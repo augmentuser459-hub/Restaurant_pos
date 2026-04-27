@@ -6,15 +6,24 @@ import { shiftsService, CashierShift } from '../../services/shifts.service'
 import { useCart } from '../../hooks/useCart'
 import { MenuItem, MenuCategory, OrderPaymentMethod } from '../../types/database.types'
 import { formatCurrency } from '../../lib/utils'
-import { ShoppingCart, Plus, Minus, Trash2, CreditCard, Banknote, Smartphone, Wallet, X, Printer, Play, Square, Clock, DollarSign, Search } from 'lucide-react'
+import { ShoppingCart, Plus, Minus, Trash2, CreditCard, Banknote, Smartphone, Wallet, X, Printer, Play, Square, Clock, DollarSign, Search, Package, ChefHat } from 'lucide-react'
+import { supabase } from '../../lib/supabase'
+
+interface Category {
+  id: string
+  name: string
+  name_ar: string
+  code: string
+}
 
 export default function POSCashier() {
   const { user } = useAuth()
   const cart = useCart()
   const [menuItems, setMenuItems] = useState<MenuItem[]>([])
-  const [categories, setCategories] = useState<MenuCategory[]>([])
+  const [categories, setCategories] = useState<Category[]>([])
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null)
   const [searchTerm, setSearchTerm] = useState('')
+  const [viewMode, setViewMode] = useState<'items' | 'recipes'>('items')
   const [loading, setLoading] = useState(true)
   const [processing, setProcessing] = useState(false)
   const [showPayment, setShowPayment] = useState(false)
@@ -44,21 +53,32 @@ export default function POSCashier() {
         const items = data.map((posItem: any) => ({
           id: posItem.item_id,
           code: posItem.item?.code || '',
+          barcode: posItem.item?.barcode || '',
           name: posItem.item?.name || '',
           name_ar: posItem.item?.name_ar || '',
           price: parseFloat(posItem.price) || 0,
           is_available: posItem.is_available && posItem.in_stock,
           image_url: posItem.item?.image_url,
-          category_id: null,
+          category_id: posItem.item?.category_id || null,
           stock_quantity: parseFloat(posItem.stock_quantity) || 0,
           in_stock: posItem.in_stock,
           is_recipe: posItem.item?.is_recipe || false
         }))
         setMenuItems(items)
       }
+      
+      // Fetch categories
+      const { data: categoriesData } = await supabase
+        .from('categories')
+        .select('id, code, name, name_ar')
+        .eq('is_active', true)
+        .order('sort_order', { ascending: true })
+      
+      if (categoriesData) {
+        setCategories(categoriesData)
+      }
     }
     
-    setCategories([]) // No categories for inventory items
     setLoading(false)
   }
 
@@ -152,13 +172,18 @@ export default function POSCashier() {
   }
 
   const filteredItems = menuItems.filter(item => {
-    // Filter by search term
+    // Filter by view mode (items vs recipes)
+    if (viewMode === 'items' && item.is_recipe) return false
+    if (viewMode === 'recipes' && !item.is_recipe) return false
+    
+    // Filter by search term (including barcode)
     if (searchTerm) {
       const term = searchTerm.toLowerCase()
       return (
         item.name_ar?.toLowerCase().includes(term) ||
         item.name?.toLowerCase().includes(term) ||
-        item.code?.toLowerCase().includes(term)
+        item.code?.toLowerCase().includes(term) ||
+        (item as any).barcode?.toLowerCase().includes(term)
       )
     }
     // Filter by category if selected
@@ -374,55 +399,138 @@ export default function POSCashier() {
       <div className="flex flex-1 gap-4 p-4">
       {/* Menu Section */}
       <div className="flex-1 flex flex-col bg-gray-50 rounded-lg p-4">
+        {/* View Mode Switcher */}
+        <div className="mb-4 flex gap-2">
+          <button
+            type="button"
+            onClick={() => {
+              setViewMode('items')
+              setSelectedCategory(null)
+              setSearchTerm('')
+            }}
+            className={`flex-1 py-3 px-4 rounded-lg font-medium transition-colors flex items-center justify-center gap-2 ${
+              viewMode === 'items'
+                ? 'bg-blue-600 text-white'
+                : 'bg-white text-gray-700 hover:bg-gray-100'
+            }`}
+          >
+            <Package className="w-5 h-5" />
+            الأصناف
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setViewMode('recipes')
+              setSelectedCategory(null)
+              setSearchTerm('')
+            }}
+            className={`flex-1 py-3 px-4 rounded-lg font-medium transition-colors flex items-center justify-center gap-2 ${
+              viewMode === 'recipes'
+                ? 'bg-blue-600 text-white'
+                : 'bg-white text-gray-700 hover:bg-gray-100'
+            }`}
+          >
+            <ChefHat className="w-5 h-5" />
+            الوصفات
+          </button>
+        </div>
+
         {/* Search */}
         <div className="mb-4">
           <div className="relative">
             <Search className="absolute right-3 top-1/2 -translate-y-1/2 w-5 h-5 text-gray-400" />
             <input
               type="text"
-              placeholder="بحث عن منتج..."
+              placeholder="بحث بالاسم، الكود، أو الباركود..."
               value={searchTerm}
-              onChange={(e) => setSearchTerm(e.target.value)}
+              onChange={(e) => {
+                setSearchTerm(e.target.value)
+                setSelectedCategory(null) // Clear category when searching
+              }}
               className="w-full pr-10 pl-4 py-2 border border-gray-300 rounded-lg"
             />
           </div>
         </div>
 
+        {/* Categories Grid - Only show when not searching */}
+        {!searchTerm && categories.length > 0 && (
+          <div className="mb-4">
+            <div className="grid grid-cols-3 sm:grid-cols-4 lg:grid-cols-6 gap-2 mb-2">
+              <button
+                type="button"
+                onClick={() => setSelectedCategory(null)}
+                className={`py-3 px-4 rounded-lg font-medium text-sm transition-colors ${
+                  selectedCategory === null
+                    ? 'bg-blue-600 text-white'
+                    : 'bg-white text-gray-700 hover:bg-gray-100 border border-gray-200'
+                }`}
+              >
+                الكل
+              </button>
+              {categories.map(category => (
+                <button
+                  key={category.id}
+                  type="button"
+                  onClick={() => setSelectedCategory(category.id)}
+                  className={`py-3 px-4 rounded-lg font-medium text-sm transition-colors ${
+                    selectedCategory === category.id
+                      ? 'bg-blue-600 text-white'
+                      : 'bg-white text-gray-700 hover:bg-gray-100 border border-gray-200'
+                  }`}
+                >
+                  {category.name_ar}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
         {/* Menu Items Grid */}
         <div className="flex-1 overflow-y-auto">
-          <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
-            {filteredItems.map(item => {
-                const stockQty = (item as any).stock_quantity || 0
-                const inStock = (item as any).in_stock || false
-                
-                return (
-                  <button
-                    type="button"
-                    key={item.id}
-                    onClick={() => inStock && handleAddToCart(item)}
-                    disabled={!inStock}
-                    className={`bg-white rounded-lg p-4 text-right transition-shadow border ${
-                      inStock 
-                        ? 'border-gray-100 hover:shadow-md cursor-pointer' 
-                        : 'border-red-200 bg-red-50 opacity-60 cursor-not-allowed'
-                    }`}
-                  >
-                    {item.image_url && (
-                      <img
-                        src={item.image_url}
-                        alt={item.name_ar}
-                        className="w-full h-24 object-cover rounded-lg mb-2"
-                      />
-                    )}
-                    <h3 className="font-medium text-gray-900 mb-1">{item.name_ar}</h3>
-                    <p className="text-blue-600 font-bold mb-1">{formatCurrency(item.price)}</p>
-                    <div className={`text-xs font-medium ${inStock ? 'text-green-600' : 'text-red-600'}`}>
-                      {inStock ? `متاح: ${stockQty.toFixed(2)}` : 'غير متاح'}
-                    </div>
-                  </button>
-                )
-              })}
-          </div>
+          {filteredItems.length === 0 ? (
+            <div className="flex flex-col items-center justify-center h-full text-gray-500">
+              <Package className="w-16 h-16 mb-4 opacity-50" />
+              <p className="text-lg">لا توجد عناصر</p>
+            </div>
+          ) : (
+            <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
+              {filteredItems.map(item => {
+                  const stockQty = (item as any).stock_quantity || 0
+                  const inStock = (item as any).in_stock || false
+                  const isRecipe = (item as any).is_recipe || false
+                  
+                  return (
+                    <button
+                      type="button"
+                      key={item.id}
+                      onClick={() => inStock && handleAddToCart(item)}
+                      disabled={!inStock}
+                      className={`bg-white rounded-lg p-4 text-right transition-shadow border ${
+                        inStock 
+                          ? 'border-gray-100 hover:shadow-md cursor-pointer' 
+                          : 'border-red-200 bg-red-50 opacity-60 cursor-not-allowed'
+                      }`}
+                    >
+                      {item.image_url && (
+                        <img
+                          src={item.image_url}
+                          alt={item.name_ar}
+                          className="w-full h-24 object-cover rounded-lg mb-2"
+                        />
+                      )}
+                      <h3 className="font-medium text-gray-900 mb-1">{item.name_ar}</h3>
+                      <p className="text-blue-600 font-bold mb-1">{formatCurrency(item.price)}</p>
+                      <div className="flex items-center justify-between">
+                        <div className={`text-xs font-medium ${inStock ? 'text-green-600' : 'text-red-600'}`}>
+                          {isRecipe ? 'وصفة' : inStock ? `متاح: ${stockQty.toFixed(2)}` : 'غير متاح'}
+                        </div>
+                        {isRecipe && <ChefHat className="w-4 h-4 text-orange-500" />}
+                      </div>
+                    </button>
+                  )
+                })}
+            </div>
+          )}
         </div>
       </div>
 
