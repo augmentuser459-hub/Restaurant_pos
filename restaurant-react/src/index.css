@@ -1,0 +1,292 @@
+@import url('https://fonts.googleapis.com/css2?family=Cairo:wght@300;400;500;600;700&display=swap');
+@import "tailwindcss";
+
+/* RTL Support */
+html {
+  direction: rtl;
+}
+
+body {
+  font-family: 'Cairo', 'Segoe UI', 'Arial', Tahoma, sans-serif;
+  background-color: #f8f9fa;
+  margin: 0;
+}
+
+/* Custom Scrollbar */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #f1f1f1;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #c1c1c1;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #a1a1a1;
+}
+
+/* Print Styles */
+@media print {
+  /* Hide navigation, sidebar, and interactive elements */
+  .print\:hidden,
+  nav,
+  aside,
+  header,
+  .sidebar,
+  button:not(.print\:block button),
+  .no-print {
+    display: none !important;
+  }
+
+  /* Show print-only elements */
+  .print\:block {
+    display: block !important;
+  }
+
+  /* Hide URL and page info in footer/header */
+  @page {
+    size: A4 portrait;
+    margin: 1cm 1.5cm;
+    /* Try to hide headers and footers */
+    @top-left { content: none; }
+    @top-center { content: none; }
+    @top-right { content: none; }
+    @bottom-left { content: none; }
+    @bottom-center { content: none; }
+    @bottom-right { content: none; }
+  }
+
+  /* Remove URL from links when printing */
+  a[href]:after {
+    content: none !important;
+  }
+
+  a {
+    text-decoration: none !important;
+    color: inherit !important;
+  }
+
+  /* Hide browser's default header/footer */
+  body {
+    margin: 0 !important;
+  }
+
+  html, body {
+    background: white !important;
+    color: black !important;
+    padding: 0 !important;
+    margin: 0 !important;
+    width: 100% !important;
+    height: 100% !important;
+  }
+
+  /* Full width for print */
+  main,
+  .main-content {
+    margin: 0 !important;
+    padding: 0 !important;
+    width: 100% !important;
+    max-width: 100% !important;
+  }
+
+  /* Remove margin from main container */
+  .print\:\!mr-0 {
+    margin-right: 0 !important;
+  }
+
+  .print\:\!p-0 {
+    padding: 0 !important;
+  }
+
+  /* Ensure content fits on page */
+  * {
+    box-shadow: none !important;
+    text-shadow: none !important;
+  }
+
+  /* Better table printing */
+  table {
+    page-break-inside: auto;
+    width: 100% !important;
+    border-collapse: collapse !important;
+    font-size: 11pt !important;
+  }
+
+  .print\:border-collapse {
+    border-collapse: collapse !important;
+  }
+
+  thead {
+    display: table-header-group;
+    background-color: #e5e7eb !important;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  .print\:bg-gray-200 {
+    background-color: #e5e7eb !important;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  .print\:text-black {
+    color: #000 !important;
+  }
+
+  tr {
+    page-break-inside: avoid;
+    page-break-after: auto;
+  }
+
+  img {
+    page-break-inside: avoid;
+  }
+
+  /* Table borders for print */
+  .print\:border {
+    border: 1px solid #d1d5db !important;
+  }
+
+  .print\:border-gray-300 {
+    border-color: #d1d5db !important;
+  }
+
+  th, td {
+    padding: 6px 8px !important;
+    text-align: right !important;
+  }
+
+  /* Remove borders and shadows for cleaner print */
+  .print\:shadow-none {
+    box-shadow: none !important;
+  }
+
+  .print\:rounded-none {
+    border-radius: 0 !important;
+  }
+
+  .shadow-sm,
+  .shadow,
+  .shadow-lg {
+    box-shadow: none !important;
+  }
+
+  .rounded-lg,
+  .rounded {
+    border-radius: 0 !important;
+  }
+
+  /* Ensure text is readable */
+  .text-gray-500,
+  .text-gray-600 {
+    color: #4b5563 !important;
+  }
+
+  .text-gray-900 {
+    color: #000 !important;
+  }
+
+  /* Keep important colors for print */
+  .text-red-600 {
+    color: #dc2626 !important;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  .text-green-600 {
+    color: #16a34a !important;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  .text-blue-600 {
+    color: #2563eb !important;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  /* Background colors for print */
+  .bg-gray-50,
+  .bg-blue-50,
+  .bg-green-50,
+  .bg-red-50,
+  .bg-gray-100,
+  .bg-red-100,
+  .bg-green-100 {
+    background-color: #f9fafb !important;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  .bg-gray-200 {
+    background-color: #e5e7eb !important;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  .bg-white {
+    background-color: white !important;
+  }
+
+  .bg-green-600 {
+    background-color: #16a34a !important;
+    color: white !important;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  /* Font sizes for print */
+  .text-2xl {
+    font-size: 1.3rem !important;
+  }
+
+  .text-xl {
+    font-size: 1.1rem !important;
+  }
+
+  .text-sm {
+    font-size: 0.85rem !important;
+  }
+
+  /* Spacing adjustments */
+  .space-y-6 > * + * {
+    margin-top: 0.75rem !important;
+  }
+
+  .print\:space-y-4 > * + * {
+    margin-top: 0.5rem !important;
+  }
+
+  .p-6 {
+    padding: 0.75rem !important;
+  }
+
+  .p-4 {
+    padding: 0.5rem !important;
+  }
+
+  .print\:gap-2 {
+    gap: 0.25rem !important;
+  }
+
+  .print\:py-6 {
+    padding-top: 0.75rem !important;
+    padding-bottom: 0.75rem !important;
+  }
+
+  /* Grid adjustments for print */
+  .grid {
+    display: grid !important;
+  }
+
+  /* Avoid page breaks in important sections */
+  .bg-white.rounded-lg {
+    page-break-inside: avoid;
+  }
+}
