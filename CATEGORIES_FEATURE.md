@@ -14,7 +14,7 @@ Enhanced categories system with dedicated management page, tabs for Item and Rec
   - See item/recipe count for each category
   - Toggle active/inactive status
   - Edit and delete categories
-  - Add new categories
+  - Add new categoriesf
 
 ### 2. Category Form (Add/Edit)
 - **Create or edit categories** with full details:
