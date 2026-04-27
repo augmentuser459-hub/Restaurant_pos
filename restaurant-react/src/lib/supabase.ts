@@ -1,14 +1,15 @@
 import { createClient } from '@supabase/supabase-js'
 
-const supabaseUrl = import.meta.env.VITE_SUPABASE_URL || ''
-const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY || ''
+// Supabase configuration - reads from environment variables with fallback to production values
+const supabaseUrl = import.meta.env.VITE_SUPABASE_URL || 'https://hqjwhhqcymgkwohlofvf.supabase.co'
+const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhxandoaHFjeW1na3dvaGxvZnZmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzU3MzU0NjIsImV4cCI6MjA5MTMxMTQ2Mn0.nXBqG9P7_6I5eqxtMxaaSKr2NM5PTdkhC6jZH0GJu08'
 
 // Check if we have valid credentials
-export const hasValidCredentials = Boolean(supabaseUrl && supabaseAnonKey)
+export const hasValidCredentials = Boolean(supabaseUrl && supabaseAnonKey && supabaseUrl !== 'https://placeholder.supabase.co')
 
 export const supabase = createClient(
-  supabaseUrl || 'https://placeholder.supabase.co',
-  supabaseAnonKey || 'placeholder-key',
+  supabaseUrl,
+  supabaseAnonKey,
   {
     auth: {
       persistSession: true,
