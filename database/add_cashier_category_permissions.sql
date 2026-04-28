@@ -78,3 +78,46 @@ BEGIN
     END IF;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- ============================================
+-- ROW LEVEL SECURITY (RLS)
+-- ============================================
+
+-- Enable RLS on the table
+ALTER TABLE cashier_category_permissions ENABLE ROW LEVEL SECURITY;
+
+-- Policy: Admins and managers can view all permissions
+CREATE POLICY "Admins and managers can view all category permissions"
+    ON cashier_category_permissions
+    FOR SELECT
+    USING (
+        EXISTS (
+            SELECT 1 FROM users u
+            INNER JOIN roles r ON u.role_id = r.id
+            WHERE u.id = auth.uid()
+            AND r.name IN ('admin', 'warehouse_manager', 'branch_supervisor', 'purchase_manager')
+        )
+    );
+
+-- Policy: Cashiers can view their own permissions
+CREATE POLICY "Cashiers can view their own category permissions"
+    ON cashier_category_permissions
+    FOR SELECT
+    USING (user_id = auth.uid());
+
+-- Policy: Only admins can insert/update/delete permissions
+CREATE POLICY "Only admins can manage category permissions"
+    ON cashier_category_permissions
+    FOR ALL
+    USING (
+        EXISTS (
+            SELECT 1 FROM users u
+            INNER JOIN roles r ON u.role_id = r.id
+            WHERE u.id = auth.uid()
+            AND r.name = 'admin'
+        )
+    );
+
+-- Grant necessary permissions
+GRANT SELECT ON cashier_category_permissions TO authenticated;
+GRANT INSERT, UPDATE, DELETE ON cashier_category_permissions TO authenticated;
