@@ -157,6 +157,16 @@ export const posManagementService = {
 
   // Add item to POS
   async addItemToPOS(branchId: string, itemId: string, price: number) {
+    // First, update the base item's selling price
+    await supabase
+      .from('items')
+      .update({
+        selling_price: price,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', itemId)
+
+    // Then add to POS
     const { data, error } = await supabase
       .from('branch_pos_items')
       .insert({
@@ -243,6 +253,18 @@ export const posManagementService = {
 
     if (fetchError || !sourceItems) return { success: false, error: fetchError }
 
+    // Update base item prices and upsert to target branch
+    for (const item of sourceItems) {
+      // Update base item selling price
+      await supabase
+        .from('items')
+        .update({ 
+          selling_price: item.price, 
+          updated_at: new Date().toISOString() 
+        })
+        .eq('id', item.item_id)
+    }
+
     // Upsert to target branch
     const itemsToInsert = sourceItems.map(item => ({
       branch_id: targetBranchId,
@@ -264,7 +286,7 @@ export const posManagementService = {
   async applyPercentageChange(branchId: string, percentage: number) {
     const { data: currentItems, error: fetchError } = await supabase
       .from('branch_pos_items')
-      .select('id, price')
+      .select('id, item_id, price')
       .eq('branch_id', branchId)
 
     if (fetchError || !currentItems) return { success: false, error: fetchError }
@@ -273,10 +295,18 @@ export const posManagementService = {
     
     for (const item of currentItems) {
       const newPrice = Math.round(item.price * multiplier * 100) / 100
+      
+      // Update POS item price
       await supabase
         .from('branch_pos_items')
         .update({ price: newPrice, updated_at: new Date().toISOString() })
         .eq('id', item.id)
+      
+      // Update base item selling price
+      await supabase
+        .from('items')
+        .update({ selling_price: newPrice, updated_at: new Date().toISOString() })
+        .eq('id', item.item_id)
     }
 
     return { success: true, error: null }
