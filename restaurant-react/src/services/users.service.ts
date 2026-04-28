@@ -148,4 +148,51 @@ export const usersService = {
     const { data, error } = await query
     return { exists: data && data.length > 0, error }
   },
+
+  // Get all active categories
+  async getCategories() {
+    const { data, error } = await supabase
+      .from('categories')
+      .select('id, code, name, name_ar')
+      .eq('is_active', true)
+      .order('sort_order')
+
+    return { data: fixEncodingInData(data), error }
+  },
+
+  // Get categories assigned to a user
+  async getUserCategories(userId: string) {
+    const { data, error } = await supabase
+      .from('cashier_category_permissions')
+      .select('category_id, category:categories(id, code, name_ar)')
+      .eq('user_id', userId)
+
+    return { data: fixEncodingInData(data), error }
+  },
+
+  // Update user category permissions
+  async updateUserCategories(userId: string, categoryIds: string[]) {
+    // First, delete existing permissions
+    await supabase
+      .from('cashier_category_permissions')
+      .delete()
+      .eq('user_id', userId)
+
+    // If no categories selected, user can see all (no restrictions)
+    if (categoryIds.length === 0) {
+      return { error: null }
+    }
+
+    // Insert new permissions
+    const permissions = categoryIds.map(categoryId => ({
+      user_id: userId,
+      category_id: categoryId
+    }))
+
+    const { error } = await supabase
+      .from('cashier_category_permissions')
+      .insert(permissions)
+
+    return { error }
+  },
 }

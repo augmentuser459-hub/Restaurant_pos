@@ -20,10 +20,18 @@ interface Branch {
   code: string
 }
 
+interface Category {
+  id: string
+  name_ar: string
+  code: string
+}
+
 export default function UserFormModal({ user, onClose }: UserFormModalProps) {
   const [loading, setLoading] = useState(false)
   const [roles, setRoles] = useState<Role[]>([])
   const [branches, setBranches] = useState<Branch[]>([])
+  const [categories, setCategories] = useState<Category[]>([])
+  const [selectedCategories, setSelectedCategories] = useState<string[]>([])
   const [showPassword, setShowPassword] = useState(false)
   
   const [formData, setFormData] = useState({
@@ -41,6 +49,10 @@ export default function UserFormModal({ user, onClose }: UserFormModalProps) {
 
   useEffect(() => {
     fetchRolesAndBranches()
+    fetchCategories()
+    if (user) {
+      fetchUserCategories()
+    }
   }, [])
 
   const fetchRolesAndBranches = async () => {
@@ -51,6 +63,29 @@ export default function UserFormModal({ user, onClose }: UserFormModalProps) {
     
     setRoles(rolesRes.data || [])
     setBranches(branchesRes.data || [])
+  }
+
+  const fetchCategories = async () => {
+    const { data, error } = await usersService.getCategories()
+    if (!error && data) {
+      setCategories(data)
+    }
+  }
+
+  const fetchUserCategories = async () => {
+    if (!user) return
+    const { data, error } = await usersService.getUserCategories(user.id)
+    if (!error && data) {
+      setSelectedCategories(data.map((c: any) => c.category_id))
+    }
+  }
+
+  const handleCategoryToggle = (categoryId: string) => {
+    setSelectedCategories(prev => 
+      prev.includes(categoryId)
+        ? prev.filter(id => id !== categoryId)
+        : [...prev, categoryId]
+    )
   }
 
   const handleSubmit = async (e: React.FormEvent) => {
@@ -110,6 +145,11 @@ export default function UserFormModal({ user, onClose }: UserFormModalProps) {
           console.error(error)
           return
         }
+
+        // Update category permissions if cashier
+        if (selectedRole?.name === 'cashier') {
+          await usersService.updateUserCategories(user.id, selectedCategories)
+        }
       } else {
         // Create new user
         const createData: CreateUserData = {
@@ -125,12 +165,17 @@ export default function UserFormModal({ user, onClose }: UserFormModalProps) {
           status: formData.status as 'active' | 'inactive',
         }
 
-        const { error } = await usersService.create(createData)
+        const { data: newUser, error } = await usersService.create(createData)
         
         if (error) {
           alert('حدث خطأ أثناء إضافة المستخدم')
           console.error(error)
           return
+        }
+
+        // Set category permissions if cashier
+        if (selectedRole?.name === 'cashier' && newUser) {
+          await usersService.updateUserCategories(newUser.id, selectedCategories)
         }
       }
 
@@ -349,6 +394,40 @@ export default function UserFormModal({ user, onClose }: UserFormModalProps) {
               <option value="inactive">غير نشط</option>
             </select>
           </div>
+
+          {/* Category Permissions (only for cashiers) */}
+          {selectedRole?.name === 'cashier' && (
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-2">
+                المجموعات المسموح بها في نقطة البيع
+              </label>
+              <p className="text-xs text-gray-500 mb-3">
+                اختر المجموعات التي يمكن للكاشير رؤيتها. إذا لم تختر أي مجموعة، سيتمكن من رؤية جميع المجموعات.
+              </p>
+              <div className="border border-gray-300 rounded-lg p-4 max-h-48 overflow-y-auto space-y-2">
+                {categories.length === 0 ? (
+                  <p className="text-sm text-gray-500 text-center py-2">لا توجد مجموعات</p>
+                ) : (
+                  categories.map(category => (
+                    <label
+                      key={category.id}
+                      className="flex items-center gap-3 p-2 hover:bg-gray-50 rounded cursor-pointer"
+                    >
+                      <input
+                        type="checkbox"
+                        checked={selectedCategories.includes(category.id)}
+                        onChange={() => handleCategoryToggle(category.id)}
+                        className="w-4 h-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500"
+                      />
+                      <span className="text-sm text-gray-900">
+                        {category.name_ar} <span className="text-gray-500">({category.code})</span>
+                      </span>
+                    </label>
+                  ))
+                )}
+              </div>
+            </div>
+          )}
 
           {/* Actions */}
           <div className="flex gap-3 pt-4">

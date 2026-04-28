@@ -67,15 +67,15 @@ export default function POSCashier() {
         setMenuItems(items)
       }
       
-      // Fetch categories
-      const { data: categoriesData } = await supabase
-        .from('categories')
-        .select('id, code, name, name_ar')
-        .eq('is_active', true)
-        .order('sort_order', { ascending: true })
-      
-      if (categoriesData) {
-        setCategories(categoriesData)
+      // Fetch categories accessible by this cashier
+      if (user?.id) {
+        const { data: categoriesData } = await supabase.rpc('get_cashier_categories', {
+          p_user_id: user.id
+        })
+        
+        if (categoriesData) {
+          setCategories(categoriesData)
+        }
       }
     }
     
@@ -190,6 +190,13 @@ export default function POSCashier() {
     if (selectedCategory) {
       return item.category_id === selectedCategory
     }
+    
+    // If no category selected and categories exist, only show items that belong to accessible categories
+    // Items without category are hidden unless "الكل" is selected
+    if (!selectedCategory && categories.length > 0) {
+      return item.category_id && categories.some(cat => cat.id === item.category_id)
+    }
+    
     return true
   })
 
