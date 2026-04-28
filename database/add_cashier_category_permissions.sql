@@ -79,28 +79,5 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
--- ============================================
--- ROW LEVEL SECURITY (RLS)
--- ============================================
-
--- Enable RLS on the table
-ALTER TABLE cashier_category_permissions ENABLE ROW LEVEL SECURITY;
-
--- Policy: Allow all authenticated users to read
-CREATE POLICY "Authenticated users can view category permissions"
-    ON cashier_category_permissions
-    FOR SELECT
-    TO authenticated
-    USING (true);
-
--- Policy: Allow all authenticated users to insert/update/delete
--- (Your app handles authorization at the application level)
-CREATE POLICY "Authenticated users can manage category permissions"
-    ON cashier_category_permissions
-    FOR ALL
-    TO authenticated
-    USING (true)
-    WITH CHECK (true);
-
--- Grant necessary permissions
-GRANT SELECT, INSERT, UPDATE, DELETE ON cashier_category_permissions TO authenticated;
+-- Note: RLS is disabled for this table
+-- Authorization is handled at the application level
