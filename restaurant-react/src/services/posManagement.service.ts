@@ -184,6 +184,16 @@ export const posManagementService = {
 
   // Update POS item price and availability
   async updatePOSItem(id: string, updates: { price?: number; is_available?: boolean }) {
+    // First, get the item_id from this POS item
+    const { data: posItem, error: fetchError } = await supabase
+      .from('branch_pos_items')
+      .select('item_id')
+      .eq('id', id)
+      .single()
+
+    if (fetchError) return { data: null, error: fetchError }
+
+    // Update the POS item
     const { data, error } = await supabase
       .from('branch_pos_items')
       .update({
@@ -193,6 +203,17 @@ export const posManagementService = {
       .eq('id', id)
       .select()
       .single()
+
+    // If price is being updated, also update the base item's selling_price
+    if (!error && updates.price !== undefined && posItem?.item_id) {
+      await supabase
+        .from('items')
+        .update({
+          selling_price: updates.price,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', posItem.item_id)
+    }
 
     return { data, error }
   },
