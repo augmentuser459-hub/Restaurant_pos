@@ -115,6 +115,7 @@ export function formatDateForExcel(date: string | Date): string {
 export const inventoryColumns: ExcelColumn[] = [
   { key: 'item_code', header: 'كود الصنف' },
   { key: 'item_name', header: 'اسم الصنف' },
+  { key: 'category_name', header: 'مجموعة' },
   { key: 'branch_name', header: 'الفرع' },
   { key: 'quantity', header: 'الكمية' },
   { key: 'unit', header: 'الوحدة' },

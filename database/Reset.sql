@@ -2,7 +2,7 @@
 -- Reset Data Script - Keep Suppliers
 -- ============================================
 -- This script deletes:
--- - All items and inventory
+-- - All items, inventory, and categories
 -- - All purchase orders and related data
 -- - All supplier transactions and debt history
 -- But KEEPS the suppliers themselves
@@ -100,6 +100,9 @@ DELETE FROM inventory;
 -- 30. Finally, Delete Items (all references should be gone now)
 DELETE FROM items;
 
+-- 31. Delete Categories (items are gone, safe to remove)
+DELETE FROM categories;
+
 COMMIT;
 
 -- ============================================
@@ -109,6 +112,7 @@ SELECT
     'Data Reset Complete!' as status,
     (SELECT COUNT(*) FROM items) as remaining_items,
     (SELECT COUNT(*) FROM inventory) as remaining_inventory,
+    (SELECT COUNT(*) FROM categories) as remaining_categories,
     (SELECT COUNT(*) FROM purchase_orders) as remaining_purchase_orders,
     (SELECT COUNT(*) FROM orders) as remaining_orders,
     (SELECT COUNT(*) FROM suppliers) as remaining_suppliers,

@@ -11,6 +11,22 @@ export default function ItemList() {
   const [search, setSearch] = useState('')
   const [deleteId, setDeleteId] = useState<string | null>(null)
 
+  // Convert scientific notation (3.50E+12) to full number string
+  const formatCodeValue = (value: string | number | undefined | null): string => {
+    if (value === null || value === undefined || value === '') return ''
+    const str = String(value)
+    if (/[eE]/.test(str)) {
+      const num = Number(str)
+      if (!isNaN(num) && isFinite(num)) {
+        try { return BigInt(Math.round(num)).toString() } catch { return num.toLocaleString('en-US', { useGrouping: false, maximumFractionDigits: 0 }) }
+      }
+    }
+    if (typeof value === 'number') {
+      try { return BigInt(Math.round(value)).toString() } catch { return value.toLocaleString('en-US', { useGrouping: false, maximumFractionDigits: 0 }) }
+    }
+    return str
+  }
+
   useEffect(() => {
     fetchItems()
   }, [])
@@ -116,7 +132,10 @@ export default function ItemList() {
                       </div>
                       <div>
                         <p className="font-medium text-gray-900">{item.name_ar}</p>
-                        <p className="text-sm text-gray-500">{item.code}</p>
+                        <p className="text-sm text-gray-500 font-mono select-all" dir="ltr" style={{ fontVariantNumeric: 'tabular-nums' }}>{formatCodeValue(item.code)}</p>
+                        {item.barcode && (
+                          <p className="text-xs text-gray-400 font-mono select-all" dir="ltr" style={{ fontVariantNumeric: 'tabular-nums' }}>{formatCodeValue(item.barcode)}</p>
+                        )}
                       </div>
                     </div>
                   </td>

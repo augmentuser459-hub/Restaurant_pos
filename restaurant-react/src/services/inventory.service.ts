@@ -144,6 +144,25 @@ export const inventoryService = {
     return { data: fixEncodingInData(data) as Category[], error }
   },
 
+  // Create a new category
+  async createCategory(name_ar: string) {
+    // Generate a code from the name
+    const code = `CAT-${Date.now()}`
+    const { data, error } = await supabase
+      .from('categories')
+      .insert({
+        code,
+        name: name_ar,
+        name_ar,
+        is_active: true,
+        sort_order: 0,
+      })
+      .select()
+      .single()
+
+    return { data: data as Category, error }
+  },
+
   // Inventory/Stock
   async getStock(branchId?: string) {
     // Fetch all records by fetching in batches to bypass the 1000 limit
@@ -155,7 +174,7 @@ export const inventoryService = {
     while (hasMore) {
       let query = supabase
         .from('inventory')
-        .select('*, item:items(id, code, name_ar, min_stock_level, category_id, purchase_price, selling_price, unit:units(id, name_ar, code), category:categories(id, name_ar)), branch:branches(id, name_ar, code)')
+        .select('*, item:items(id, code, barcode, name_ar, min_stock_level, category_id, purchase_price, selling_price, unit:units(id, name_ar, code), category:categories(id, name_ar)), branch:branches(id, name_ar, code)')
         .order('quantity', { ascending: true })
         .range(start, start + BATCH_SIZE - 1)
 
@@ -191,7 +210,7 @@ export const inventoryService = {
     while (hasMore) {
       const { data, error } = await supabase
         .from('inventory')
-        .select('*, item:items(id, code, name_ar, min_stock_level, category_id, purchase_price, selling_price, unit:units(id, name_ar, code), category:categories(id, name_ar))')
+        .select('*, item:items(id, code, barcode, name_ar, min_stock_level, category_id, purchase_price, selling_price, unit:units(id, name_ar, code), category:categories(id, name_ar))')
         .eq('branch_id', branchId)
         .order('created_at', { ascending: false })
         .range(start, start + BATCH_SIZE - 1)
