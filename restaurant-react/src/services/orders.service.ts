@@ -174,8 +174,8 @@ export const ordersService = {
         *,
         items:order_items(
           *,
-          menu_item:menu_items(id, name_ar, code),
-          item:items(id, name_ar, code)
+          menu_item:menu_items(id, name_ar, code, category_id),
+          item:items(id, name_ar, code, category_id)
         )
       `)
       .eq('branch_id', branchId)

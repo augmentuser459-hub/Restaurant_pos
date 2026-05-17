@@ -3,7 +3,7 @@ import { posManagementService, BranchPOSItem, AvailableInventoryItem } from '../
 import { formatCurrency } from '../../lib/utils'
 import { 
   Store, DollarSign, Save, Copy, Percent, 
-  Check, X, Eye, EyeOff, Search, Plus, Trash2, Package
+  Check, X, Eye, EyeOff, Search, Plus, Trash2, Package, PackagePlus
 } from 'lucide-react'
 
 interface Branch {
@@ -31,6 +31,8 @@ export default function POSManagement() {
   const [availableItems, setAvailableItems] = useState<AvailableInventoryItem[]>([])
   const [selectedItemToAdd, setSelectedItemToAdd] = useState<string>('')
   const [newItemPrice, setNewItemPrice] = useState<string>('')
+  const [bulkAdding, setBulkAdding] = useState(false)
+  const [bulkAddProgress, setBulkAddProgress] = useState<{ done: number; total: number } | null>(null)
 
   useEffect(() => {
     fetchBranches()
@@ -136,6 +138,67 @@ export default function POSManagement() {
       await fetchBranches()
     }
     setSaving(false)
+  }
+
+  const handleBulkAddAll = async () => {
+    if (!selectedBranch) return
+
+    // Items not yet in POS
+    const newItems = itemsToAdd
+    if (newItems.length === 0) {
+      alert('كل أصناف المخزون موجودة بالفعل في نقطة البيع')
+      return
+    }
+
+    if (!confirm(`هل تريد إضافة ${newItems.length} صنف من المخزون إلى نقطة البيع؟\nسيتم استخدام سعر البيع الموجود في كل صنف.`)) {
+      return
+    }
+
+    setBulkAdding(true)
+    setBulkAddProgress({ done: 0, total: newItems.length })
+    let successCount = 0
+    let errorCount = 0
+
+    // Build all records for batch upsert
+    const allRecords = newItems.map(item => ({
+      branch_id: selectedBranch,
+      item_id: item.id,
+      price: (item as any).selling_price || (item as any).purchase_price || 0,
+      is_available: true,
+      display_order: 0
+    }))
+
+    // Process in large batches using upsert
+    const BATCH_SIZE = 50
+    for (let i = 0; i < allRecords.length; i += BATCH_SIZE) {
+      const batch = allRecords.slice(i, i + BATCH_SIZE)
+      
+      const { error } = await import('../../lib/supabase').then(m => 
+        m.supabase
+          .from('branch_pos_items')
+          .upsert(batch, { onConflict: 'branch_id,item_id' })
+      )
+      
+      if (error) {
+        errorCount += batch.length
+        console.error('Batch upsert error:', error)
+      } else {
+        successCount += batch.length
+      }
+      
+      setBulkAddProgress({ done: Math.min(i + BATCH_SIZE, allRecords.length), total: allRecords.length })
+    }
+
+    setBulkAdding(false)
+    setBulkAddProgress(null)
+    
+    await fetchPOSItems(selectedBranch)
+    await fetchBranches()
+    await fetchAvailableItems(selectedBranch)
+
+    let msg = `تم إضافة ${successCount} صنف بنجاح`
+    if (errorCount > 0) msg += `\nفشل إضافة ${errorCount} صنف`
+    alert(msg)
   }
 
   const handleCopyPrices = async () => {
@@ -258,6 +321,23 @@ export default function POSManagement() {
                 >
                   <Plus className="w-4 h-4" />
                   إضافة منتج
+                </button>
+
+                <button
+                  onClick={handleBulkAddAll}
+                  disabled={bulkAdding || itemsToAdd.length === 0}
+                  className="flex items-center gap-2 px-3 py-2 text-sm bg-teal-50 text-teal-700 rounded-lg hover:bg-teal-100 disabled:opacity-50 disabled:cursor-not-allowed"
+                  title={`إضافة كل أصناف المخزون (${itemsToAdd.length} صنف)`}
+                >
+                  {bulkAdding ? (
+                    <span className="w-4 h-4 border-2 border-teal-700 border-t-transparent rounded-full animate-spin" />
+                  ) : (
+                    <PackagePlus className="w-4 h-4" />
+                  )}
+                  {bulkAdding 
+                    ? `جاري الإضافة... (${bulkAddProgress?.done || 0}/${bulkAddProgress?.total || 0})`
+                    : `إضافة الكل (${itemsToAdd.length})`
+                  }
                 </button>
 
                 <button

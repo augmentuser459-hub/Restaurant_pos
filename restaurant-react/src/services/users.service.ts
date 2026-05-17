@@ -195,4 +195,40 @@ export const usersService = {
 
     return { error }
   },
+
+  // Get categories assigned to a chef user
+  async getChefCategories(userId: string) {
+    const { data, error } = await supabase
+      .from('chef_category_permissions')
+      .select('category_id, category:categories(id, code, name_ar)')
+      .eq('user_id', userId)
+
+    return { data: fixEncodingInData(data), error }
+  },
+
+  // Update chef category permissions
+  async updateChefCategories(userId: string, categoryIds: string[]) {
+    // First, delete existing permissions
+    await supabase
+      .from('chef_category_permissions')
+      .delete()
+      .eq('user_id', userId)
+
+    // If no categories selected, chef can see all (no restrictions)
+    if (categoryIds.length === 0) {
+      return { error: null }
+    }
+
+    // Insert new permissions
+    const permissions = categoryIds.map(categoryId => ({
+      user_id: userId,
+      category_id: categoryId
+    }))
+
+    const { error } = await supabase
+      .from('chef_category_permissions')
+      .insert(permissions)
+
+    return { error }
+  },
 }

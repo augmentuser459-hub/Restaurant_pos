@@ -312,15 +312,73 @@ export const posManagementService = {
     return { success: true, error: null }
   },
 
-  // Get POS items for cashier (with stock info)
+  // Get POS items for cashier - reads directly from inventory
+  // Any item with stock in the branch automatically appears in POS
   async getPOSItemsForCashier(branchId: string) {
-    const { data, error } = await supabase
+    // First try the managed POS items view
+    const { data: posData } = await supabase
       .from('v_branch_pos_items_with_stock')
       .select('*')
       .eq('branch_id', branchId)
       .eq('is_available', true)
       .order('display_order')
 
-    return { data: fixEncodingInData(data), error }
+    // Also get ALL inventory items for this branch (auto-populate)
+    const { data: invData, error: invError } = await supabase
+      .from('inventory')
+      .select(`
+        id,
+        item_id,
+        quantity,
+        branch_id,
+        item:items(
+          id, code, barcode, name, name_ar, is_recipe, image_url,
+          selling_price, purchase_price, category_id,
+          unit:units(name_ar, code)
+        )
+      `)
+      .eq('branch_id', branchId)
+      .gt('quantity', 0)
+
+    if (invError) {
+      // Fallback to managed POS items only
+      return { data: fixEncodingInData(posData), error: null }
+    }
+
+    // Build a set of item_ids already in POS
+    const posItemIds = new Set((posData || []).map((p: any) => p.item_id))
+
+    // Transform inventory items into POS format (for items NOT already in POS)
+    const autoItems = (invData || [])
+      .filter(inv => inv.item && !Array.isArray(inv.item) && !posItemIds.has(inv.item_id))
+      .map(inv => {
+        const item = Array.isArray(inv.item) ? inv.item[0] : inv.item
+        return {
+          id: `auto_${inv.id}`,
+          branch_id: branchId,
+          item_id: inv.item_id,
+          price: item.selling_price || item.purchase_price || 0,
+          is_available: true,
+          display_order: 999,
+          item: {
+            id: item.id,
+            code: item.code,
+            barcode: item.barcode,
+            name: item.name,
+            name_ar: item.name_ar,
+            is_recipe: item.is_recipe,
+            image_url: item.image_url,
+            category_id: item.category_id,
+            purchase_price: item.purchase_price,
+            unit: Array.isArray(item.unit) ? item.unit[0] : item.unit
+          },
+          stock_quantity: inv.quantity,
+          in_stock: inv.quantity > 0
+        }
+      })
+
+    // Merge: POS managed items first, then auto-populated from inventory
+    const merged = [...(posData || []), ...autoItems]
+    return { data: fixEncodingInData(merged), error: null }
   }
 }

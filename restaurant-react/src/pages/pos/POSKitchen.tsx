@@ -9,13 +9,27 @@ export default function POSKitchen() {
   const { user } = useAuth()
   const [orders, setOrders] = useState<OrderWithDetails[]>([])
   const [loading, setLoading] = useState(true)
+  const [kitchenCategoryIds, setKitchenCategoryIds] = useState<string[]>([])
 
   useEffect(() => {
     if (user?.branch_id) {
+      fetchKitchenCategories()
       fetchOrders()
       setupRealtime()
     }
   }, [user?.branch_id])
+
+  // Fetch categories marked as kitchen categories
+  const fetchKitchenCategories = async () => {
+    const { data } = await supabase
+      .from('categories')
+      .select('id')
+      .eq('is_kitchen', true)
+    
+    if (data) {
+      setKitchenCategoryIds(data.map(c => c.id))
+    }
+  }
 
   const fetchOrders = async () => {
     if (!user?.branch_id) return
@@ -53,31 +67,21 @@ export default function POSKitchen() {
 
   const getStatusColor = (status: string) => {
     switch (status) {
-      case 'paid':
-        return 'bg-yellow-100 border-yellow-300'
-      case 'in_kitchen':
-        return 'bg-blue-100 border-blue-300'
-      case 'preparing':
-        return 'bg-orange-100 border-orange-300'
-      case 'ready':
-        return 'bg-green-100 border-green-300'
-      default:
-        return 'bg-gray-100 border-gray-300'
+      case 'paid': return 'bg-yellow-100 border-yellow-300'
+      case 'in_kitchen': return 'bg-blue-100 border-blue-300'
+      case 'preparing': return 'bg-orange-100 border-orange-300'
+      case 'ready': return 'bg-green-100 border-green-300'
+      default: return 'bg-gray-100 border-gray-300'
     }
   }
 
   const getStatusLabel = (status: string) => {
     switch (status) {
-      case 'paid':
-        return 'جديد'
-      case 'in_kitchen':
-        return 'في المطبخ'
-      case 'preparing':
-        return 'قيد التحضير'
-      case 'ready':
-        return 'جاهز'
-      default:
-        return status
+      case 'paid': return 'جديد'
+      case 'in_kitchen': return 'في المطبخ'
+      case 'preparing': return 'قيد التحضير'
+      case 'ready': return 'جاهز'
+      default: return status
     }
   }
 
@@ -90,11 +94,32 @@ export default function POSKitchen() {
     return `${hours} ساعة`
   }
 
-  const handlePrint = (order: OrderWithDetails) => {
-    const printWindow = window.open('', '_blank', 'width=400,height=600')
-    if (!printWindow) return
+  // Filter order items: only show items from kitchen categories
+  const getKitchenItems = (order: OrderWithDetails) => {
+    if (!order.items || order.items.length === 0) return []
+    if (kitchenCategoryIds.length === 0) return order.items // No filter if no categories loaded yet
+    
+    return order.items.filter(item => {
+      const itemData = item as unknown as { 
+        item?: { category_id?: string }, 
+        menu_item?: { category_id?: string } 
+      }
+      const categoryId = itemData.item?.category_id || itemData.menu_item?.category_id
+      if (!categoryId) return true // Show items without category (safety)
+      return kitchenCategoryIds.includes(categoryId)
+    })
+  }
 
-    const items = order.items?.map(item => {
+  // Orders with at least one kitchen item
+  const kitchenOrders = orders
+    .map(order => ({
+      ...order,
+      kitchenItems: getKitchenItems(order)
+    }))
+    .filter(order => order.kitchenItems.length > 0)
+
+  const handlePrint = (order: OrderWithDetails & { kitchenItems?: any[] }) => {
+    const items = (order.kitchenItems || order.items || []).map(item => {
       const itemData = item as unknown as { menu_item?: { name_ar: string }, item?: { name_ar: string } }
       const itemName = itemData.item?.name_ar || itemData.menu_item?.name_ar || 'صنف'
       return `
@@ -105,6 +130,9 @@ export default function POSKitchen() {
         </tr>
       `
     }).join('')
+
+    const printWindow = window.open('', '_blank', 'width=400,height=600')
+    if (!printWindow) return
 
     printWindow.document.write(`
       <!DOCTYPE html>
@@ -130,20 +158,12 @@ export default function POSKitchen() {
         </div>
         <table>
           <thead>
-            <tr>
-              <th>الصنف</th>
-              <th>الكمية</th>
-              <th>ملاحظات</th>
-            </tr>
+            <tr><th>الصنف</th><th>الكمية</th><th>ملاحظات</th></tr>
           </thead>
-          <tbody>
-            ${items}
-          </tbody>
+          <tbody>${items}</tbody>
         </table>
         ${order.notes ? `<div style="background: #fef3c7; padding: 10px; border-radius: 5px; margin-top: 10px;"><strong>ملاحظات:</strong> ${order.notes}</div>` : ''}
-        <div class="footer">
-          <p>شكراً لكم</p>
-        </div>
+        <div class="footer"><p>شكراً لكم</p></div>
         <script>window.onload = function() { window.print(); }</script>
       </body>
       </html>
@@ -169,7 +189,7 @@ export default function POSKitchen() {
           </div>
           <div>
             <h1 className="text-2xl font-bold text-gray-900">شاشة المطبخ</h1>
-            <p className="text-gray-600">الطلبات النشطة: {orders.length}</p>
+            <p className="text-gray-600">الطلبات النشطة: {kitchenOrders.length}</p>
           </div>
         </div>
         <button
@@ -181,7 +201,7 @@ export default function POSKitchen() {
       </div>
 
       {/* Orders Grid */}
-      {orders.length === 0 ? (
+      {kitchenOrders.length === 0 ? (
         <div className="text-center py-16 bg-white rounded-lg border border-gray-100">
           <ChefHat className="w-16 h-16 text-gray-400 mx-auto mb-4" />
           <h3 className="text-xl font-medium text-gray-900 mb-2">لا توجد طلبات</h3>
@@ -189,7 +209,7 @@ export default function POSKitchen() {
         </div>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-          {orders.map(order => (
+          {kitchenOrders.map(order => (
             <div
               key={order.id}
               className={`rounded-lg border-2 overflow-hidden ${getStatusColor(order.status)}`}
@@ -227,31 +247,25 @@ export default function POSKitchen() {
                 </div>
               </div>
 
-              {/* Order Items */}
+              {/* Order Items - Kitchen items only */}
               <div className="p-4 bg-white space-y-2">
-                {order.items && order.items.length > 0 ? (
-                  order.items.map(item => {
-                    const itemData = item as unknown as { menu_item?: { name_ar: string }, item?: { name_ar: string } }
-                    const itemName = itemData.item?.name_ar || itemData.menu_item?.name_ar || 'صنف غير معروف'
-                    return (
-                      <div key={item.id} className="flex items-center gap-3">
-                        <span className="w-8 h-8 bg-blue-100 text-blue-600 rounded-full flex items-center justify-center font-bold text-sm">
-                          {item.quantity}
-                        </span>
-                        <div className="flex-1">
-                          <p className="font-medium text-gray-900">
-                            {itemName}
-                          </p>
-                          {item.notes && (
-                            <p className="text-sm text-orange-600">{item.notes}</p>
-                          )}
-                        </div>
+                {order.kitchenItems.map(item => {
+                  const itemData = item as unknown as { menu_item?: { name_ar: string }, item?: { name_ar: string } }
+                  const itemName = itemData.item?.name_ar || itemData.menu_item?.name_ar || 'صنف غير معروف'
+                  return (
+                    <div key={item.id} className="flex items-center gap-3">
+                      <span className="w-8 h-8 bg-blue-100 text-blue-600 rounded-full flex items-center justify-center font-bold text-sm">
+                        {item.quantity}
+                      </span>
+                      <div className="flex-1">
+                        <p className="font-medium text-gray-900">{itemName}</p>
+                        {item.notes && (
+                          <p className="text-sm text-orange-600">{item.notes}</p>
+                        )}
                       </div>
-                    )
-                  })
-                ) : (
-                  <p className="text-gray-500 text-sm text-center py-2">لا توجد أصناف</p>
-                )}
+                    </div>
+                  )
+                })}
               </div>
 
               {/* Order Actions */}

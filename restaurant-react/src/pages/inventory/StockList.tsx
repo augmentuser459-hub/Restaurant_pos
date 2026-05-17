@@ -3,7 +3,7 @@ import { Link } from 'react-router-dom'
 import { inventoryService, InventoryWithDetails } from '../../services/inventory.service'
 import { branchesService } from '../../services/branches.service'
 import { Branch } from '../../types/database.types'
-import { Package, Search, Filter, Plus, Download, Upload, Edit2, Save, X, Trash2, Barcode as BarcodeIcon, Copy, Check } from 'lucide-react'
+import { Package, Search, Filter, Plus, Download, Upload, Edit2, Save, X, Trash2, Barcode as BarcodeIcon, Copy, Check, CheckSquare, Square } from 'lucide-react'
 import ReactBarcode from 'react-barcode'
 import { formatNumber } from '../../lib/utils'
 import { exportToExcel, inventoryColumns, parseCSV, readFileAsText } from '../../lib/excel'
@@ -22,22 +22,31 @@ export default function StockList() {
   const [itemsPerPage] = useState(250)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const [editingItemId, setEditingItemId] = useState<string | null>(null)
+  const [editingInvId, setEditingInvId] = useState<string | null>(null)
   const [editFormData, setEditFormData] = useState<{
     name_ar: string
     code: string
     barcode: string
     purchase_price: number
     selling_price: number
+    quantity: number
+    opening_balance: number
+    category_id: string
   }>({
     name_ar: '',
     code: '',
     barcode: '',
     purchase_price: 0,
-    selling_price: 0
+    selling_price: 0,
+    quantity: 0,
+    opening_balance: 0,
+    category_id: ''
   })
   const [saving, setSaving] = useState(false)
   const [showBarcode, setShowBarcode] = useState(false)
   const [copiedId, setCopiedId] = useState<string | null>(null)
+  const [selectedItems, setSelectedItems] = useState<Set<string>>(new Set())
+  const [bulkDeleting, setBulkDeleting] = useState(false)
 
   useEffect(() => {
     fetchData()
@@ -113,7 +122,7 @@ export default function StockList() {
 
   // Handle edit item
   const handleEditItem = (inv: InventoryWithDetails) => {
-    const item = inv.item as { id: string; name_ar?: string; code?: string; barcode?: string; purchase_price?: number; selling_price?: number }
+    const item = inv.item as { id: string; name_ar?: string; code?: string; barcode?: string; purchase_price?: number; selling_price?: number; category_id?: string; category?: { id: string } }
     // Convert scientific notation to full number string
     const toFullString = (v: string | number | undefined) => {
       if (!v) return ''
@@ -126,23 +135,31 @@ export default function StockList() {
       return s
     }
     setEditingItemId(item.id)
+    setEditingInvId(inv.id)
     setEditFormData({
       name_ar: item.name_ar || '',
       code: toFullString(item.code),
       barcode: toFullString(item.barcode),
       purchase_price: item.purchase_price || 0,
-      selling_price: item.selling_price || 0
+      selling_price: item.selling_price || 0,
+      quantity: inv.quantity || 0,
+      opening_balance: inv.opening_balance || 0,
+      category_id: item.category_id || item.category?.id || ''
     })
   }
 
   const handleCancelEdit = () => {
     setEditingItemId(null)
+    setEditingInvId(null)
     setEditFormData({
       name_ar: '',
       code: '',
       barcode: '',
       purchase_price: 0,
-      selling_price: 0
+      selling_price: 0,
+      quantity: 0,
+      opening_balance: 0,
+      category_id: ''
     })
   }
 
@@ -152,26 +169,51 @@ export default function StockList() {
     setSaving(true)
     
     // Update item in database
+    const itemUpdateData: Record<string, unknown> = {
+      name_ar: editFormData.name_ar,
+      code: editFormData.code,
+      barcode: editFormData.barcode || null,
+      purchase_price: editFormData.purchase_price,
+      selling_price: editFormData.selling_price,
+      updated_at: new Date().toISOString()
+    }
+    if (editFormData.category_id) {
+      itemUpdateData.category_id = editFormData.category_id
+    }
+    
     const { error } = await supabase
       .from('items')
-      .update({
-        name_ar: editFormData.name_ar,
-        code: editFormData.code,
-        barcode: editFormData.barcode || null,
-        purchase_price: editFormData.purchase_price,
-        selling_price: editFormData.selling_price,
-        updated_at: new Date().toISOString()
-      })
+      .update(itemUpdateData)
       .eq('id', editingItemId)
     
     if (error) {
-      alert('فشل في حفظ التعديلات: ' + error.message)
-    } else {
-      // Refresh stock data
-      await fetchStock()
-      handleCancelEdit()
-      alert('تم حفظ التعديلات بنجاح')
+      alert('فشل في حفظ تعديلات الصنف: ' + error.message)
+      setSaving(false)
+      return
     }
+    
+    // Update inventory record (quantity + opening_balance)
+    if (editingInvId) {
+      const { error: invError } = await supabase
+        .from('inventory')
+        .update({
+          quantity: editFormData.quantity,
+          opening_balance: editFormData.opening_balance,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', editingInvId)
+      
+      if (invError) {
+        alert('تم حفظ بيانات الصنف لكن فشل تحديث الكمية: ' + invError.message)
+        setSaving(false)
+        return
+      }
+    }
+    
+    // Refresh stock data
+    await fetchStock()
+    handleCancelEdit()
+    alert('تم حفظ التعديلات بنجاح')
     
     setSaving(false)
   }
@@ -220,6 +262,81 @@ export default function StockList() {
       setCopiedId(itemId)
       setTimeout(() => setCopiedId(null), 2000)
     })
+  }
+
+  // Bulk selection handlers
+  const handleToggleSelect = (invId: string) => {
+    setSelectedItems(prev => {
+      const next = new Set(prev)
+      if (next.has(invId)) {
+        next.delete(invId)
+      } else {
+        next.add(invId)
+      }
+      return next
+    })
+  }
+
+  const handleSelectAll = () => {
+    if (selectedItems.size === paginatedStock.length) {
+      // Deselect all
+      setSelectedItems(new Set())
+    } else {
+      // Select all on current page
+      setSelectedItems(new Set(paginatedStock.map(inv => inv.id)))
+    }
+  }
+
+  const handleBulkDelete = async () => {
+    if (selectedItems.size === 0) return
+    
+    const count = selectedItems.size
+    if (!confirm(`هل أنت متأكد من حذف ${count} صنف؟\nسيتم حذف الأصناف ومخزونها نهائياً.`)) {
+      return
+    }
+
+    setBulkDeleting(true)
+    let successCount = 0
+    let errorCount = 0
+
+    const itemsToDelete = stock.filter(inv => selectedItems.has(inv.id))
+
+    // Process in batches of 20
+    const BATCH_SIZE = 20
+    for (let i = 0; i < itemsToDelete.length; i += BATCH_SIZE) {
+      const batch = itemsToDelete.slice(i, i + BATCH_SIZE)
+      
+      for (const inv of batch) {
+        try {
+          const item = inv.item as { id: string }
+          // Delete inventory record
+          const { error: invError } = await supabase
+            .from('inventory')
+            .delete()
+            .eq('id', inv.id)
+
+          if (invError) {
+            errorCount++
+            continue
+          }
+
+          // Try to delete item (may fail if referenced elsewhere)
+          await inventoryService.deleteItem(item.id).catch(() => {})
+          successCount++
+        } catch {
+          errorCount++
+        }
+      }
+    }
+
+    // Update local state
+    setStock(prev => prev.filter(s => !selectedItems.has(s.id)))
+    setSelectedItems(new Set())
+    setBulkDeleting(false)
+
+    let msg = `تم حذف ${successCount} صنف بنجاح`
+    if (errorCount > 0) msg += `\nفشل حذف ${errorCount} صنف`
+    alert(msg)
   }
 
   // Convert scientific notation (3.50E+12) to full number string (3500000000000)
@@ -662,6 +779,40 @@ export default function StockList() {
         </div>
       </div>
 
+      {/* Bulk Delete Action Bar */}
+      {selectedItems.size > 0 && (
+        <div className="bg-red-50 border border-red-200 rounded-lg p-4 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <CheckSquare className="w-5 h-5 text-red-600" />
+            <span className="font-medium text-red-800">
+              تم اختيار {selectedItems.size} صنف
+            </span>
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => setSelectedItems(new Set())}
+              className="px-4 py-2 text-gray-600 bg-white border border-gray-300 rounded-lg hover:bg-gray-50"
+            >
+              إلغاء الاختيار
+            </button>
+            <button
+              type="button"
+              onClick={handleBulkDelete}
+              disabled={bulkDeleting}
+              className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 flex items-center gap-2 disabled:opacity-50"
+            >
+              {bulkDeleting ? (
+                <span className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+              ) : (
+                <Trash2 className="w-4 h-4" />
+              )}
+              حذف المحدد ({selectedItems.size})
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Stats */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
         <div className="bg-white rounded-lg shadow-sm p-4 border border-gray-100">
@@ -699,6 +850,20 @@ export default function StockList() {
             <table className="w-full">
               <thead className="bg-blue-100">
                 <tr>
+                  <th className="px-2 py-3 text-center">
+                    <button
+                      type="button"
+                      onClick={handleSelectAll}
+                      className="p-1 hover:bg-blue-200 rounded transition-colors"
+                      title={selectedItems.size === paginatedStock.length ? 'إلغاء اختيار الكل' : 'اختيار الكل'}
+                    >
+                      {selectedItems.size === paginatedStock.length && paginatedStock.length > 0 ? (
+                        <CheckSquare className="w-4 h-4 text-blue-700" />
+                      ) : (
+                        <Square className="w-4 h-4 text-gray-500" />
+                      )}
+                    </button>
+                  </th>
                   <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">م</th>
                   <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">مجموعة</th>
                   <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">
@@ -739,7 +904,20 @@ export default function StockList() {
                     : formatCodeValue(item?.code)
                   
                   return (
-                    <tr key={inv.id} className={index % 2 === 0 ? 'bg-white' : 'bg-gray-50'}>
+                    <tr key={inv.id} className={`${index % 2 === 0 ? 'bg-white' : 'bg-gray-50'} ${selectedItems.has(inv.id) ? '!bg-blue-50' : ''}`}>
+                      <td className="px-2 py-3 text-center">
+                        <button
+                          type="button"
+                          onClick={() => handleToggleSelect(inv.id)}
+                          className="p-1 hover:bg-blue-100 rounded transition-colors"
+                        >
+                          {selectedItems.has(inv.id) ? (
+                            <CheckSquare className="w-4 h-4 text-blue-600" />
+                          ) : (
+                            <Square className="w-4 h-4 text-gray-400" />
+                          )}
+                        </button>
+                      </td>
                       <td className="px-4 py-3 text-gray-900">{globalIndex}</td>
                       <td className="px-4 py-3 text-gray-600">{categoryName}</td>
                       <td className="px-4 py-3">
@@ -805,10 +983,36 @@ export default function StockList() {
                           <span className="text-gray-900">{item?.name_ar || '-'}</span>
                         )}
                       </td>
-                      <td className="px-4 py-3 text-gray-600">{formatNumber(inv.opening_balance || 0)}</td>
+                      <td className="px-4 py-3 text-gray-600">
+                        {isEditing ? (
+                          <input
+                            type="number"
+                            step="0.01"
+                            value={editFormData.opening_balance}
+                            onChange={(e) => setEditFormData({ ...editFormData, opening_balance: parseFloat(e.target.value) || 0 })}
+                            className="w-24 px-2 py-1 border border-blue-300 rounded text-sm"
+                            dir="ltr"
+                          />
+                        ) : (
+                          formatNumber(inv.opening_balance || 0)
+                        )}
+                      </td>
                       <td className="px-4 py-3 text-gray-600">-</td>
                       <td className="px-4 py-3 text-gray-600">-</td>
-                      <td className="px-4 py-3 text-gray-900 font-medium">{formatNumber(inv.quantity)}</td>
+                      <td className="px-4 py-3 text-gray-900 font-medium">
+                        {isEditing ? (
+                          <input
+                            type="number"
+                            step="0.01"
+                            value={editFormData.quantity}
+                            onChange={(e) => setEditFormData({ ...editFormData, quantity: parseFloat(e.target.value) || 0 })}
+                            className="w-24 px-2 py-1 border border-blue-300 rounded text-sm"
+                            dir="ltr"
+                          />
+                        ) : (
+                          formatNumber(inv.quantity)
+                        )}
+                      </td>
                       <td className="px-4 py-3 text-gray-500 text-sm">{unitName}</td>
                       <td className="px-4 py-3">
                         {isEditing ? (
@@ -893,6 +1097,20 @@ export default function StockList() {
             <table className="w-full">
               <thead className="bg-red-100">
                 <tr>
+                  <th className="px-2 py-3 text-center">
+                    <button
+                      type="button"
+                      onClick={handleSelectAll}
+                      className="p-1 hover:bg-red-200 rounded transition-colors"
+                      title={selectedItems.size === paginatedStock.length ? 'إلغاء اختيار الكل' : 'اختيار الكل'}
+                    >
+                      {selectedItems.size === paginatedStock.length && paginatedStock.length > 0 ? (
+                        <CheckSquare className="w-4 h-4 text-red-700" />
+                      ) : (
+                        <Square className="w-4 h-4 text-gray-500" />
+                      )}
+                    </button>
+                  </th>
                   <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">م</th>
                   <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">التاريخ</th>
                   <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">رقم المستند</th>
@@ -934,7 +1152,20 @@ export default function StockList() {
                     : formatCodeValue(item?.code)
 
                   return (
-                    <tr key={inv.id} className={index % 2 === 0 ? 'bg-white' : 'bg-gray-50'}>
+                    <tr key={inv.id} className={`${index % 2 === 0 ? 'bg-white' : 'bg-gray-50'} ${selectedItems.has(inv.id) ? '!bg-red-50' : ''}`}>
+                      <td className="px-2 py-3 text-center">
+                        <button
+                          type="button"
+                          onClick={() => handleToggleSelect(inv.id)}
+                          className="p-1 hover:bg-red-100 rounded transition-colors"
+                        >
+                          {selectedItems.has(inv.id) ? (
+                            <CheckSquare className="w-4 h-4 text-red-600" />
+                          ) : (
+                            <Square className="w-4 h-4 text-gray-400" />
+                          )}
+                        </button>
+                      </td>
                       <td className="px-4 py-3 text-gray-900">{globalIndex}</td>
                       <td className="px-4 py-3 text-gray-600">{formatDate(createdAt)}</td>
                       <td className="px-4 py-3 text-gray-900 font-mono">{getDocNumber(createdAt, index)}</td>
@@ -1001,9 +1232,29 @@ export default function StockList() {
                           <span className="text-gray-900">{item?.name_ar || '-'}</span>
                         )}
                       </td>
-                      <td className="px-4 py-3 text-gray-600">{formatNumber(Math.floor(totalQty))}</td>
+                      <td className="px-4 py-3 text-gray-600">
+                        {isEditing ? (
+                          <input
+                            type="number"
+                            step="0.01"
+                            value={editFormData.quantity}
+                            onChange={(e) => setEditFormData({ ...editFormData, quantity: parseFloat(e.target.value) || 0 })}
+                            className="w-20 px-2 py-1 border border-blue-300 rounded text-sm"
+                            dir="ltr"
+                            title="جزئي"
+                          />
+                        ) : (
+                          formatNumber(Math.floor(totalQty))
+                        )}
+                      </td>
                       <td className="px-4 py-3 text-gray-600">1</td>
-                      <td className="px-4 py-3 text-gray-900 font-medium">{formatNumber(totalQty)}</td>
+                      <td className="px-4 py-3 text-gray-900 font-medium">
+                        {isEditing ? (
+                          <span className="font-medium">{formatNumber(editFormData.quantity)}</span>
+                        ) : (
+                          formatNumber(totalQty)
+                        )}
+                      </td>
                       <td className="px-4 py-3 text-gray-500 text-sm">{unitName}</td>
                       <td className="px-4 py-3">
                         {isEditing ? (

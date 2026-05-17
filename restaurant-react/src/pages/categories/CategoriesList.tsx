@@ -10,6 +10,7 @@ interface Category {
   name_ar: string
   description?: string
   is_active: boolean
+  is_kitchen: boolean
   sort_order: number
   item_count?: number
 }
@@ -93,6 +94,19 @@ export default function CategoriesList() {
 
     if (error) {
       alert('فشل في تحديث الحالة')
+    } else {
+      fetchCategories()
+    }
+  }
+
+  const handleToggleKitchen = async (id: string, currentStatus: boolean) => {
+    const { error } = await supabase
+      .from('categories')
+      .update({ is_kitchen: !currentStatus })
+      .eq('id', id)
+
+    if (error) {
+      alert('فشل في تحديث إعداد المطبخ')
     } else {
       fetchCategories()
     }
@@ -216,17 +230,32 @@ export default function CategoriesList() {
                         {category.item_count || 0} {activeTab === 'items' ? 'صنف' : 'وصفة'}
                       </span>
                     </div>
-                    <button
-                      type="button"
-                      onClick={() => handleToggleActive(category.id, category.is_active)}
-                      className={`px-3 py-1 text-xs font-medium rounded-full ${
-                        category.is_active
-                          ? 'bg-green-100 text-green-700'
-                          : 'bg-gray-100 text-gray-600'
-                      }`}
-                    >
-                      {category.is_active ? 'نشط' : 'غير نشط'}
-                    </button>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => handleToggleKitchen(category.id, category.is_kitchen)}
+                        className={`px-3 py-1 text-xs font-medium rounded-full flex items-center gap-1 ${
+                          category.is_kitchen
+                            ? 'bg-orange-100 text-orange-700'
+                            : 'bg-gray-100 text-gray-500'
+                        }`}
+                        title={category.is_kitchen ? 'يظهر في المطبخ - اضغط لإخفائه' : 'مخفي من المطبخ - اضغط لإظهاره'}
+                      >
+                        <ChefHat className="w-3 h-3" />
+                        {category.is_kitchen ? 'مطبخ' : 'غير مطبخ'}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleToggleActive(category.id, category.is_active)}
+                        className={`px-3 py-1 text-xs font-medium rounded-full ${
+                          category.is_active
+                            ? 'bg-green-100 text-green-700'
+                            : 'bg-gray-100 text-gray-600'
+                        }`}
+                      >
+                        {category.is_active ? 'نشط' : 'غير نشط'}
+                      </button>
+                    </div>
                   </div>
                 </div>
               ))}
