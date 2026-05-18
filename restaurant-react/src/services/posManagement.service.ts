@@ -55,6 +55,7 @@ export const posManagementService = {
       .select('*')
       .eq('branch_id', branchId)
       .order('display_order')
+      .limit(10000)
 
     if (error) return { data: null, error }
 
@@ -87,7 +88,7 @@ export const posManagementService = {
     return { data: fixEncodingInData(itemsWithCosts) as BranchPOSItem[], error: null }
   },
 
-  // Get all branches with their POS item counts
+  // Get all branches with their POS item counts - count per branch to avoid 1000 row limit
   async getBranchesWithItemCounts() {
     const { data: branches, error: branchError } = await supabase
       .from('branches')
@@ -98,22 +99,20 @@ export const posManagementService = {
 
     if (branchError) return { data: null, error: branchError }
 
-    // Get item counts for each branch
-    const { data: itemCounts, error: countError } = await supabase
-      .from('branch_pos_items')
-      .select('branch_id')
+    // Count per branch separately to avoid the 1000-row global limit
+    const branchesWithCounts = await Promise.all(
+      (branches || []).map(async (branch) => {
+        const { count } = await supabase
+          .from('branch_pos_items')
+          .select('*', { count: 'exact', head: true })
+          .eq('branch_id', branch.id)
 
-    if (countError) return { data: branches, error: null }
-
-    const counts = itemCounts?.reduce((acc, item) => {
-      acc[item.branch_id] = (acc[item.branch_id] || 0) + 1
-      return acc
-    }, {} as Record<string, number>)
-
-    const branchesWithCounts = branches?.map(branch => ({
-      ...branch,
-      itemCount: counts?.[branch.id] || 0
-    }))
+        return {
+          ...branch,
+          itemCount: count || 0
+        }
+      })
+    )
 
     return { data: fixEncodingInData(branchesWithCounts), error: null }
   },
@@ -126,12 +125,13 @@ export const posManagementService = {
         item_id,
         quantity,
         item:items(
-          id, code, name, name_ar, is_recipe, image_url,
+          id, code, name, name_ar, is_recipe, image_url, selling_price, purchase_price,
           unit:units(name_ar)
         )
       `)
       .eq('branch_id', branchId)
       .order('item(name_ar)')
+      .limit(10000)
 
     if (error) return { data: null, error }
 
@@ -147,6 +147,8 @@ export const posManagementService = {
           name_ar: item.name_ar,
           is_recipe: item.is_recipe,
           image_url: item.image_url,
+          selling_price: item.selling_price,
+          purchase_price: item.purchase_price,
           unit: Array.isArray(item.unit) ? item.unit[0] : item.unit,
           stock_quantity: inv.quantity
         }
@@ -180,6 +182,62 @@ export const posManagementService = {
       .single()
 
     return { data, error }
+  },
+
+  // Fix zero prices: update branch_pos_items.price from items.selling_price in batches
+  async fixPricesFromInventory(branchId: string, onProgress?: (done: number, total: number) => void) {
+    // Get all POS items with price = 0 for this branch
+    const { data: zeroPriceItems, error: fetchError } = await supabase
+      .from('branch_pos_items')
+      .select('id, item_id')
+      .eq('branch_id', branchId)
+      .eq('price', 0)
+      .limit(10000)
+
+    if (fetchError || !zeroPriceItems || zeroPriceItems.length === 0) {
+      return { updated: 0, error: fetchError }
+    }
+
+    // Get all item prices in one query
+    const itemIds = zeroPriceItems.map(p => p.item_id)
+    const { data: items, error: itemsError } = await supabase
+      .from('items')
+      .select('id, selling_price, purchase_price')
+      .in('id', itemIds)
+
+    if (itemsError || !items) return { updated: 0, error: itemsError }
+
+    // Build item price map
+    const priceMap = new Map(items.map(i => [i.id, i.selling_price || i.purchase_price || 0]))
+
+    // Filter only items that have a valid price > 0
+    const itemsToFix = zeroPriceItems.filter(p => {
+      const price = priceMap.get(p.item_id) || 0
+      return price > 0
+    })
+
+    if (itemsToFix.length === 0) return { updated: 0, error: null }
+
+    const total = itemsToFix.length
+    let updated = 0
+    const BATCH_SIZE = 50
+
+    for (let i = 0; i < itemsToFix.length; i += BATCH_SIZE) {
+      const batch = itemsToFix.slice(i, i + BATCH_SIZE).map(p => ({
+        id: p.id,
+        price: priceMap.get(p.item_id) || 0,
+        updated_at: new Date().toISOString()
+      }))
+
+      const { error } = await supabase
+        .from('branch_pos_items')
+        .upsert(batch)
+
+      if (!error) updated += batch.length
+      if (onProgress) onProgress(Math.min(i + BATCH_SIZE, total), total)
+    }
+
+    return { updated, error: null }
   },
 
   // Remove item from POS

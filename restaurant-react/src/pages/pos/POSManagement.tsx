@@ -3,7 +3,7 @@ import { posManagementService, BranchPOSItem, AvailableInventoryItem } from '../
 import { formatCurrency } from '../../lib/utils'
 import { 
   Store, DollarSign, Save, Copy, Percent, 
-  Check, X, Eye, EyeOff, Search, Plus, Trash2, Package, PackagePlus
+  Check, X, Eye, EyeOff, Search, Plus, Trash2, Package, PackagePlus, RefreshCw
 } from 'lucide-react'
 
 interface Branch {
@@ -33,6 +33,8 @@ export default function POSManagement() {
   const [newItemPrice, setNewItemPrice] = useState<string>('')
   const [bulkAdding, setBulkAdding] = useState(false)
   const [bulkAddProgress, setBulkAddProgress] = useState<{ done: number; total: number } | null>(null)
+  const [fixingPrices, setFixingPrices] = useState(false)
+  const [fixPricesProgress, setFixPricesProgress] = useState<{ done: number; total: number } | null>(null)
 
   useEffect(() => {
     fetchBranches()
@@ -201,6 +203,32 @@ export default function POSManagement() {
     alert(msg)
   }
 
+  const handleFixPrices = async () => {
+    if (!selectedBranch) return
+
+    if (!confirm('هل تريد تحديث أسعار البيع من المخزون؟\nسيتم استبدال كل الأسعار الصفرية بالسعر الموجود في بيانات الصنف.')) return
+
+    setFixingPrices(true)
+    setFixPricesProgress({ done: 0, total: 0 })
+
+    const { updated, error } = await posManagementService.fixPricesFromInventory(
+      selectedBranch,
+      (done, total) => setFixPricesProgress({ done, total })
+    )
+
+    setFixingPrices(false)
+    setFixPricesProgress(null)
+
+    if (error) {
+      alert('حدث خطأ أثناء تحديث الأسعار')
+    } else if (updated === 0) {
+      alert('لا توجد أسعار صفرية تحتاج إلى تحديث ✓')
+    } else {
+      alert(`تم تحديث ${updated} سعر بنجاح ✓`)
+      await fetchPOSItems(selectedBranch)
+    }
+  }
+
   const handleCopyPrices = async () => {
     if (!selectedBranch || !copySourceBranch) return
     
@@ -230,15 +258,24 @@ export default function POSManagement() {
     if (!searchTerm) return true
     const term = searchTerm.toLowerCase()
     return (
-      p.item?.name?.toLowerCase().includes(term) ||
-      p.item?.name_ar?.toLowerCase().includes(term) ||
-      p.item?.code?.toLowerCase().includes(term)
+      p.item?.name?.toLowerCase()?.includes(term) ||
+      p.item?.name_ar?.toLowerCase()?.includes(term) ||
+      p.item?.code?.toLowerCase()?.includes(term)
     )
   })
 
-  // Filter available items to exclude already added ones
+  // Filter available items to exclude already added ones (unless their price is 0 and we can fix it)
   const itemsToAdd = availableItems.filter(
-    item => !posItems.some(pos => pos.item_id === item.id)
+    avail => {
+      const pos = posItems.find(pos => pos.item_id === avail.id)
+      if (!pos) return true // Not added yet
+      
+      // If it's already added but price is 0, and inventory has a valid price, include it for update
+      const validPrice = (avail as any).selling_price || (avail as any).purchase_price || 0
+      if (pos.price === 0 && validPrice > 0) return true
+      
+      return false
+    }
   )
 
   const selectedBranchData = branches.find(b => b.id === selectedBranch)
@@ -337,6 +374,24 @@ export default function POSManagement() {
                   {bulkAdding 
                     ? `جاري الإضافة... (${bulkAddProgress?.done || 0}/${bulkAddProgress?.total || 0})`
                     : `إضافة الكل (${itemsToAdd.length})`
+                  }
+                </button>
+
+                {/* Fix Prices Button */}
+                <button
+                  onClick={handleFixPrices}
+                  disabled={fixingPrices}
+                  className="flex items-center gap-2 px-3 py-2 text-sm bg-yellow-50 text-yellow-700 rounded-lg hover:bg-yellow-100 disabled:opacity-50 disabled:cursor-not-allowed"
+                  title="تحديث أسعار البيع من المخزون"
+                >
+                  {fixingPrices ? (
+                    <span className="w-4 h-4 border-2 border-yellow-700 border-t-transparent rounded-full animate-spin" />
+                  ) : (
+                    <RefreshCw className="w-4 h-4" />
+                  )}
+                  {fixingPrices
+                    ? `جاري التحديث... (${fixPricesProgress?.done || 0}/${fixPricesProgress?.total || 0})`
+                    : 'تحديث الأسعار'
                   }
                 </button>
 
