@@ -48,39 +48,46 @@ export interface AvailableInventoryItem {
 }
 
 export const posManagementService = {
-  // Get all branch POS items for a specific branch (with stock info)
+  // Get all branch POS items for a specific branch - paginated to bypass 1000 row Supabase limit
   async getBranchPOSItems(branchId: string) {
-    const { data, error } = await supabase
-      .from('v_branch_pos_items_with_stock')
-      .select('*')
-      .eq('branch_id', branchId)
-      .order('display_order')
-      .limit(10000)
+    const BATCH_SIZE = 1000
+    let allData: any[] = []
+    let start = 0
+    let hasMore = true
 
-    if (error) return { data: null, error }
+    while (hasMore) {
+      const { data, error } = await supabase
+        .from('v_branch_pos_items_with_stock')
+        .select('*')
+        .eq('branch_id', branchId)
+        .order('display_order')
+        .range(start, start + BATCH_SIZE - 1)
+
+      if (error) return { data: null, error }
+
+      if (data && data.length > 0) {
+        allData = [...allData, ...data]
+        start += BATCH_SIZE
+        hasMore = data.length === BATCH_SIZE
+      } else {
+        hasMore = false
+      }
+    }
 
     // Parse item JSONB and calculate recipe costs
     const itemsWithCosts = await Promise.all(
-      (data || []).map(async (row: any) => {
-        // Parse item from JSONB
+      allData.map(async (row: any) => {
         const item = typeof row.item === 'string' ? JSON.parse(row.item) : row.item
-        
         let calculatedCost = item?.purchase_price || 0
-        
-        // If it's a recipe, calculate cost from ingredients
         if (item?.is_recipe) {
           const { data: costData } = await supabase.rpc('calculate_recipe_cost', {
             recipe_item_id: row.item_id
           })
           calculatedCost = costData || 0
         }
-        
         return {
           ...row,
-          item: {
-            ...item,
-            calculated_cost: calculatedCost
-          }
+          item: { ...item, calculated_cost: calculatedCost }
         }
       })
     )
@@ -117,27 +124,42 @@ export const posManagementService = {
     return { data: fixEncodingInData(branchesWithCounts), error: null }
   },
 
-  // Get available inventory items for a branch (recipes + selected products)
+  // Get available inventory items for a branch - paginated to bypass 1000 row Supabase limit
   async getAvailableInventoryItems(branchId: string) {
-    const { data, error } = await supabase
-      .from('inventory')
-      .select(`
-        item_id,
-        quantity,
-        item:items(
-          id, code, name, name_ar, is_recipe, image_url, selling_price, purchase_price,
-          unit:units(name_ar)
-        )
-      `)
-      .eq('branch_id', branchId)
-      .order('item(name_ar)')
-      .limit(10000)
+    const BATCH_SIZE = 1000
+    let allRaw: any[] = []
+    let start = 0
+    let hasMore = true
 
-    if (error) return { data: null, error }
+    while (hasMore) {
+      const { data, error } = await supabase
+        .from('inventory')
+        .select(`
+          item_id,
+          quantity,
+          item:items(
+            id, code, name, name_ar, is_recipe, image_url, selling_price, purchase_price,
+            unit:units(name_ar)
+          )
+        `)
+        .eq('branch_id', branchId)
+        .order('item_id')
+        .range(start, start + BATCH_SIZE - 1)
+
+      if (error) return { data: null, error }
+
+      if (data && data.length > 0) {
+        allRaw = [...allRaw, ...data]
+        start += BATCH_SIZE
+        hasMore = data.length === BATCH_SIZE
+      } else {
+        hasMore = false
+      }
+    }
 
     // Filter and transform
-    const items = data
-      ?.filter(inv => inv.item && !Array.isArray(inv.item))
+    const items = allRaw
+      .filter(inv => inv.item && !Array.isArray(inv.item))
       .map(inv => {
         const item = Array.isArray(inv.item) ? inv.item[0] : inv.item
         return {
