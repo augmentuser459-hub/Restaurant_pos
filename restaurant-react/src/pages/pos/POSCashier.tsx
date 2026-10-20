@@ -176,7 +176,7 @@ export default function POSCashier() {
     if (viewMode === 'items' && item.is_recipe) return false
     if (viewMode === 'recipes' && !item.is_recipe) return false
     
-    // Filter by search term (including barcode)
+    // Filter by search term (including barcode) - BYPASSES category filter
     if (searchTerm) {
       const term = searchTerm.toLowerCase()
       return (
@@ -186,6 +186,7 @@ export default function POSCashier() {
         (item as any).barcode?.toLowerCase().includes(term)
       )
     }
+    
     // Filter by category if selected
     if (selectedCategory) {
       return item.category_id === selectedCategory

@@ -168,21 +168,41 @@ export const ordersService = {
 
   // Get kitchen orders (for kitchen display)
   async getKitchenOrders(branchId: string) {
-    const { data, error } = await supabase
-      .from('orders')
-      .select(`
-        *,
-        items:order_items(
-          *,
-          menu_item:menu_items(id, name_ar, code, category_id),
-          item:items(id, name_ar, code, category_id)
-        )
-      `)
-      .eq('branch_id', branchId)
-      .in('status', ['paid', 'in_kitchen', 'preparing'])
-      .order('created_at', { ascending: true })
+    const BATCH_SIZE = 1000
+    let allOrders: any[] = []
+    let start = 0
+    let hasMore = true
 
-    return { data: fixEncodingInData(data) as OrderWithDetails[], error }
+    while (hasMore) {
+      const { data, error } = await supabase
+        .from('orders')
+        .select(`
+          *,
+          items:order_items(
+            *,
+            menu_item:menu_items(id, name_ar, code, category_id),
+            item:items(id, name_ar, code, category_id)
+          )
+        `)
+        .eq('branch_id', branchId)
+        .in('status', ['paid', 'in_kitchen', 'preparing'])
+        .order('created_at', { ascending: false })
+        .range(start, start + BATCH_SIZE - 1)
+
+      if (error) {
+        return { data: fixEncodingInData(allOrders) as OrderWithDetails[], error }
+      }
+
+      if (!data || data.length === 0) {
+        hasMore = false
+      } else {
+        allOrders = [...allOrders, ...data]
+        hasMore = data.length === BATCH_SIZE
+        start += BATCH_SIZE
+      }
+    }
+
+    return { data: fixEncodingInData(allOrders) as OrderWithDetails[], error: null }
   },
 
   // Get menu items for POS

@@ -395,30 +395,66 @@ export const posManagementService = {
   // Get POS items for cashier - reads directly from inventory
   // Any item with stock in the branch automatically appears in POS
   async getPOSItemsForCashier(branchId: string) {
-    // First try the managed POS items view
-    const { data: posData } = await supabase
-      .from('v_branch_pos_items_with_stock')
-      .select('*')
-      .eq('branch_id', branchId)
-      .eq('is_available', true)
-      .order('display_order')
+    const BATCH_SIZE = 1000
 
-    // Also get ALL inventory items for this branch (auto-populate)
-    const { data: invData, error: invError } = await supabase
-      .from('inventory')
-      .select(`
-        id,
-        item_id,
-        quantity,
-        branch_id,
-        item:items(
-          id, code, barcode, name, name_ar, is_recipe, image_url,
-          selling_price, purchase_price, category_id,
-          unit:units(name_ar, code)
-        )
-      `)
-      .eq('branch_id', branchId)
-      .gt('quantity', 0)
+    // First try the managed POS items view - with pagination
+    let posData: any[] = []
+    let posStart = 0
+    let posHasMore = true
+
+    while (posHasMore) {
+      const { data: posBatch } = await supabase
+        .from('v_branch_pos_items_with_stock')
+        .select('*')
+        .eq('branch_id', branchId)
+        .eq('is_available', true)
+        .order('display_order')
+        .range(posStart, posStart + BATCH_SIZE - 1)
+
+      if (!posBatch || posBatch.length === 0) {
+        posHasMore = false
+      } else {
+        posData = [...posData, ...posBatch]
+        posHasMore = posBatch.length === BATCH_SIZE
+        posStart += BATCH_SIZE
+      }
+    }
+
+    // Also get ALL inventory items for this branch (auto-populate) - with pagination
+    let invData: any[] = []
+    let invStart = 0
+    let invHasMore = true
+    let invError = null
+
+    while (invHasMore) {
+      const { data: invBatch, error: batchError } = await supabase
+        .from('inventory')
+        .select(`
+          id,
+          item_id,
+          quantity,
+          branch_id,
+          item:items(
+            id, code, barcode, name, name_ar, is_recipe, image_url,
+            selling_price, purchase_price, category_id,
+            unit:units(name_ar, code)
+          )
+        `)
+        .eq('branch_id', branchId)
+        .gt('quantity', 0)
+        .range(invStart, invStart + BATCH_SIZE - 1)
+
+      if (batchError) {
+        invError = batchError
+        invHasMore = false
+      } else if (!invBatch || invBatch.length === 0) {
+        invHasMore = false
+      } else {
+        invData = [...invData, ...invBatch]
+        invHasMore = invBatch.length === BATCH_SIZE
+        invStart += BATCH_SIZE
+      }
+    }
 
     if (invError) {
       // Fallback to managed POS items only
@@ -426,10 +462,10 @@ export const posManagementService = {
     }
 
     // Build a set of item_ids already in POS
-    const posItemIds = new Set((posData || []).map((p: any) => p.item_id))
+    const posItemIds = new Set(posData.map((p: any) => p.item_id))
 
     // Transform inventory items into POS format (for items NOT already in POS)
-    const autoItems = (invData || [])
+    const autoItems = invData
       .filter(inv => inv.item && !Array.isArray(inv.item) && !posItemIds.has(inv.item_id))
       .map(inv => {
         const item = Array.isArray(inv.item) ? inv.item[0] : inv.item
@@ -458,7 +494,7 @@ export const posManagementService = {
       })
 
     // Merge: POS managed items first, then auto-populated from inventory
-    const merged = [...(posData || []), ...autoItems]
+    const merged = [...posData, ...autoItems]
     return { data: fixEncodingInData(merged), error: null }
   }
 }

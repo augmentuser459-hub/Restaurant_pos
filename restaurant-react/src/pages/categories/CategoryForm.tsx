@@ -1,7 +1,7 @@
 import { useState, useEffect, FormEvent } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { supabase, fixEncodingInData } from '../../lib/supabase'
-import { Save, ArrowRight, Package, ChefHat, Search } from 'lucide-react'
+import { Save, ArrowRight, Package, ChefHat, Search, X, Trash2 } from 'lucide-react'
 
 interface CategoryFormData {
   code: string
@@ -45,50 +45,104 @@ export default function CategoryForm() {
   const [searchTerm, setSearchTerm] = useState('')
 
   useEffect(() => {
-    fetchItems()
-    if (isEdit && id) fetchCategory(id)
+    loadData()
   }, [id, isEdit, categoryType])
 
-  const fetchItems = async () => {
-    // Fetch items based on category type
-    const { data, error } = await supabase
-      .from('items')
-      .select('id, code, name_ar, is_recipe, category_id')
-      .eq('is_recipe', categoryType === 'recipes')
-      .eq('status', 'active')
-      .order('name_ar')
+  const loadData = async () => {
+    console.log('🔄 Loading data for category:', id, 'type:', categoryType, 'isEdit:', isEdit)
+    
+    // First, fetch ALL items (paginated to bypass 1000 limit)
+    let allItemsData: Item[] = []
+    let start = 0
+    const BATCH_SIZE = 1000
+    let hasMore = true
 
-    if (!error && data) {
-      setAllItems(fixEncodingInData(data) as Item[])
+    while (hasMore) {
+      const { data: itemsBatch, error: itemsError } = await supabase
+        .from('items')
+        .select('id, code, name_ar, is_recipe, category_id')
+        .eq('is_recipe', categoryType === 'recipes')
+        .eq('status', 'active')
+        .order('name_ar')
+        .range(start, start + BATCH_SIZE - 1)
+
+      if (itemsError) {
+        console.error('❌ Items error:', itemsError)
+        break
+      }
+
+      if (itemsBatch && itemsBatch.length > 0) {
+        allItemsData = [...allItemsData, ...itemsBatch]
+        hasMore = itemsBatch.length === BATCH_SIZE
+        start += BATCH_SIZE
+        console.log('📦 Loaded batch:', itemsBatch.length, 'items. Total so far:', allItemsData.length)
+      } else {
+        hasMore = false
+      }
     }
-  }
 
-  const fetchCategory = async (categoryId: string) => {
-    const { data, error } = await supabase
-      .from('categories')
-      .select('*')
-      .eq('id', categoryId)
-      .single()
+    console.log('📦 Total items loaded:', allItemsData.length)
 
-    if (error) {
-      setError('فشل في تحميل بيانات المجموعة')
-    } else if (data) {
-      setFormData({
-        code: data.code,
-        name: data.name,
-        name_ar: data.name_ar,
-        description: data.description || '',
-        sort_order: data.sort_order || 0,
-        is_active: data.is_active,
-      })
+    if (allItemsData.length > 0) {
+      const items = fixEncodingInData(allItemsData) as Item[]
+      setAllItems(items)
+      console.log('✅ Set allItems:', items.length)
 
-      // Get items in this category
-      const itemsInCategory = allItems
-        .filter(item => item.category_id === categoryId)
-        .map(item => item.id)
-      setSelectedItems(new Set(itemsInCategory))
+      // Then, if editing, fetch category and set selected items
+      if (isEdit && id) {
+        console.log('📝 Fetching category:', id)
+        const { data: categoryData, error: categoryError } = await supabase
+          .from('categories')
+          .select('*')
+          .eq('id', id)
+          .single()
+
+        console.log('📂 Category data:', categoryData)
+        if (categoryError) console.error('❌ Category error:', categoryError)
+
+        if (categoryError) {
+          setError('فشل في تحميل بيانات المجموعة')
+        } else if (categoryData) {
+          setFormData({
+            code: categoryData.code,
+            name: categoryData.name,
+            name_ar: categoryData.name_ar,
+            description: categoryData.description || '',
+            sort_order: categoryData.sort_order || 0,
+            is_active: categoryData.is_active,
+          })
+
+          // Get items in this category from the loaded items
+          console.log('🔍 Filtering items for category_id:', id)
+          
+          // Debug: Show sample of category_ids in loaded items
+          const categoryIdsInItems = new Set(items.map(i => i.category_id).filter(Boolean))
+          console.log('📋 Unique category_ids in loaded items:', Array.from(categoryIdsInItems).slice(0, 10))
+          console.log('📋 Total unique categories:', categoryIdsInItems.size)
+          console.log('📋 Total items with category_id:', items.filter(i => i.category_id).length)
+          console.log('📋 Total items without category_id:', items.filter(i => !i.category_id).length)
+          console.log('📋 Looking for category_id:', id)
+          console.log('📋 Category exists in items?', categoryIdsInItems.has(id))
+          
+          const itemsInCategory = items.filter(item => {
+            const matches = item.category_id === id
+            if (matches) {
+              console.log('✓ Found item:', item.name_ar, 'category_id:', item.category_id)
+            }
+            return matches
+          })
+          
+          console.log('📊 Found', itemsInCategory.length, 'items in category')
+          console.log('Items:', itemsInCategory.map(i => i.name_ar))
+          
+          const itemIds = itemsInCategory.map(item => item.id)
+          setSelectedItems(new Set(itemIds))
+          console.log('✅ Set selectedItems:', itemIds.length, 'items')
+        }
+      }
     }
     setFetchLoading(false)
+    console.log('✅ Loading complete')
   }
 
   const handleSubmit = async (e: FormEvent) => {
@@ -199,8 +253,20 @@ export default function CategoryForm() {
     )
   }
 
+  // Get assigned items for the sidebar
+  const assignedItems = allItems.filter(item => selectedItems.has(item.id))
+
+  // Handle removing an item from the category
+  const handleRemoveItem = (itemId: string) => {
+    setSelectedItems(prev => {
+      const newSet = new Set(prev)
+      newSet.delete(itemId)
+      return newSet
+    })
+  }
+
   return (
-    <div className="max-w-4xl mx-auto">
+    <div className="max-w-7xl mx-auto">
       <div className="flex items-center gap-4 mb-6">
         <button
           type="button"
@@ -231,7 +297,9 @@ export default function CategoryForm() {
         </div>
       )}
 
-      <form onSubmit={handleSubmit} className="space-y-6">
+      <div className="flex gap-6">
+        {/* Main Form */}
+        <form onSubmit={handleSubmit} className="flex-1 space-y-6">
         {/* Category Details */}
         <div className="bg-white rounded-lg shadow-sm border border-gray-100 p-6">
           <h2 className="text-lg font-bold text-gray-900 mb-4">بيانات المجموعة</h2>
@@ -381,34 +449,102 @@ export default function CategoryForm() {
           </div>
         </div>
 
-        {/* Actions */}
-        <div className="flex items-center gap-4">
-          <button
-            type="submit"
-            disabled={loading}
-            className="flex items-center gap-2 px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
-          >
-            {loading ? (
-              <>
-                <span className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" />
-                جاري الحفظ...
-              </>
-            ) : (
-              <>
-                <Save className="w-5 h-5" />
-                حفظ
-              </>
+          {/* Actions */}
+          <div className="flex items-center gap-4">
+            <button
+              type="submit"
+              disabled={loading}
+              className="flex items-center gap-2 px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
+            >
+              {loading ? (
+                <>
+                  <span className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" />
+                  جاري الحفظ...
+                </>
+              ) : (
+                <>
+                  <Save className="w-5 h-5" />
+                  حفظ
+                </>
+              )}
+            </button>
+            <button
+              type="button"
+              onClick={() => navigate('/categories')}
+              className="px-6 py-2 text-gray-700 hover:bg-gray-100 rounded-lg"
+            >
+              إلغاء
+            </button>
+          </div>
+        </form>
+
+        {/* Assigned Items Sidebar */}
+        <div className="w-80 lg:w-96">
+          <div className="bg-white rounded-lg shadow-sm border border-gray-100 sticky top-4">
+            {/* Header */}
+            <div className="p-4 border-b border-gray-200">
+              <div className="flex items-center justify-between mb-1">
+                <h3 className="font-bold text-gray-900">
+                  {categoryType === 'items' ? 'الأصناف المعينة' : 'الوصفات المعينة'}
+                </h3>
+                <span className="bg-blue-100 text-blue-600 px-2 py-0.5 rounded-full text-sm font-medium">
+                  {assignedItems.length}
+                </span>
+              </div>
+              <p className="text-sm text-gray-500">
+                {categoryType === 'items' ? 'الأصناف' : 'الوصفات'} التي تنتمي لهذه المجموعة
+              </p>
+            </div>
+
+            {/* Assigned Items List */}
+            <div className="max-h-[calc(100vh-16rem)] overflow-y-auto">
+              {assignedItems.length === 0 ? (
+                <div className="p-8 text-center text-gray-500">
+                  <Package className="w-12 h-12 mx-auto mb-2 opacity-50" />
+                  <p className="text-sm">لا توجد عناصر معينة</p>
+                  <p className="text-xs mt-1">حدد العناصر من القائمة الجانبية</p>
+                </div>
+              ) : (
+                <div className="divide-y divide-gray-100">
+                  {assignedItems.map((item) => (
+                    <div
+                      key={item.id}
+                      className="p-3 hover:bg-gray-50 flex items-center gap-3 group"
+                    >
+                      <div className="flex-1 min-w-0">
+                        <p className="font-medium text-gray-900 truncate">
+                          {item.name_ar}
+                        </p>
+                        <p className="text-sm text-gray-500 truncate">
+                          {item.code}
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => handleRemoveItem(item.id)}
+                        className="p-1.5 text-red-600 hover:bg-red-50 rounded-lg opacity-0 group-hover:opacity-100 transition-opacity"
+                        title="إزالة من المجموعة"
+                      >
+                        <X className="w-4 h-4" />
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Footer Stats */}
+            {assignedItems.length > 0 && (
+              <div className="p-4 border-t border-gray-200 bg-gray-50">
+                <div className="flex items-center justify-between text-sm">
+                  <span className="text-gray-600">إجمالي العناصر</span>
+                  <span className="font-bold text-gray-900">{assignedItems.length}</span>
+                </div>
+              </div>
             )}
-          </button>
-          <button
-            type="button"
-            onClick={() => navigate('/categories')}
-            className="px-6 py-2 text-gray-700 hover:bg-gray-100 rounded-lg"
-          >
-            إلغاء
-          </button>
+          </div>
         </div>
-      </form>
+      </div>
     </div>
   )
 }

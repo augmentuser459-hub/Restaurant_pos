@@ -919,7 +919,24 @@ export default function StockList() {
                         </button>
                       </td>
                       <td className="px-4 py-3 text-gray-900">{globalIndex}</td>
-                      <td className="px-4 py-3 text-gray-600">{categoryName}</td>
+                      <td className="px-4 py-3 text-gray-600">
+                        {isEditing ? (
+                          <select
+                            value={editFormData.category_id}
+                            onChange={(e) => setEditFormData({ ...editFormData, category_id: e.target.value })}
+                            className="w-full px-2 py-1 border border-blue-300 rounded text-sm"
+                          >
+                            <option value="">بدون تصنيف</option>
+                            {categories.map((cat) => (
+                              <option key={cat.id} value={cat.id}>
+                                {cat.name_ar}
+                              </option>
+                            ))}
+                          </select>
+                        ) : (
+                          categoryName
+                        )}
+                      </td>
                       <td className="px-4 py-3">
                         {isEditing ? (
                           <div className="space-y-1">
@@ -1112,6 +1129,7 @@ export default function StockList() {
                     </button>
                   </th>
                   <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">م</th>
+                  <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">مجموعة</th>
                   <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">التاريخ</th>
                   <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">رقم المستند</th>
                   <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">
@@ -1139,7 +1157,8 @@ export default function StockList() {
               </thead>
               <tbody className="divide-y divide-gray-100">
                 {paginatedStock.map((inv, index) => {
-                  const item = inv.item as unknown as { id: string; code?: string; barcode?: string; name_ar?: string; unit?: { name_ar: string; code: string }; purchase_price?: number; selling_price?: number }
+                  const item = inv.item as unknown as { id: string; code?: string; barcode?: string; name_ar?: string; category?: { name_ar: string }; unit?: { name_ar: string; code: string }; purchase_price?: number; selling_price?: number }
+                  const categoryName = item?.category?.name_ar || '-'
                   const unitName = item?.unit?.name_ar || item?.unit?.code || 'قطعة'
                   const totalQty = inv.quantity || 0
                   const createdAt = (inv as unknown as { created_at?: string }).created_at || new Date().toISOString()
@@ -1167,6 +1186,24 @@ export default function StockList() {
                         </button>
                       </td>
                       <td className="px-4 py-3 text-gray-900">{globalIndex}</td>
+                      <td className="px-4 py-3 text-gray-600">
+                        {isEditing ? (
+                          <select
+                            value={editFormData.category_id}
+                            onChange={(e) => setEditFormData({ ...editFormData, category_id: e.target.value })}
+                            className="w-full px-2 py-1 border border-blue-300 rounded text-sm"
+                          >
+                            <option value="">بدون تصنيف</option>
+                            {categories.map((cat) => (
+                              <option key={cat.id} value={cat.id}>
+                                {cat.name_ar}
+                              </option>
+                            ))}
+                          </select>
+                        ) : (
+                          categoryName
+                        )}
+                      </td>
                       <td className="px-4 py-3 text-gray-600">{formatDate(createdAt)}</td>
                       <td className="px-4 py-3 text-gray-900 font-mono">{getDocNumber(createdAt, index)}</td>
                       <td className="px-4 py-3">

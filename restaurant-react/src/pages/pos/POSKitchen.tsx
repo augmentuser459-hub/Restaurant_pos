@@ -10,6 +10,8 @@ export default function POSKitchen() {
   const [orders, setOrders] = useState<OrderWithDetails[]>([])
   const [loading, setLoading] = useState(true)
   const [kitchenCategoryIds, setKitchenCategoryIds] = useState<string[]>([])
+  const [currentPage, setCurrentPage] = useState(1)
+  const [itemsPerPage] = useState(30)
 
   useEffect(() => {
     if (user?.branch_id) {
@@ -36,6 +38,8 @@ export default function POSKitchen() {
     const { data } = await ordersService.getKitchenOrders(user.branch_id)
     setOrders(data || [])
     setLoading(false)
+    // Reset to first page when orders update
+    setCurrentPage(1)
   }
 
   const setupRealtime = () => {
@@ -117,6 +121,12 @@ export default function POSKitchen() {
       kitchenItems: getKitchenItems(order)
     }))
     .filter(order => order.kitchenItems.length > 0)
+
+  // Pagination
+  const totalPages = Math.ceil(kitchenOrders.length / itemsPerPage)
+  const startIndex = (currentPage - 1) * itemsPerPage
+  const endIndex = startIndex + itemsPerPage
+  const paginatedOrders = kitchenOrders.slice(startIndex, endIndex)
 
   const handlePrint = (order: OrderWithDetails & { kitchenItems?: any[] }) => {
     const items = (order.kitchenItems || order.items || []).map(item => {
@@ -209,7 +219,7 @@ export default function POSKitchen() {
         </div>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
-          {kitchenOrders.map(order => (
+          {paginatedOrders.map(order => (
             <div
               key={order.id}
               className={`rounded-lg border-2 overflow-hidden ${getStatusColor(order.status)}`}
@@ -300,6 +310,77 @@ export default function POSKitchen() {
               </div>
             </div>
           ))}
+        </div>
+      )}
+
+      {/* Pagination */}
+      {kitchenOrders.length > itemsPerPage && (
+        <div className="bg-white rounded-lg shadow-sm border border-gray-100 p-4">
+          <div className="flex items-center justify-between">
+            <div className="text-sm text-gray-600">
+              عرض {startIndex + 1} - {Math.min(endIndex, kitchenOrders.length)} من {kitchenOrders.length} طلب
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setCurrentPage(1)}
+                disabled={currentPage === 1}
+                className="px-3 py-1 rounded-lg border border-gray-300 text-gray-700 hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                الأولى
+              </button>
+              <button
+                onClick={() => setCurrentPage(currentPage - 1)}
+                disabled={currentPage === 1}
+                className="px-3 py-1 rounded-lg border border-gray-300 text-gray-700 hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                السابق
+              </button>
+              
+              <div className="flex items-center gap-1">
+                {Array.from({ length: Math.min(5, totalPages) }, (_, i) => {
+                  let pageNum
+                  if (totalPages <= 5) {
+                    pageNum = i + 1
+                  } else if (currentPage <= 3) {
+                    pageNum = i + 1
+                  } else if (currentPage >= totalPages - 2) {
+                    pageNum = totalPages - 4 + i
+                  } else {
+                    pageNum = currentPage - 2 + i
+                  }
+                  
+                  return (
+                    <button
+                      key={pageNum}
+                      onClick={() => setCurrentPage(pageNum)}
+                      className={`px-3 py-1 rounded-lg ${
+                        currentPage === pageNum
+                          ? 'bg-blue-600 text-white'
+                          : 'border border-gray-300 text-gray-700 hover:bg-gray-50'
+                      }`}
+                    >
+                      {pageNum}
+                    </button>
+                  )
+                })}
+              </div>
+
+              <button
+                onClick={() => setCurrentPage(currentPage + 1)}
+                disabled={currentPage === totalPages}
+                className="px-3 py-1 rounded-lg border border-gray-300 text-gray-700 hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                التالي
+              </button>
+              <button
+                onClick={() => setCurrentPage(totalPages)}
+                disabled={currentPage === totalPages}
+                className="px-3 py-1 rounded-lg border border-gray-300 text-gray-700 hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                الأخيرة
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>
