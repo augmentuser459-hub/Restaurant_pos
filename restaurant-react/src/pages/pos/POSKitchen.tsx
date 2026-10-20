@@ -112,9 +112,11 @@ export default function POSKitchen() {
 
   const fetchOrders = async () => {
     if (!user?.branch_id) return
+    console.log('📥 Fetching orders for branch:', user.branch_id)
     const previousOrders = orders
     const { data } = await ordersService.getKitchenOrders(user.branch_id)
     const newOrders = data || []
+    console.log('📦 Received orders:', newOrders.length)
     setOrders(newOrders)
     setLoading(false)
     // Reset to first page when orders update
@@ -126,20 +128,43 @@ export default function POSKitchen() {
       const newOrdersToAdd = newOrders.filter(order => !previousIds.has(order.id))
       
       if (newOrdersToAdd.length > 0) {
-        console.log(`🆕 ${newOrdersToAdd.length} new order(s) detected`)
+        console.log(`🆕 ${newOrdersToAdd.length} new order(s) detected:`, newOrdersToAdd.map(o => o.order_number))
         
         // Print immediately on next tick to ensure UI is updated
         setTimeout(() => {
+          console.log('⏰ Print timeout triggered')
           newOrdersToAdd.forEach(order => {
+            console.log(`🔍 Checking order ${order.order_number} - Already printed?`, printedOrderIds.has(order.id))
             if (!printedOrderIds.has(order.id)) {
-              console.log(`🖨️ Auto-printing order: ${order.order_number}`)
-              setPrintedOrderIds(prev => new Set(prev).add(order.id))
-              const orderWithKitchen = { ...order, kitchenItems: getKitchenItems(order) }
-              handlePrint(orderWithKitchen)
+              console.log(`✅ Order ${order.order_number} NOT printed yet - printing now`)
+              setPrintedOrderIds(prev => {
+                const newSet = new Set(prev).add(order.id)
+                console.log('📝 Updated printed IDs:', Array.from(newSet))
+                return newSet
+              })
+              
+              const kitchenItems = getKitchenItems(order)
+              console.log(`🍽️ Kitchen items for order ${order.order_number}:`, kitchenItems.length, 'items')
+              
+              const orderWithKitchen = { ...order, kitchenItems }
+              console.log(`🖨️ Calling handlePrint for order ${order.order_number}`)
+              
+              try {
+                handlePrint(orderWithKitchen)
+                console.log(`✅ handlePrint called successfully for ${order.order_number}`)
+              } catch (error) {
+                console.error(`❌ Error calling handlePrint for ${order.order_number}:`, error)
+              }
+            } else {
+              console.log(`⏭️ Order ${order.order_number} already printed - skipping`)
             }
           })
         }, 100) // Small delay to ensure state is ready
+      } else {
+        console.log('ℹ️ No new orders detected')
       }
+    } else {
+      console.log('ℹ️ First load - not checking for new orders')
     }
   }
 
@@ -230,6 +255,14 @@ export default function POSKitchen() {
   const paginatedOrders = kitchenOrders.slice(startIndex, endIndex)
 
   const handlePrint = (order: OrderWithDetails & { kitchenItems?: any[] }) => {
+    console.log('🖨️ handlePrint called for order:', order.order_number)
+    console.log('📋 Order data:', {
+      id: order.id,
+      order_number: order.order_number,
+      items: order.items?.length || 0,
+      kitchenItems: order.kitchenItems?.length || 0
+    })
+    
     const items = (order.kitchenItems || order.items || []).map(item => {
       const itemData = item as unknown as { menu_item?: { name_ar: string }, item?: { name_ar: string } }
       const itemName = itemData.item?.name_ar || itemData.menu_item?.name_ar || 'صنف'
@@ -242,8 +275,16 @@ export default function POSKitchen() {
       `
     }).join('')
 
+    console.log('📄 Opening print window for order:', order.order_number)
     const printWindow = window.open('', '_blank', 'width=400,height=600')
-    if (!printWindow) return
+    
+    if (!printWindow) {
+      console.error('❌ Failed to open print window - pop-ups may be blocked!')
+      alert('Pop-ups are blocked! Please allow pop-ups for this site to enable auto-print.')
+      return
+    }
+    
+    console.log('✅ Print window opened successfully')
 
     printWindow.document.write(`
       <!DOCTYPE html>
@@ -275,11 +316,19 @@ export default function POSKitchen() {
         </table>
         ${order.notes ? `<div style="background: #fef3c7; padding: 10px; border-radius: 5px; margin-top: 10px;"><strong>ملاحظات:</strong> ${order.notes}</div>` : ''}
         <div class="footer"><p>شكراً لكم</p></div>
-        <script>window.onload = function() { window.print(); }</script>
+        <script>
+          console.log('🖨️ Print window loaded - triggering print dialog');
+          window.onload = function() { 
+            console.log('📄 Calling window.print()');
+            window.print();
+            console.log('✅ Print dialog opened');
+          }
+        </script>
       </body>
       </html>
     `)
     printWindow.document.close()
+    console.log('✅ Print window document written and closed')
   }
 
   if (loading) {
