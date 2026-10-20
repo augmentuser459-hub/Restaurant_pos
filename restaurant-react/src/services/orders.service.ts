@@ -140,7 +140,7 @@ export const ordersService = {
       .from('orders')
       .update({
         payment_method: paymentMethod,
-        status: 'paid',
+        status: 'preparing',  // Go directly to preparing instead of paid
         paid_at: new Date().toISOString(),
         updated_at: new Date().toISOString(),
       })
@@ -185,7 +185,7 @@ export const ordersService = {
           )
         `)
         .eq('branch_id', branchId)
-        .in('status', ['paid', 'in_kitchen', 'preparing'])
+        .in('status', ['paid', 'in_kitchen', 'preparing'])  // Include all statuses
         .order('created_at', { ascending: false })
         .range(start, start + BATCH_SIZE - 1)
 

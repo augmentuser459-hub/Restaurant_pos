@@ -12,6 +12,7 @@ export default function POSKitchen() {
   const [kitchenCategoryIds, setKitchenCategoryIds] = useState<string[]>([])
   const [currentPage, setCurrentPage] = useState(1)
   const [itemsPerPage] = useState(30)
+  const [printedOrderIds, setPrintedOrderIds] = useState<Set<string>>(new Set())
 
   useEffect(() => {
     if (user?.branch_id) {
@@ -35,11 +36,26 @@ export default function POSKitchen() {
 
   const fetchOrders = async () => {
     if (!user?.branch_id) return
+    const previousOrders = orders
     const { data } = await ordersService.getKitchenOrders(user.branch_id)
-    setOrders(data || [])
+    const newOrders = data || []
+    setOrders(newOrders)
     setLoading(false)
     // Reset to first page when orders update
     setCurrentPage(1)
+
+    // Auto-print new orders that haven't been printed yet
+    if (previousOrders.length > 0) {
+      const previousIds = new Set(previousOrders.map(o => o.id))
+      const newOrdersToAdd = newOrders.filter(order => !previousIds.has(order.id))
+      
+      newOrdersToAdd.forEach(order => {
+        if (!printedOrderIds.has(order.id)) {
+          autoPrintOrder(order)
+          setPrintedOrderIds(prev => new Set(prev).add(order.id))
+        }
+      })
+    }
   }
 
   const setupRealtime = () => {
@@ -96,6 +112,65 @@ export default function POSKitchen() {
     if (minutes < 60) return `${minutes} دقيقة`
     const hours = Math.floor(minutes / 60)
     return `${hours} ساعة`
+  }
+
+  // Auto-print function for new orders
+  const autoPrintOrder = (order: OrderWithDetails & { kitchenItems?: any[] }) => {
+    const items = (order.kitchenItems || getKitchenItems(order) || order.items || []).map(item => {
+      const itemData = item as unknown as { menu_item?: { name_ar: string }, item?: { name_ar: string } }
+      const itemName = itemData.item?.name_ar || itemData.menu_item?.name_ar || 'صنف'
+      return `
+        <tr>
+          <td style="padding: 8px; border-bottom: 1px solid #eee;">${itemName}</td>
+          <td style="padding: 8px; border-bottom: 1px solid #eee; text-align: center;">${item.quantity}</td>
+          ${item.notes ? `<td style="padding: 8px; border-bottom: 1px solid #eee; color: #f97316; font-size: 12px;">${item.notes}</td>` : '<td></td>'}
+        </tr>
+      `
+    }).join('')
+
+    const printWindow = window.open('', '_blank', 'width=400,height=600')
+    if (!printWindow) return
+
+    printWindow.document.write(`
+      <!DOCTYPE html>
+      <html dir="rtl" lang="ar">
+      <head>
+        <meta charset="UTF-8">
+        <title>طلب ${order.order_number}</title>
+        <style>
+          body { font-family: Arial, sans-serif; padding: 20px; direction: rtl; }
+          .header { text-align: center; border-bottom: 2px dashed #000; padding-bottom: 15px; margin-bottom: 15px; }
+          .order-number { font-size: 24px; font-weight: bold; }
+          .time { color: #666; margin-top: 5px; }
+          table { width: 100%; border-collapse: collapse; margin: 15px 0; }
+          th { background: #f3f4f6; padding: 10px; text-align: right; }
+          .footer { text-align: center; margin-top: 20px; padding-top: 15px; border-top: 2px dashed #000; }
+          @media print { body { padding: 0; } }
+        </style>
+      </head>
+      <body>
+        <div class="header">
+          <div class="order-number">طلب #${order.order_number.split('-').pop()}</div>
+          <div class="time">${formatTime(order.created_at)}</div>
+        </div>
+        <table>
+          <thead>
+            <tr><th>الصنف</th><th>الكمية</th><th>ملاحظات</th></tr>
+          </thead>
+          <tbody>${items}</tbody>
+        </table>
+        ${order.notes ? `<div style="background: #fef3c7; padding: 10px; border-radius: 5px; margin-top: 10px;"><strong>ملاحظات:</strong> ${order.notes}</div>` : ''}
+        <div class="footer"><p>شكراً لكم</p></div>
+        <script>
+          window.onload = function() { 
+            window.print();
+            setTimeout(function() { window.close(); }, 100);
+          }
+        </script>
+      </body>
+      </html>
+    `)
+    printWindow.document.close()
   }
 
   // Filter order items: only show items from kitchen categories
