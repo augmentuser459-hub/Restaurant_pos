@@ -367,22 +367,6 @@ export default function POSKitchen() {
     return `${hours} ساعة`
   }
 
-  // Filter order items: only show items from kitchen categories
-  const getKitchenItems = (order: OrderWithDetails) => {
-    if (!order.items || order.items.length === 0) return []
-    if (kitchenCategoryIds.length === 0) return order.items // No filter if no categories loaded yet
-    
-    return order.items.filter(item => {
-      const itemData = item as unknown as { 
-        item?: { category_id?: string }, 
-        menu_item?: { category_id?: string } 
-      }
-      const categoryId = itemData.item?.category_id || itemData.menu_item?.category_id
-      if (!categoryId) return true // Show items without category (safety)
-      return kitchenCategoryIds.includes(categoryId)
-    })
-  }
-
   // Orders with at least one kitchen item
   const kitchenOrders = orders
     .map(order => ({
