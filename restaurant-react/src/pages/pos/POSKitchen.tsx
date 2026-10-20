@@ -26,19 +26,47 @@ export default function POSKitchen() {
         .channel(`kitchen-orders-${user.branch_id}`, {
           config: {
             broadcast: { self: true },
+            presence: { key: user.branch_id },
           },
         })
         .on(
           'postgres_changes',
           {
-            event: '*',
+            event: 'INSERT',
             schema: 'public',
             table: 'orders',
             filter: `branch_id=eq.${user.branch_id}`,
           },
           (payload) => {
-            console.log('🔄 Real-time order update:', payload.eventType, payload.new)
+            console.log('🆕 New order inserted:', payload.new)
+            // Immediate fetch on new order
+            setTimeout(() => fetchOrders(), 500)
+          }
+        )
+        .on(
+          'postgres_changes',
+          {
+            event: 'UPDATE',
+            schema: 'public',
+            table: 'orders',
+            filter: `branch_id=eq.${user.branch_id}`,
+          },
+          (payload) => {
+            console.log('📝 Order updated:', payload.new)
             fetchOrders()
+          }
+        )
+        .on(
+          'postgres_changes',
+          {
+            event: 'INSERT',
+            schema: 'public',
+            table: 'order_items',
+          },
+          (payload) => {
+            console.log('🍽️ Order item inserted:', payload.new)
+            // Fetch orders when items are added
+            setTimeout(() => fetchOrders(), 1000)
           }
         )
         .subscribe((status) => {
@@ -54,10 +82,18 @@ export default function POSKitchen() {
           }
         })
 
+      // Polling fallback - check every 10 seconds
+      console.log('⏰ Setting up polling fallback (every 10 seconds)')
+      const pollingInterval = setInterval(() => {
+        console.log('🔄 Polling for new orders...')
+        fetchOrders()
+      }, 10000) // 10 seconds
+
       // Cleanup function
       return () => {
-        console.log('🧹 Cleaning up real-time subscription')
+        console.log('🧹 Cleaning up real-time subscription and polling')
         supabase.removeChannel(channel)
+        clearInterval(pollingInterval)
       }
     }
   }, [user?.branch_id])
