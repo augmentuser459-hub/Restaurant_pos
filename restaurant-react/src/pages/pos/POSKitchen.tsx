@@ -40,7 +40,7 @@ export default function POSKitchen() {
           (payload) => {
             console.log('🆕 New order inserted:', payload.new)
             // Immediate fetch on new order
-            setTimeout(() => fetchOrders(), 500)
+            fetchOrders()
           }
         )
         .on(
@@ -65,8 +65,8 @@ export default function POSKitchen() {
           },
           (payload) => {
             console.log('🍽️ Order item inserted:', payload.new)
-            // Fetch orders when items are added
-            setTimeout(() => fetchOrders(), 1000)
+            // Fetch orders when items are added - small delay for batch inserts
+            setTimeout(() => fetchOrders(), 500)
           }
         )
         .subscribe((status) => {
@@ -127,16 +127,19 @@ export default function POSKitchen() {
       
       if (newOrdersToAdd.length > 0) {
         console.log(`🆕 ${newOrdersToAdd.length} new order(s) detected`)
+        
+        // Print immediately on next tick to ensure UI is updated
+        setTimeout(() => {
+          newOrdersToAdd.forEach(order => {
+            if (!printedOrderIds.has(order.id)) {
+              console.log(`🖨️ Auto-printing order: ${order.order_number}`)
+              setPrintedOrderIds(prev => new Set(prev).add(order.id))
+              const orderWithKitchen = { ...order, kitchenItems: getKitchenItems(order) }
+              handlePrint(orderWithKitchen)
+            }
+          })
+        }, 100) // Small delay to ensure state is ready
       }
-      
-      newOrdersToAdd.forEach(order => {
-        if (!printedOrderIds.has(order.id)) {
-          console.log(`🖨️ Auto-printing order: ${order.order_number}`)
-          // Use the existing handlePrint function
-          handlePrint({ ...order, kitchenItems: getKitchenItems(order) })
-          setPrintedOrderIds(prev => new Set(prev).add(order.id))
-        }
-      })
     }
   }
 
