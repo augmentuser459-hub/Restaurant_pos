@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useCallback, useRef } from 'react'
 import { useAuth } from '../../contexts/AuthContext'
 import { ordersService, OrderWithDetails } from '../../services/orders.service'
 import { supabase } from '../../lib/supabase'
@@ -13,6 +13,21 @@ export default function POSKitchen() {
   const [currentPage, setCurrentPage] = useState(1)
   const [itemsPerPage] = useState(30)
   const [printedOrderIds, setPrintedOrderIds] = useState<Set<string>>(new Set())
+  
+  // Use ref to always have current orders in fetchOrders closure
+  const ordersRef = useRef<OrderWithDetails[]>([])
+  const printedOrderIdsRef = useRef<Set<string>>(new Set())
+
+  // Update refs whenever state changes
+  useEffect(() => {
+    ordersRef.current = orders
+    console.log('📊 Orders ref updated, current count:', orders.length)
+  }, [orders])
+
+  useEffect(() => {
+    printedOrderIdsRef.current = printedOrderIds
+    console.log('🔖 Printed IDs ref updated, count:', printedOrderIds.size)
+  }, [printedOrderIds])
 
   useEffect(() => {
     if (user?.branch_id) {
@@ -107,66 +122,194 @@ export default function POSKitchen() {
     
     if (data) {
       setKitchenCategoryIds(data.map(c => c.id))
+      console.log('📂 Kitchen categories loaded:', data.length)
     }
   }
 
-  const fetchOrders = async () => {
-    if (!user?.branch_id) return
+  // Filter order items: only show items from kitchen categories
+  const getKitchenItems = useCallback((order: OrderWithDetails) => {
+    if (!order.items || order.items.length === 0) return []
+    if (kitchenCategoryIds.length === 0) return order.items
+    
+    return order.items.filter(item => {
+      const itemData = item as unknown as { 
+        item?: { category_id?: string }, 
+        menu_item?: { category_id?: string } 
+      }
+      const categoryId = itemData.item?.category_id || itemData.menu_item?.category_id
+      if (!categoryId) return true
+      return kitchenCategoryIds.includes(categoryId)
+    })
+  }, [kitchenCategoryIds])
+
+  // Print function for orders
+  const handlePrint = useCallback((order: OrderWithDetails & { kitchenItems?: any[] }) => {
+    console.log('🖨️ handlePrint called for order:', order.order_number)
+    console.log('📋 Order data:', {
+      id: order.id,
+      order_number: order.order_number,
+      items: order.items?.length || 0,
+      kitchenItems: order.kitchenItems?.length || 0
+    })
+    
+    const items = (order.kitchenItems || order.items || []).map(item => {
+      const itemData = item as unknown as { menu_item?: { name_ar: string }, item?: { name_ar: string } }
+      const itemName = itemData.item?.name_ar || itemData.menu_item?.name_ar || 'صنف'
+      return `
+        <tr>
+          <td style="padding: 8px; border-bottom: 1px solid #eee;">${itemName}</td>
+          <td style="padding: 8px; border-bottom: 1px solid #eee; text-align: center;">${item.quantity}</td>
+          ${item.notes ? `<td style="padding: 8px; border-bottom: 1px solid #eee; color: #f97316; font-size: 12px;">${item.notes}</td>` : '<td></td>'}
+        </tr>
+      `
+    }).join('')
+
+    console.log('📄 Opening print window for order:', order.order_number)
+    const printWindow = window.open('', '_blank', 'width=400,height=600')
+    
+    if (!printWindow) {
+      console.error('❌ Failed to open print window - pop-ups may be blocked!')
+      alert('Pop-ups are blocked! Please allow pop-ups for this site to enable auto-print.')
+      return
+    }
+    
+    console.log('✅ Print window opened successfully')
+
+    printWindow.document.write(`
+      <!DOCTYPE html>
+      <html dir="rtl" lang="ar">
+      <head>
+        <meta charset="UTF-8">
+        <title>طلب ${order.order_number}</title>
+        <style>
+          body { font-family: Arial, sans-serif; padding: 20px; direction: rtl; }
+          .header { text-align: center; border-bottom: 2px dashed #000; padding-bottom: 15px; margin-bottom: 15px; }
+          .order-number { font-size: 24px; font-weight: bold; }
+          .time { color: #666; margin-top: 5px; }
+          table { width: 100%; border-collapse: collapse; margin: 15px 0; }
+          th { background: #f3f4f6; padding: 10px; text-align: right; }
+          .footer { text-align: center; margin-top: 20px; padding-top: 15px; border-top: 2px dashed #000; }
+          @media print { body { padding: 0; } }
+        </style>
+      </head>
+      <body>
+        <div class="header">
+          <div class="order-number">طلب #${order.order_number.split('-').pop()}</div>
+          <div class="time">${formatTime(order.created_at)}</div>
+        </div>
+        <table>
+          <thead>
+            <tr><th>الصنف</th><th>الكمية</th><th>ملاحظات</th></tr>
+          </thead>
+          <tbody>${items}</tbody>
+        </table>
+        ${order.notes ? `<div style="background: #fef3c7; padding: 10px; border-radius: 5px; margin-top: 10px;"><strong>ملاحظات:</strong> ${order.notes}</div>` : ''}
+        <div class="footer"><p>شكراً لكم</p></div>
+        <script>
+          console.log('🖨️ Print window loaded - triggering print dialog');
+          window.onload = function() { 
+            console.log('📄 Calling window.print()');
+            window.print();
+            console.log('✅ Print dialog opened');
+          }
+        </script>
+      </body>
+      </html>
+    `)
+    printWindow.document.close()
+    console.log('✅ Print window document written and closed')
+  }, [])
+
+  const fetchOrders = useCallback(async () => {
+    if (!user?.branch_id) {
+      console.log('⚠️ No branch_id, skipping fetch')
+      return
+    }
+    
     console.log('📥 Fetching orders for branch:', user.branch_id)
-    const previousOrders = orders
+    console.log('📊 Previous orders count (from ref):', ordersRef.current.length)
+    console.log('🔖 Already printed count (from ref):', printedOrderIdsRef.current.size)
+    
+    const previousOrders = ordersRef.current
     const { data } = await ordersService.getKitchenOrders(user.branch_id)
     const newOrders = data || []
-    console.log('📦 Received orders:', newOrders.length)
+    
+    console.log('📦 Received orders from DB:', newOrders.length)
+    console.log('🆔 New order IDs:', newOrders.slice(0, 5).map(o => o.order_number))
+    
     setOrders(newOrders)
     setLoading(false)
-    // Reset to first page when orders update
     setCurrentPage(1)
 
     // Auto-print new orders that haven't been printed yet
+    console.log('🔍 Checking for new orders to print...')
+    console.log('   Previous orders:', previousOrders.length)
+    console.log('   Current orders:', newOrders.length)
+    
     if (previousOrders.length > 0) {
       const previousIds = new Set(previousOrders.map(o => o.id))
+      console.log('📋 Previous order IDs:', Array.from(previousIds).slice(0, 5))
+      
       const newOrdersToAdd = newOrders.filter(order => !previousIds.has(order.id))
+      console.log('🆕 Orders not in previous set:', newOrdersToAdd.length)
       
       if (newOrdersToAdd.length > 0) {
-        console.log(`🆕 ${newOrdersToAdd.length} new order(s) detected:`, newOrdersToAdd.map(o => o.order_number))
+        console.log(`✨ ${newOrdersToAdd.length} NEW order(s) detected:`, newOrdersToAdd.map(o => o.order_number))
         
         // Print immediately on next tick to ensure UI is updated
         setTimeout(() => {
-          console.log('⏰ Print timeout triggered')
+          console.log('⏰ Print timeout triggered, processing new orders...')
+          
           newOrdersToAdd.forEach(order => {
-            console.log(`🔍 Checking order ${order.order_number} - Already printed?`, printedOrderIds.has(order.id))
-            if (!printedOrderIds.has(order.id)) {
-              console.log(`✅ Order ${order.order_number} NOT printed yet - printing now`)
+            const alreadyPrinted = printedOrderIdsRef.current.has(order.id)
+            console.log(`🔍 Order ${order.order_number} (${order.id}):`)
+            console.log(`   Already printed? ${alreadyPrinted}`)
+            
+            if (!alreadyPrinted) {
+              console.log(`✅ Order ${order.order_number} NOT printed yet - PRINTING NOW!`)
+              
+              // Update state
               setPrintedOrderIds(prev => {
                 const newSet = new Set(prev).add(order.id)
-                console.log('📝 Updated printed IDs:', Array.from(newSet))
+                console.log('📝 Updated printed IDs state, new count:', newSet.size)
                 return newSet
               })
               
+              // Get kitchen items
               const kitchenItems = getKitchenItems(order)
-              console.log(`🍽️ Kitchen items for order ${order.order_number}:`, kitchenItems.length, 'items')
+              console.log(`🍽️ Kitchen items for ${order.order_number}:`, kitchenItems.length, 'items')
+              if (kitchenItems.length > 0) {
+                console.log('   Items:', kitchenItems.map((item: any) => {
+                  const itemData = item as unknown as { item?: { name_ar?: string }, menu_item?: { name_ar?: string } }
+                  return itemData.item?.name_ar || itemData.menu_item?.name_ar || 'Unknown'
+                }))
+              }
               
               const orderWithKitchen = { ...order, kitchenItems }
-              console.log(`🖨️ Calling handlePrint for order ${order.order_number}`)
+              console.log(`🖨️ Calling handlePrint for ${order.order_number}...`)
               
               try {
                 handlePrint(orderWithKitchen)
-                console.log(`✅ handlePrint called successfully for ${order.order_number}`)
+                console.log(`✅ handlePrint executed successfully for ${order.order_number}`)
               } catch (error) {
                 console.error(`❌ Error calling handlePrint for ${order.order_number}:`, error)
               }
             } else {
-              console.log(`⏭️ Order ${order.order_number} already printed - skipping`)
+              console.log(`⏭️ Order ${order.order_number} already printed - SKIPPING`)
             }
           })
-        }, 100) // Small delay to ensure state is ready
+          
+          console.log('✅ Finished processing all new orders')
+        }, 100)
       } else {
-        console.log('ℹ️ No new orders detected')
+        console.log('ℹ️ No new orders detected (all orders already in previous set)')
       }
     } else {
-      console.log('ℹ️ First load - not checking for new orders')
+      console.log('⚠️ First load (previousOrders.length = 0) - NOT checking for new orders')
+      console.log('   This is expected on initial page load')
+      console.log('   Next fetch will detect new orders')
     }
-  }
+  }, [user?.branch_id, getKitchenItems, handlePrint])
 
   const setupRealtime = () => {
     const channel = supabase
