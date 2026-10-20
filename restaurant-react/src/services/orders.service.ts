@@ -168,12 +168,20 @@ export const ordersService = {
 
   // Get kitchen orders (for kitchen display)
   async getKitchenOrders(branchId: string) {
+    // Only get orders from the last 7 days to avoid loading thousands of old orders
+    const sevenDaysAgo = new Date()
+    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7)
+    const cutoffDate = sevenDaysAgo.toISOString()
+
+    console.log('🔍 Fetching kitchen orders from:', cutoffDate)
+
     const BATCH_SIZE = 1000
+    const MAX_ORDERS = 2000 // Safety limit
     let allOrders: any[] = []
     let start = 0
     let hasMore = true
 
-    while (hasMore) {
+    while (hasMore && allOrders.length < MAX_ORDERS) {
       const { data, error } = await supabase
         .from('orders')
         .select(`
@@ -186,10 +194,13 @@ export const ordersService = {
         `)
         .eq('branch_id', branchId)
         .in('status', ['paid', 'in_kitchen', 'preparing'])  // Include all statuses
+        .gte('created_at', cutoffDate) // Only last 7 days
         .order('created_at', { ascending: false })
         .range(start, start + BATCH_SIZE - 1)
 
       if (error) {
+        console.error('❌ Error fetching orders:', error)
+        // Return what we have so far
         return { data: fixEncodingInData(allOrders) as OrderWithDetails[], error }
       }
 
@@ -199,9 +210,11 @@ export const ordersService = {
         allOrders = [...allOrders, ...data]
         hasMore = data.length === BATCH_SIZE
         start += BATCH_SIZE
+        console.log(`📦 Loaded ${allOrders.length} orders so far...`)
       }
     }
 
+    console.log(`✅ Total kitchen orders loaded: ${allOrders.length}`)
     return { data: fixEncodingInData(allOrders) as OrderWithDetails[], error: null }
   },
 
