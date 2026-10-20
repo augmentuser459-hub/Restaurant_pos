@@ -18,7 +18,47 @@ export default function POSKitchen() {
     if (user?.branch_id) {
       fetchKitchenCategories()
       fetchOrders()
-      setupRealtime()
+      
+      // Setup realtime subscription
+      console.log('🔌 Setting up real-time subscription for branch:', user.branch_id)
+      
+      const channel = supabase
+        .channel(`kitchen-orders-${user.branch_id}`, {
+          config: {
+            broadcast: { self: true },
+          },
+        })
+        .on(
+          'postgres_changes',
+          {
+            event: '*',
+            schema: 'public',
+            table: 'orders',
+            filter: `branch_id=eq.${user.branch_id}`,
+          },
+          (payload) => {
+            console.log('🔄 Real-time order update:', payload.eventType, payload.new)
+            fetchOrders()
+          }
+        )
+        .subscribe((status) => {
+          console.log('📡 Subscription status:', status)
+          if (status === 'SUBSCRIBED') {
+            console.log('✅ Real-time connected successfully')
+          }
+          if (status === 'CHANNEL_ERROR') {
+            console.error('❌ Real-time connection error')
+          }
+          if (status === 'TIMED_OUT') {
+            console.error('⏱️ Real-time connection timed out')
+          }
+        })
+
+      // Cleanup function
+      return () => {
+        console.log('🧹 Cleaning up real-time subscription')
+        supabase.removeChannel(channel)
+      }
     }
   }, [user?.branch_id])
 
@@ -49,8 +89,13 @@ export default function POSKitchen() {
       const previousIds = new Set(previousOrders.map(o => o.id))
       const newOrdersToAdd = newOrders.filter(order => !previousIds.has(order.id))
       
+      if (newOrdersToAdd.length > 0) {
+        console.log(`🆕 ${newOrdersToAdd.length} new order(s) detected`)
+      }
+      
       newOrdersToAdd.forEach(order => {
         if (!printedOrderIds.has(order.id)) {
+          console.log(`🖨️ Auto-printing order: ${order.order_number}`)
           autoPrintOrder(order)
           setPrintedOrderIds(prev => new Set(prev).add(order.id))
         }
