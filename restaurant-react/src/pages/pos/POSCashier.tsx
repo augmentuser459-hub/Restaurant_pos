@@ -64,7 +64,13 @@ export default function POSCashier() {
           in_stock: posItem.in_stock,
           is_recipe: posItem.item?.is_recipe || false
         }))
-        setMenuItems(items)
+        
+        // Deduplicate items by id (keep the first occurrence)
+        const uniqueItems = items.filter((item, index, self) => 
+          index === self.findIndex((t) => t.id === item.id)
+        )
+        
+        setMenuItems(uniqueItems)
       }
       
       // Fetch categories accessible by this cashier
@@ -271,10 +277,14 @@ export default function POSCashier() {
     `
     
     const printWindow = window.open('', '_blank', 'width=400,height=600')
-    if (printWindow) {
-      printWindow.document.write(receiptContent)
-      printWindow.document.close()
+    if (!printWindow) {
+      console.error('❌ Failed to open print window for cashier receipt')
+      alert('فشل في فتح نافذة الطباعة. يرجى التأكد من السماح بالنوافذ المنبثقة في المتصفح')
+      return
     }
+    
+    printWindow.document.write(receiptContent)
+    printWindow.document.close()
   }
 
   // Print last order
@@ -326,13 +336,17 @@ export default function POSCashier() {
     } else {
       // Save order info for printing
       const paid = parseFloat(paidAmount) || cart.total
+      const orderItems = [...cart.items]
+      const orderTotal = cart.total
+      
       setLastOrder({
         orderNumber: order.order_number,
-        items: [...cart.items],
-        total: cart.total,
+        items: orderItems,
+        total: orderTotal,
         paid: paid,
-        change: paid - cart.total,
+        change: paid - orderTotal,
       })
+      
       cart.clearCart()
       setShowPayment(false)
       setPaidAmount('')
@@ -340,10 +354,11 @@ export default function POSCashier() {
       // Refresh menu items to update stock quantities
       await fetchData()
       
-      // Ask to print
-      if (confirm(`تم إنشاء الطلب رقم ${order.order_number} بنجاح\n\nهل تريد طباعة الفاتورة؟`)) {
-        printReceipt(order.order_number, [...cart.items], cart.total, paid)
-      }
+      // Auto-print receipt without confirmation
+      printReceipt(order.order_number, orderItems, orderTotal, paid)
+      
+      // Show success message
+      alert(`تم إنشاء الطلب رقم ${order.order_number} بنجاح`)
     }
     
     setProcessing(false)
