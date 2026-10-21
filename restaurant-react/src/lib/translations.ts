@@ -103,7 +103,7 @@ export const translations = {
   // Payment methods
   paymentMethods: {
     cash: 'نقدي',
-    visa: 'فيزا',
+    visa: 'دليفري',
     instapay: 'انستاباي',
     wallet: 'محفظة',
     credit: 'آجل',

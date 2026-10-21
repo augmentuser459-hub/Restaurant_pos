@@ -6,7 +6,7 @@ import { shiftsService, CashierShift } from '../../services/shifts.service'
 import { useCart } from '../../hooks/useCart'
 import { MenuItem, MenuCategory, OrderPaymentMethod } from '../../types/database.types'
 import { formatCurrency } from '../../lib/utils'
-import { ShoppingCart, Plus, Minus, Trash2, CreditCard, Banknote, Smartphone, Wallet, X, Printer, Play, Square, Clock, DollarSign, Search, Package, ChefHat } from 'lucide-react'
+import { ShoppingCart, Plus, Minus, Trash2, Truck, Banknote, Smartphone, Wallet, X, Printer, Play, Square, Clock, DollarSign, Search, Package, ChefHat } from 'lucide-react'
 import { supabase } from '../../lib/supabase'
 
 interface Category {
@@ -807,7 +807,7 @@ export default function POSCashier() {
                 disabled={processing}
               />
               <PaymentButton
-                icon={CreditCard}
+                icon={Truck}
                 label="دليفري"
                 onClick={() => handlePayment('visa')}
                 disabled={processing}
