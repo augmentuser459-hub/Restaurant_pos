@@ -232,9 +232,17 @@ export default function OrdersList() {
                     </td>
                     <td className="py-3 px-4">
                       <span className={`px-2 py-1 text-xs rounded ${
-                        order.payment_method === 'cash' ? 'bg-green-100 text-green-700' : 'bg-purple-100 text-purple-700'
+                        order.payment_method === 'cash' ? 'bg-green-100 text-green-700' : 
+                        order.payment_method === 'visa' ? 'bg-purple-100 text-purple-700' :
+                        order.payment_method === 'instapay' ? 'bg-blue-100 text-blue-700' :
+                        order.payment_method === 'wallet' ? 'bg-yellow-100 text-yellow-700' :
+                        'bg-gray-100 text-gray-700'
                       }`}>
-                        {order.payment_method === 'cash' ? 'كاش' : order.payment_method === 'visa' ? 'دليفري' : order.payment_method || '-'}
+                        {order.payment_method === 'cash' ? 'كاش' : 
+                         order.payment_method === 'visa' ? 'دليفري' : 
+                         order.payment_method === 'instapay' ? 'إنستاباي' :
+                         order.payment_method === 'wallet' ? 'محفظة' :
+                         order.payment_method || '-'}
                       </span>
                     </td>
                     <td className="py-3 px-4">
