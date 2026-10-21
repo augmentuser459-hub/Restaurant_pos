@@ -152,7 +152,7 @@ export default function OrdersList() {
           >
             <option value="">كل طرق الدفع</option>
             <option value="cash">كاش</option>
-            <option value="visa">فيزا</option>
+            <option value="visa">دليفري</option>
             <option value="instapay">إنستاباي</option>
             <option value="vodafone_cash">فودافون كاش</option>
           </select>
@@ -234,7 +234,7 @@ export default function OrdersList() {
                       <span className={`px-2 py-1 text-xs rounded ${
                         order.payment_method === 'cash' ? 'bg-green-100 text-green-700' : 'bg-purple-100 text-purple-700'
                       }`}>
-                        {order.payment_method === 'cash' ? 'كاش' : order.payment_method === 'visa' ? 'فيزا' : order.payment_method || '-'}
+                        {order.payment_method === 'cash' ? 'كاش' : order.payment_method === 'visa' ? 'دليفري' : order.payment_method || '-'}
                       </span>
                     </td>
                     <td className="py-3 px-4">

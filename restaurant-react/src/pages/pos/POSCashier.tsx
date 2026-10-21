@@ -808,7 +808,7 @@ export default function POSCashier() {
               />
               <PaymentButton
                 icon={CreditCard}
-                label="فيزا"
+                label="دليفري"
                 onClick={() => handlePayment('visa')}
                 disabled={processing}
               />

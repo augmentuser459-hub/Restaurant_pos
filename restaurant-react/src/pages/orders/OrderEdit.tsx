@@ -26,7 +26,7 @@ const STATUS_OPTIONS: { value: OrderStatus; label: string }[] = [
 
 const PAYMENT_OPTIONS: { value: OrderPaymentMethod; label: string }[] = [
   { value: 'cash', label: 'كاش' },
-  { value: 'visa', label: 'فيزا' },
+  { value: 'visa', label: 'دليفري' },
   { value: 'instapay', label: 'انستاباي' },
   { value: 'wallet', label: 'محفظة' },
 ];

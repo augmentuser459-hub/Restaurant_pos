@@ -218,7 +218,7 @@ export default function OrderDetail() {
                   <p className="text-sm text-gray-500">طريقة الدفع</p>
                   <p className="font-medium">
                     {order.payment_method === 'cash' ? 'كاش' : 
-                     order.payment_method === 'visa' ? 'فيزا' : 
+                     order.payment_method === 'visa' ? 'دليفري' : 
                      order.payment_method || '-'}
                   </p>
                 </div>
