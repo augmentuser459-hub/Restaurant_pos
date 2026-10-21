@@ -218,7 +218,48 @@ export function isValidQuantity(quantity: number | string | null | undefined, al
  * roundQuantity(19.2004) => 19.200
  */
 export function roundQuantity(quantity: number): number {
-  return Math.round(quantity * 1000) / 1000
+  return roundTo(quantity, 3)
+}
+
+/**
+ * Round money to 2 decimal places (avoids float drift like 0.1 + 0.2 = 0.30000000000000004)
+ * تقريب المبالغ إلى رقمين عشريين
+ *
+ * @example
+ * roundMoney(0.1 + 0.2) => 0.3
+ * roundMoney(10.005) => 10.01
+ */
+export function roundMoney(amount: number): number {
+  return roundTo(amount, 2)
+}
+
+function roundTo(value: number, decimals: number): number {
+  if (!Number.isFinite(value)) return 0
+  const factor = 10 ** decimals
+  return (Math.sign(value) * Math.round((Math.abs(value) + Number.EPSILON) * factor)) / factor
+}
+
+/**
+ * Parse a number typed by the user: Arabic-Indic digits, Arabic decimal separator, thousands separators.
+ * Returns null for empty or invalid input (unlike parseQuantity, negatives are kept so callers can reject them).
+ * تحليل رقم مدخل من المستخدم مع دعم الأرقام العربية
+ *
+ * @example
+ * parseDecimal("١٢٫٥") => 12.5
+ * parseDecimal("1,250.75") => 1250.75
+ * parseDecimal("abc") => null
+ */
+export function parseDecimal(value: string | number | null | undefined): number | null {
+  if (value === null || value === undefined) return null
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null
+  const normalized = value
+    .trim()
+    .replace(/[٠-٩]/g, d => String(d.charCodeAt(0) - 0x0660))
+    .replace(/[۰-۹]/g, d => String(d.charCodeAt(0) - 0x06f0))
+    .replace(/٫/g, '.')
+    .replace(/[,٬\s]/g, '')
+  if (normalized === '' || !/^-?\d*\.?\d+$/.test(normalized)) return null
+  return Number(normalized)
 }
 
 /**
