@@ -3,29 +3,35 @@ import { Link } from 'react-router-dom'
 import { branchesService } from '../../services/branches.service'
 import { Branch } from '../../types/database.types'
 import { Plus, Edit, Trash2, Building2, MapPin, Phone, Mail } from 'lucide-react'
+import { toUserMessage } from '../../lib/errors'
 
 export default function BranchList() {
   const [branches, setBranches] = useState<Branch[]>([])
   const [loading, setLoading] = useState(true)
   const [deleteId, setDeleteId] = useState<string | null>(null)
+  const [error, setError] = useState('')
 
   useEffect(() => {
     fetchBranches()
   }, [])
 
   const fetchBranches = async () => {
-    const { data } = await branchesService.getAll()
+    const { data, error: loadError } = await branchesService.getAll()
+    if (loadError) setError('تعذر تحميل الفروع: ' + toUserMessage(loadError))
     setBranches(data || [])
     setLoading(false)
   }
 
   const handleDelete = async (id: string) => {
+    if (deleteId) return
     if (!confirm('هل أنت متأكد من حذف هذا الفرع؟')) return
-    
+
     setDeleteId(id)
-    const { error } = await branchesService.delete(id)
-    if (!error) {
-      setBranches(branches.filter(b => b.id !== id))
+    const { error: deleteError } = await branchesService.delete(id)
+    if (deleteError) {
+      alert('فشل في حذف الفرع: ' + toUserMessage(deleteError))
+    } else {
+      setBranches(prev => prev.filter(b => b.id !== id))
     }
     setDeleteId(null)
   }
@@ -72,6 +78,10 @@ export default function BranchList() {
           فرع جديد
         </Link>
       </div>
+
+      {error && (
+        <div className="p-4 bg-red-50 border border-red-200 rounded-lg text-red-700">{error}</div>
+      )}
 
       {/* Branches Grid */}
       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -127,7 +137,7 @@ export default function BranchList() {
               </Link>
               <button
                 onClick={() => handleDelete(branch.id)}
-                disabled={deleteId === branch.id || branch.is_main_warehouse}
+                disabled={deleteId !== null || branch.is_main_warehouse}
                 className="flex items-center gap-1 px-3 py-1.5 text-sm text-red-600 hover:bg-red-50 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 <Trash2 className="w-4 h-4" />

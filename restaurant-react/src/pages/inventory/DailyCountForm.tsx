@@ -1,4 +1,4 @@
-import { useState, useEffect, FormEvent } from 'react'
+import { useState, useEffect, useRef, FormEvent } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { dailyCountService, CreateDailyCountData } from '../../services/dailyCount.service'
 import { branchesService } from '../../services/branches.service'
@@ -6,6 +6,10 @@ import { inventoryService, InventoryWithDetails } from '../../services/inventory
 import { useAuth } from '../../contexts/AuthContext'
 import { Branch } from '../../types/database.types'
 import { Save, ArrowRight, AlertCircle, ClipboardList } from 'lucide-react'
+import { todayLocal } from '../../lib/dates'
+import { toUserMessage } from '../../lib/errors'
+import { formatQuantity, parseDecimal, roundQuantity } from '../../lib/utils'
+import { canAccessAllBranches, displayCode, unitLabel } from './stockHelpers'
 
 interface CountItem {
   item_id: string
@@ -13,24 +17,36 @@ interface CountItem {
   item_code: string
   unit: string
   system_quantity: number
-  actual_quantity: number
+  actual_quantity: string // as typed; validated on save
   variance_reason: string
+}
+
+/** Counted quantity, or null while the input is empty/invalid */
+const actualValue = (item: CountItem) => {
+  const value = parseDecimal(item.actual_quantity)
+  return value === null || value < 0 ? null : roundQuantity(value)
 }
 
 export default function DailyCountForm() {
   const navigate = useNavigate()
   const { user } = useAuth()
+  // Admin / warehouse manager count any branch; everyone else counts their own branch
+  const allBranches = canAccessAllBranches(user?.role)
 
   const [loading, setLoading] = useState(false)
-  const [fetchLoading, setFetchLoading] = useState(true)
+  const [branchesLoading, setBranchesLoading] = useState(true)
+  const [fetchLoading, setFetchLoading] = useState(false) // the selected branch's items
   const [error, setError] = useState('')
 
   const [branches, setBranches] = useState<Branch[]>([])
   const [countItems, setCountItems] = useState<CountItem[]>([])
+  const inventoryRequestRef = useRef(0) // ignores a late stock response for a previously selected branch
+  // branch the lines in countItems were loaded for (saved with the count, never the dropdown's value)
+  const [itemsBranchId, setItemsBranchId] = useState('')
 
   const [formData, setFormData] = useState({
     branch_id: user?.branch_id || '',
-    count_date: new Date().toISOString().split('T')[0],
+    count_date: todayLocal(), // Cairo date (the UTC date is still "yesterday" after local midnight)
     count_type: 'opening' as 'opening' | 'closing',
     notes: '',
   })
@@ -40,28 +56,45 @@ export default function DailyCountForm() {
   }, [])
 
   useEffect(() => {
+    // the previous branch's lines must never stay on screen (or be saved) for the new branch
+    setCountItems([])
+    setItemsBranchId('')
     if (formData.branch_id) {
       fetchInventory(formData.branch_id)
+    } else {
+      inventoryRequestRef.current++ // drop a response still on its way for the previous branch
+      setFetchLoading(false)
     }
   }, [formData.branch_id])
 
   const fetchBranches = async () => {
-    const { data } = await branchesService.getActive()
-    setBranches(data || [])
-    setFetchLoading(false)
+    const { data, error: branchesError } = await branchesService.getActive()
+    if (branchesError) setError('تعذر تحميل الفروع: ' + toUserMessage(branchesError))
+    const list = data || []
+    setBranches(allBranches ? list : list.filter(b => b.id === user?.branch_id))
+    setBranchesLoading(false)
   }
 
   const fetchInventory = async (branchId: string) => {
+    const request = ++inventoryRequestRef.current
     setFetchLoading(true)
-    const { data } = await inventoryService.getStockByBranch(branchId)
-    if (data) {
-      setCountItems(data.map((inv: InventoryWithDetails) => ({
+    const { data, error: stockError } = await inventoryService.getStockByBranch(branchId)
+    // a newer branch was selected meanwhile: its own request fills the list
+    if (request !== inventoryRequestRef.current) return
+    if (stockError) {
+      setError('تعذر تحميل أصناف الفرع: ' + toUserMessage(stockError))
+      setCountItems([])
+      setItemsBranchId('')
+    } else {
+      setItemsBranchId(branchId)
+      setCountItems((data || []).filter((inv: InventoryWithDetails) => inv.item).map((inv: InventoryWithDetails) => ({
         item_id: inv.item.id,
         item_name: inv.item.name_ar,
-        item_code: inv.item.code,
-        unit: inv.item.unit,
-        system_quantity: inv.quantity,
-        actual_quantity: inv.quantity,
+        item_code: displayCode(inv.item.code),
+        // the embedded units row ({ id, name_ar, code }), rendered as its name
+        unit: unitLabel(inv.item.unit),
+        system_quantity: Number(inv.quantity ?? 0),
+        actual_quantity: String(inv.quantity ?? 0),
         variance_reason: '',
       })))
     }
@@ -69,55 +102,75 @@ export default function DailyCountForm() {
   }
 
 
-  const handleItemChange = (index: number, field: keyof CountItem, value: string | number) => {
-    const updated = [...countItems]
-    updated[index] = { ...updated[index], [field]: value }
-    setCountItems(updated)
+  const handleItemChange = (index: number, field: 'actual_quantity' | 'variance_reason', value: string) => {
+    setCountItems(prev => {
+      const updated = [...prev]
+      updated[index] = { ...updated[index], [field]: value }
+      return updated
+    })
   }
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault()
+    if (loading) return
     setError('')
 
     if (countItems.length === 0) {
       setError('لا توجد أصناف للجرد')
       return
     }
+    if (fetchLoading || itemsBranchId !== formData.branch_id) {
+      setError('جاري تحميل أصناف الفرع المختار، انتظر حتى يكتمل التحميل')
+      return
+    }
+    const invalid = countItems.find(item => actualValue(item) === null)
+    if (invalid) {
+      setError(`أدخل كمية فعلية صحيحة (صفر أو أكثر) للصنف "${invalid.item_name}"`)
+      return
+    }
+    if (formData.count_date > todayLocal()) {
+      setError('لا يمكن تسجيل جرد بتاريخ مستقبلي')
+      return
+    }
 
     setLoading(true)
 
     const countData: CreateDailyCountData = {
-      branch_id: formData.branch_id,
+      branch_id: itemsBranchId, // the branch these lines and system quantities belong to
       count_date: formData.count_date,
       count_type: formData.count_type,
-      counted_by: user?.id || '',
-      notes: formData.notes || undefined,
+      notes: formData.notes.trim() || undefined,
       items: countItems.map(item => ({
         item_id: item.item_id,
         system_quantity: item.system_quantity,
-        actual_quantity: item.actual_quantity,
-        variance_reason: item.variance_reason || undefined,
+        actual_quantity: actualValue(item) as number,
+        variance_reason: item.variance_reason.trim() || undefined,
       }))
     }
 
-    const { error: submitError } = await dailyCountService.create(countData)
+    // Saved as a draft in one database call; submit and approve happen on the count's page
+    const { data: countId, error: submitError } = await dailyCountService.create(countData)
 
-    if (submitError) {
-      setError('فشل في حفظ الجرد')
-    } else {
-      navigate('/inventory/daily-count')
+    if (submitError || !countId) {
+      setError('فشل في حفظ الجرد: ' + toUserMessage(submitError))
+      setLoading(false)
+      return
     }
-    setLoading(false)
+    navigate(`/inventory/daily-count/${countId}`)
   }
 
   const handleChange = (field: string, value: string) => {
     setFormData(prev => ({ ...prev, [field]: value }))
   }
 
-  const totalVariance = countItems.reduce((sum, item) => sum + (item.actual_quantity - item.system_quantity), 0)
-  const itemsWithVariance = countItems.filter(item => item.actual_quantity !== item.system_quantity).length
+  const variances = countItems.map(item => {
+    const actual = actualValue(item)
+    return actual === null ? 0 : roundQuantity(actual - item.system_quantity)
+  })
+  const totalVariance = roundQuantity(variances.reduce((sum, v) => sum + v, 0))
+  const itemsWithVariance = variances.filter(v => v !== 0).length
 
-  if (fetchLoading && !formData.branch_id) {
+  if (branchesLoading && !formData.branch_id) {
     return (
       <div className="flex items-center justify-center h-64">
         <div className="w-8 h-8 border-4 border-blue-600 border-t-transparent rounded-full animate-spin" />
@@ -144,7 +197,12 @@ export default function DailyCountForm() {
         </div>
       )}
 
-      <form onSubmit={handleSubmit} className="space-y-6">
+      <form
+        onSubmit={handleSubmit}
+        // Enter in a quantity field must not save a half-entered count
+        onKeyDown={(e) => { if (e.key === 'Enter' && (e.target as HTMLElement).tagName === 'INPUT') e.preventDefault() }}
+        className="space-y-6"
+      >
         {/* Basic Info */}
         <div className="bg-white rounded-lg shadow-sm border border-gray-100 p-6">
           <h2 className="text-lg font-semibold text-gray-900 mb-4">معلومات الجرد</h2>
@@ -159,7 +217,7 @@ export default function DailyCountForm() {
             </div>
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-2">التاريخ <span className="text-red-500">*</span></label>
-              <input type="date" value={formData.count_date} onChange={(e) => handleChange('count_date', e.target.value)} required
+              <input type="date" value={formData.count_date} max={todayLocal()} onChange={(e) => handleChange('count_date', e.target.value)} required
                 aria-label="التاريخ" className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500" dir="ltr" />
             </div>
             <div>
@@ -190,7 +248,7 @@ export default function DailyCountForm() {
               </div>
             </div>
             <div className={`text-lg font-bold ${totalVariance === 0 ? 'text-green-600' : totalVariance > 0 ? 'text-blue-600' : 'text-red-600'}`}>
-              {totalVariance > 0 ? '+' : ''}{totalVariance} فرق إجمالي
+              {totalVariance > 0 ? '+' : ''}{formatQuantity(totalVariance)} فرق إجمالي
             </div>
           </div>
         )}
@@ -221,28 +279,28 @@ export default function DailyCountForm() {
                   </thead>
                   <tbody>
                     {countItems.map((item, index) => {
-                      const variance = item.actual_quantity - item.system_quantity
+                      const variance = variances[index]
+                      const invalid = actualValue(item) === null
                       return (
-                        <tr key={item.item_id} className={`border-b border-gray-100 ${variance !== 0 ? 'bg-yellow-50' : ''}`}>
-                          <td className="py-3 px-2 text-sm text-gray-600">{item.item_code}</td>
+                        <tr key={item.item_id} className={`border-b border-gray-100 ${variance !== 0 || invalid ? 'bg-yellow-50' : ''}`}>
+                          <td className="py-3 px-2 text-sm text-gray-600" dir="ltr">{item.item_code}</td>
                           <td className="py-3 px-2 font-medium text-gray-900">{item.item_name}</td>
                           <td className="py-3 px-2 text-sm text-gray-600">{item.unit}</td>
-                          <td className="py-3 px-2 text-sm text-gray-600">{item.system_quantity}</td>
+                          <td className="py-3 px-2 text-sm text-gray-600">{formatQuantity(item.system_quantity)}</td>
                           <td className="py-3 px-2">
                             <input
-                              type="number"
-                              min="0"
-                              step="0.001"
+                              type="text"
+                              inputMode="decimal"
                               value={item.actual_quantity}
-                              onChange={(e) => handleItemChange(index, 'actual_quantity', Number(e.target.value))}
+                              onChange={(e) => handleItemChange(index, 'actual_quantity', e.target.value)}
                               aria-label="الكمية الفعلية"
                               placeholder="مثال: 19.200"
-                              className="w-24 px-3 py-1 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 text-sm"
+                              className={`w-24 px-3 py-1 border rounded-lg focus:ring-2 focus:ring-blue-500 text-sm ${invalid ? 'border-red-400' : 'border-gray-300'}`}
                               dir="ltr"
                             />
                           </td>
                           <td className={`py-3 px-2 text-sm font-medium ${variance === 0 ? 'text-green-600' : variance > 0 ? 'text-blue-600' : 'text-red-600'}`}>
-                            {variance > 0 ? '+' : ''}{variance}
+                            {variance > 0 ? '+' : ''}{formatQuantity(variance)}
                           </td>
                           <td className="py-3 px-2">
                             {variance !== 0 && (
@@ -267,7 +325,7 @@ export default function DailyCountForm() {
 
         {/* Actions */}
         <div className="flex items-center gap-4">
-          <button type="submit" disabled={loading || countItems.length === 0}
+          <button type="submit" disabled={loading || fetchLoading || countItems.length === 0}
             className="flex items-center gap-2 px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50">
             {loading ? (
               <><span className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" />جاري الحفظ...</>

@@ -1,22 +1,7 @@
+import type { PostgrestError } from '@supabase/supabase-js'
 import { supabase, fixEncodingInData } from '../lib/supabase'
-import { Item, Inventory, Category, ItemStatus } from '../types/database.types'
-
-export interface CreateItemData {
-  code: string
-  name: string
-  name_ar: string
-  description?: string
-  unit: string // This is unit_id (UUID)
-  category_id?: string
-  min_stock_level: number
-  max_stock_level?: number
-  reorder_point?: number
-  purchase_price?: number
-  selling_price?: number
-  status?: ItemStatus
-  is_menu_item?: boolean
-  image_url?: string
-}
+import { fetchAll } from '../lib/fetchAll'
+import { Item, Inventory, Category } from '../types/database.types'
 
 export interface Unit {
   id: string
@@ -30,59 +15,105 @@ export interface InventoryWithDetails extends Omit<Inventory, 'branch' | 'item'>
   branch: { id: string; name_ar: string; code: string }
 }
 
+/** Item columns item_save() accepts. On update only the keys present are changed. */
+export interface ItemSaveData {
+  code?: string
+  barcode?: string | null
+  name?: string
+  name_ar?: string
+  description?: string | null
+  unit_id?: string
+  category_id?: string | null
+  purchase_price?: number
+  selling_price?: number
+  min_stock_level?: number
+  max_stock_level?: number | null
+  reorder_level?: number | null
+  status?: 'active' | 'inactive'
+}
+
+/**
+ * One row of a stock import file (null = blank cell = leave unchanged).
+ * A number cell that could not be read is sent as its text, so the database reports it for that row.
+ */
+export interface StockImportRow {
+  row: number
+  code: string
+  name: string | null
+  category: string | null
+  unit: string | null
+  quantity: number | string | null
+  opening_balance: number | string | null
+  purchase_price: number | string | null
+  selling_price: number | string | null
+}
+
+export interface StockImportChange {
+  row: number
+  code: string
+  name: string | null
+  action: 'new' | 'update'
+  quantity_before?: number
+  quantity_after?: number
+  opening_balance_before?: number | null
+  opening_balance_after?: number
+  purchase_price_before?: number | null
+  purchase_price_after?: number
+  selling_price_before?: number | null
+  selling_price_after?: number
+  category_before?: string | null
+  category_after?: string
+}
+
+export interface StockImportResult {
+  dry_run: boolean
+  rows: number
+  created_items: number
+  updated_items: number
+  created_categories: number
+  quantity_changes: number
+  opening_balance_changes: number
+  unchanged: number
+  errors: { row: number; code: string; message: string }[]
+  changes: StockImportChange[]
+}
+
+const STOCK_SELECT =
+  '*, item:items(id, code, barcode, name_ar, min_stock_level, category_id, purchase_price, selling_price, unit:units(id, name_ar, code), category:categories(id, name_ar))'
+
 export const inventoryService = {
   // Items CRUD
   async getAllItems() {
-    // Fetch all records by fetching in batches to bypass the 1000 limit
-    const BATCH_SIZE = 1000
-    let allData: Item[] = []
-    let start = 0
-    let hasMore = true
-
-    while (hasMore) {
-      const { data, error } = await supabase
-        .from('items')
-        .select('*, category:categories(name_ar), unit:units(id, name_ar, code)')
-        .order('name_ar')
-        .range(start, start + BATCH_SIZE - 1)
-
-      if (error) {
-        return { data: null, error }
-      }
-
-      if (data && data.length > 0) {
-        allData = [...allData, ...data]
-        start += BATCH_SIZE
-        hasMore = data.length === BATCH_SIZE
-      } else {
-        hasMore = false
-      }
+    try {
+      const data = await fetchAll<Item>((from, to) =>
+        supabase
+          .from('items')
+          .select('*, category:categories(name_ar), unit:units(id, name_ar, code)')
+          .order('name_ar')
+          .order('id')
+          .range(from, to)
+      )
+      return { data: fixEncodingInData(data) as Item[], error: null }
+    } catch (error) {
+      return { data: null, error: error as PostgrestError }
     }
-
-    return { data: fixEncodingInData(allData) as Item[], error: null }
   },
 
-  // Search item by barcode or code
+  // Search item by barcode, then by code
   async getItemByBarcode(barcode: string) {
-    // First try barcode
-    let { data, error } = await supabase
-      .from('items')
-      .select('*, category:categories(name_ar), unit:units(id, name_ar, code)')
-      .eq('barcode', barcode)
-      .single()
-
-    // If not found, try code
-    if (!data) {
-      const result = await supabase
-        .from('items')
-        .select('*, category:categories(name_ar), unit:units(id, name_ar, code)')
-        .eq('code', barcode)
-        .single()
-      data = result.data
-      error = result.error
+    const value = barcode.trim()
+    const select = '*, category:categories(name_ar), unit:units(id, name_ar, code)'
+    const byBarcode = await supabase.from('items').select(select).eq('barcode', value).maybeSingle()
+    if (byBarcode.error || byBarcode.data) {
+      return { data: fixEncodingInData(byBarcode.data) as Item | null, error: byBarcode.error }
     }
-
-    return { data: fixEncodingInData(data) as Item, error }
+    const byCode = await supabase.from('items').select(select).eq('code', value).maybeSingle()
+    if (byCode.error || byCode.data || value.startsWith('"')) {
+      return { data: fixEncodingInData(byCode.data) as Item | null, error: byCode.error }
+    }
+    // many imported codes are stored wrapped in quotes ("6223000123456")
+    const byQuotedCode = await supabase.from('items').select(select).eq('code', `"${value}"`).maybeSingle()
+    return { data: fixEncodingInData(byQuotedCode.data) as Item | null, error: byQuotedCode.error }
   },
 
   async getItemById(id: string) {
@@ -95,41 +126,15 @@ export const inventoryService = {
     return { data: fixEncodingInData(data) as Item, error }
   },
 
-  async createItem(itemData: CreateItemData) {
-    // Map 'unit' to 'unit_id' for database
-    const dbData = {
-      ...itemData,
-      unit_id: itemData.unit,
-    }
-    // Remove 'unit' as it's not a column
-    delete (dbData as Record<string, unknown>).unit
-    
-    const { data, error } = await supabase
-      .from('items')
-      .insert(dbData)
-      .select()
-      .single()
-
-    return { data: data as Item, error }
+  /** Creates (id null) or updates an item in one database call; a new item also gets an empty main-warehouse stock row. */
+  async saveItem(id: string | null, item: ItemSaveData) {
+    const { data, error } = await supabase.rpc('item_save', { p_item_id: id, p_item: item })
+    return { data: data as string | null, error }
   },
 
-  async updateItem(id: string, itemData: Partial<CreateItemData>) {
-    const { data, error } = await supabase
-      .from('items')
-      .update({ ...itemData, updated_at: new Date().toISOString() })
-      .eq('id', id)
-      .select()
-      .single()
-
-    return { data: data as Item, error }
-  },
-
+  /** Deletes an item from the system (refused while it has stock, is a recipe ingredient or has history). */
   async deleteItem(id: string) {
-    const { error } = await supabase
-      .from('items')
-      .delete()
-      .eq('id', id)
-
+    const { error } = await supabase.rpc('item_delete', { p_item_id: id })
     return { error }
   },
 
@@ -140,181 +145,151 @@ export const inventoryService = {
       .select('*')
       .eq('is_active', true)
       .order('sort_order')
+      .order('name_ar')
 
     return { data: fixEncodingInData(data) as Category[], error }
   },
 
-  // Create a new category
-  async createCategory(name_ar: string) {
-    // Generate a code from the name
-    const code = `CAT-${Date.now()}`
-    const { data, error } = await supabase
-      .from('categories')
-      .insert({
-        code,
-        name: name_ar,
-        name_ar,
-        is_active: true,
-        sort_order: 0,
-      })
-      .select()
-      .single()
+  /**
+   * Creates (id null) or updates a category and moves items in/out of it, in one database call
+   * (the id lists travel in the request body, so long lists are fine). Only keys present in `category` change.
+   */
+  async saveCategory(
+    id: string | null,
+    category: { code?: string; name?: string; name_ar?: string; description?: string | null; sort_order?: number; is_active?: boolean; is_kitchen?: boolean },
+    addItemIds: string[] = [],
+    removeItemIds: string[] = []
+  ) {
+    const { data, error } = await supabase.rpc('item_category_save', {
+      p_category_id: id,
+      p_category: category,
+      p_add_item_ids: addItemIds,
+      p_remove_item_ids: removeItemIds,
+    })
+    return { data: data as string | null, error }
+  },
 
-    return { data: data as Category, error }
+  /** Deletes an empty category (refused while items are in it). */
+  async deleteCategory(id: string) {
+    const { error } = await supabase.rpc('item_category_delete', { p_category_id: id })
+    return { error }
   },
 
   // Inventory/Stock
   async getStock(branchId?: string) {
-    // Fetch all records by fetching in batches to bypass the 1000 limit
-    const BATCH_SIZE = 1000
-    let allData: InventoryWithDetails[] = []
-    let start = 0
-    let hasMore = true
-
-    while (hasMore) {
-      let query = supabase
-        .from('inventory')
-        .select('*, item:items(id, code, barcode, name_ar, min_stock_level, category_id, purchase_price, selling_price, unit:units(id, name_ar, code), category:categories(id, name_ar)), branch:branches(id, name_ar, code)')
-        .order('quantity', { ascending: true })
-        .range(start, start + BATCH_SIZE - 1)
-
-      if (branchId) {
-        query = query.eq('branch_id', branchId)
-      }
-
-      const { data, error } = await query
-
-      if (error) {
-        return { data: null, error }
-      }
-
-      if (data && data.length > 0) {
-        allData = [...allData, ...data]
-        start += BATCH_SIZE
-        hasMore = data.length === BATCH_SIZE
-      } else {
-        hasMore = false
-      }
+    try {
+      const data = await fetchAll<InventoryWithDetails>((from, to) => {
+        let query = supabase
+          .from('inventory')
+          .select(`${STOCK_SELECT}, branch:branches(id, name_ar, code)`)
+          .order('quantity', { ascending: true })
+          .order('id')
+        if (branchId) query = query.eq('branch_id', branchId)
+        return query.range(from, to)
+      })
+      return { data: fixEncodingInData(data) as InventoryWithDetails[], error: null }
+    } catch (error) {
+      return { data: null, error: error as PostgrestError }
     }
-
-    return { data: fixEncodingInData(allData) as InventoryWithDetails[], error: null }
   },
 
   async getStockByBranch(branchId: string) {
-    // Fetch all records by fetching in batches to bypass the 1000 limit
-    const BATCH_SIZE = 1000
-    let allData: InventoryWithDetails[] = []
-    let start = 0
-    let hasMore = true
-
-    while (hasMore) {
-      const { data, error } = await supabase
-        .from('inventory')
-        .select('*, item:items(id, code, barcode, name_ar, min_stock_level, category_id, purchase_price, selling_price, unit:units(id, name_ar, code), category:categories(id, name_ar))')
-        .eq('branch_id', branchId)
-        .order('created_at', { ascending: false })
-        .range(start, start + BATCH_SIZE - 1)
-
-      if (error) {
-        return { data: null, error }
-      }
-
-      if (data && data.length > 0) {
-        allData = [...allData, ...data]
-        start += BATCH_SIZE
-        hasMore = data.length === BATCH_SIZE
-      } else {
-        hasMore = false
-      }
+    try {
+      const data = await fetchAll<InventoryWithDetails>((from, to) =>
+        supabase
+          .from('inventory')
+          .select(STOCK_SELECT)
+          .eq('branch_id', branchId)
+          .order('created_at', { ascending: false })
+          .order('id')
+          .range(from, to)
+      )
+      return { data: fixEncodingInData(data) as InventoryWithDetails[], error: null }
+    } catch (error) {
+      return { data: null, error: error as PostgrestError }
     }
-
-    return { data: fixEncodingInData(allData) as InventoryWithDetails[], error: null }
   },
 
   async getLowStock(threshold?: number) {
-    const { data, error } = await supabase
-      .from('inventory')
-      .select('*, item:items(id, code, name_ar, unit, min_stock_level), branch:branches(id, name_ar, code)')
-      .lt('quantity', threshold || 10)
-      .order('quantity', { ascending: true })
-
-    return { data: fixEncodingInData(data) as InventoryWithDetails[], error }
-  },
-
-  async updateStock(branchId: string, itemId: string, quantity: number, openingBalance?: number) {
-    // Check if inventory record exists
-    const { data: existing } = await supabase
-      .from('inventory')
-      .select('id, quantity, opening_balance')
-      .eq('branch_id', branchId)
-      .eq('item_id', itemId)
-      .single()
-
-    if (existing) {
-      // Update existing record
-      const updateData: { quantity: number; updated_at: string; opening_balance?: number } = {
-        quantity,
-        updated_at: new Date().toISOString()
-      }
-      if (openingBalance !== undefined) {
-        updateData.opening_balance = openingBalance
-      }
-      
-      const { data, error } = await supabase
-        .from('inventory')
-        .update(updateData)
-        .eq('id', existing.id)
-        .select()
-        .single()
-
-      return { data: data as Inventory, error }
-    } else {
-      // Create new record
-      const { data, error } = await supabase
-        .from('inventory')
-        .insert({ 
-          branch_id: branchId, 
-          item_id: itemId, 
-          quantity, 
-          opening_balance: openingBalance !== undefined ? openingBalance : 0,
-          min_quantity: 0 
-        })
-        .select()
-        .single()
-
-      return { data: data as Inventory, error }
+    try {
+      const data = await fetchAll<InventoryWithDetails>((from, to) =>
+        supabase
+          .from('inventory')
+          .select('*, item:items(id, code, name_ar, min_stock_level, unit:units(id, name_ar, code)), branch:branches(id, name_ar, code)')
+          .lt('quantity', threshold ?? 10)
+          .order('quantity', { ascending: true })
+          .order('id')
+          .range(from, to)
+      )
+      return { data: fixEncodingInData(data) as InventoryWithDetails[], error: null }
+    } catch (error) {
+      return { data: null, error: error as PostgrestError }
     }
   },
 
-  async adjustStock(branchId: string, itemId: string, adjustment: number, reason?: string) {
-    // Get current quantity
-    const { data: current } = await supabase
-      .from('inventory')
-      .select('id, quantity')
-      .eq('branch_id', branchId)
-      .eq('item_id', itemId)
-      .single()
+  /**
+   * Saves the stock list's inline edit in one database call. `quantity` is sent only when the user changed it,
+   * with the quantity the page showed (`expectedQuantity`): the database refuses when the stock moved meanwhile,
+   * and logs the change as an adjustment. Returns the quantity after saving.
+   */
+  async saveStockRow(params: {
+    inventoryId: string
+    item?: ItemSaveData | null
+    quantity?: number | null
+    expectedQuantity?: number | null
+    openingBalance?: number | null
+  }) {
+    const { data, error } = await supabase.rpc('inv_save_stock_row', {
+      p_inventory_id: params.inventoryId,
+      p_item: params.item && Object.keys(params.item).length > 0 ? params.item : null,
+      p_quantity: params.quantity ?? null,
+      p_expected_quantity: params.expectedQuantity ?? null,
+      p_opening_balance: params.openingBalance ?? null,
+    })
+    return { data: data as number | null, error }
+  },
 
-    const currentQty = current?.quantity || 0
-    const newQty = currentQty + adjustment
+  /** Removes items from a branch's stock list (the items stay in the system). Returns how many rows were removed. */
+  async removeStockRows(inventoryIds: string[]) {
+    const { data, error } = await supabase.rpc('inv_remove_stock_rows', { p_inventory_ids: inventoryIds })
+    return { data: data as number | null, error }
+  },
 
-    // Update inventory
-    const result = await this.updateStock(branchId, itemId, newQty)
+  /** Stock CSV import: `dryRun` returns the preview; otherwise applies everything in one transaction. */
+  async importStock(params: {
+    branchId: string
+    rows: StockImportRow[]
+    updateItems: boolean
+    updateQuantities: boolean
+    dryRun: boolean
+  }) {
+    const { data, error } = await supabase.rpc('inv_import_stock', {
+      p_branch_id: params.branchId,
+      p_rows: params.rows,
+      p_update_items: params.updateItems,
+      p_update_quantities: params.updateQuantities,
+      p_dry_run: params.dryRun,
+    })
+    return { data: fixEncodingInData(data) as StockImportResult | null, error }
+  },
 
-    // Log transaction
-    if (!result.error) {
-      await supabase.from('inventory_transactions').insert({
-        branch_id: branchId,
-        item_id: itemId,
-        transaction_type: adjustment > 0 ? 'in' : 'out',
-        quantity: Math.abs(adjustment),
-        previous_quantity: currentQty,
-        new_quantity: newQty,
-        reason,
-      })
-    }
-
-    return result
+  /**
+   * Records chef consumption and deducts exactly those quantities from the branch stock, in one database call.
+   * Rows of the same item are added together; refused (nothing saved) when stock is not enough.
+   */
+  async recordChefConsumption(params: {
+    branchId: string
+    date: string
+    notes?: string
+    items: { item_id: string; quantity: number; content: number; notes?: string }[]
+  }) {
+    const { data, error } = await supabase.rpc('chef_consumption_record', {
+      p_branch_id: params.branchId,
+      p_date: params.date,
+      p_notes: params.notes ?? null,
+      p_items: params.items,
+    })
+    return { data: data as string | null, error }
   },
 
   // Check if item code exists
@@ -329,7 +304,7 @@ export const inventoryService = {
     }
 
     const { data, error } = await query
-    return { exists: data && data.length > 0, error }
+    return { exists: Boolean(data && data.length > 0), error }
   },
 
   // Get all units
@@ -340,28 +315,5 @@ export const inventoryService = {
       .order('name_ar')
 
     return { data: fixEncodingInData(data) as Unit[], error }
-  },
-
-  // Delete all inventory for a branch (for import replace)
-  async clearBranchInventory(branchId: string) {
-    const { error } = await supabase
-      .from('inventory')
-      .delete()
-      .eq('branch_id', branchId)
-
-    return { error }
-  },
-
-  // Delete all items (for full import replace)
-  async clearAllItems() {
-    // First delete all inventory
-    await supabase.from('inventory').delete().neq('id', '00000000-0000-0000-0000-000000000000')
-    // Then delete all items
-    const { error } = await supabase
-      .from('items')
-      .delete()
-      .neq('id', '00000000-0000-0000-0000-000000000000')
-
-    return { error }
   },
 }

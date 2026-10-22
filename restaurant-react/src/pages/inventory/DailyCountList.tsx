@@ -2,27 +2,32 @@ import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { dailyCountService, DailyCountWithDetails } from '../../services/dailyCount.service'
 import { useAuth } from '../../contexts/AuthContext'
-import { formatDate, translateStatus, getStatusColor } from '../../lib/utils'
+import { formatDate, getStatusColor } from '../../lib/utils'
+import { toUserMessage } from '../../lib/errors'
 import { Plus, ClipboardList, Eye, Building2 } from 'lucide-react'
+import { canAccessAllBranches, countStatusLabel } from './stockHelpers'
 
 export default function DailyCountList() {
   const { user } = useAuth()
   const [counts, setCounts] = useState<DailyCountWithDetails[]>([])
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
 
   useEffect(() => {
     fetchCounts()
   }, [user])
 
   const fetchCounts = async () => {
-    const branchId = user?.role !== 'admin' ? user?.branch_id : undefined
-    const { data } = await dailyCountService.getAll(branchId)
+    // user.role is the roles row ({ name, ... }); admin / warehouse manager see every branch
+    const branchId = canAccessAllBranches(user?.role) ? undefined : user?.branch_id
+    const { data, error: loadError } = await dailyCountService.getAll(branchId)
+    if (loadError) setError('تعذر تحميل سجلات الجرد: ' + toUserMessage(loadError))
     setCounts(data || [])
     setLoading(false)
   }
 
   const getCountTypeBadge = (type: string) => {
-    return type === 'opening' 
+    return type === 'opening'
       ? <span className="px-2 py-1 rounded-full text-xs font-medium bg-blue-100 text-blue-800">افتتاحي</span>
       : <span className="px-2 py-1 rounded-full text-xs font-medium bg-orange-100 text-orange-800">ختامي</span>
   }
@@ -42,6 +47,8 @@ export default function DailyCountList() {
           <Plus className="w-5 h-5" /> جرد جديد
         </Link>
       </div>
+
+      {error && <div className="p-4 bg-red-50 border border-red-200 rounded-lg text-red-700">{error}</div>}
 
       <div className="bg-white rounded-lg shadow-sm border border-gray-100 overflow-hidden">
         <div className="overflow-x-auto">
@@ -75,7 +82,7 @@ export default function DailyCountList() {
                   <td className="px-6 py-4">{getCountTypeBadge(count.count_type)}</td>
                   <td className="px-6 py-4">
                     <span className={`px-2 py-1 rounded-full text-xs font-medium ${getStatusColor(count.status)}`}>
-                      {translateStatus(count.status)}
+                      {countStatusLabel(count.status)}
                     </span>
                   </td>
                   <td className="px-6 py-4">

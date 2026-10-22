@@ -1,110 +1,129 @@
 import { useEffect, useState, useRef } from 'react'
 import { Link } from 'react-router-dom'
-import { inventoryService, InventoryWithDetails } from '../../services/inventory.service'
+import { inventoryService, InventoryWithDetails, ItemSaveData } from '../../services/inventory.service'
 import { branchesService } from '../../services/branches.service'
 import { Branch } from '../../types/database.types'
-import { Package, Search, Filter, Plus, Download, Upload, Edit2, Save, X, Trash2, Barcode as BarcodeIcon, Copy, Check, CheckSquare, Square } from 'lucide-react'
+import { Package, Search, Filter, Plus, Download, Upload, Edit2, Save, X, Trash2, Barcode as BarcodeIcon, Copy, Check, CheckSquare, Square, PackageX } from 'lucide-react'
 import ReactBarcode from 'react-barcode'
-import { formatNumber } from '../../lib/utils'
-import { exportToExcel, inventoryColumns, parseCSV, readFileAsText } from '../../lib/excel'
-import { supabase } from '../../lib/supabase'
+import { formatNumber, parseDecimal, roundMoney, roundQuantity } from '../../lib/utils'
+import { exportToExcel, inventoryColumns } from '../../lib/excel'
+import { toUserMessage } from '../../lib/errors'
+import { toLocalDate } from '../../lib/dates'
+import { useAuth } from '../../contexts/AuthContext'
+import { displayCode, roleName, unitLabel } from './stockHelpers'
+import StockImportDialog from './StockImportDialog'
+
+// Values of the row being edited (numbers kept as typed text, validated on save)
+interface EditForm {
+  name_ar: string
+  code: string
+  barcode: string
+  purchase_price: string
+  selling_price: string
+  quantity: string
+  opening_balance: string
+  category_id: string
+}
+
+const EMPTY_EDIT: EditForm = {
+  name_ar: '',
+  code: '',
+  barcode: '',
+  purchase_price: '',
+  selling_price: '',
+  quantity: '',
+  opening_balance: '',
+  category_id: ''
+}
+
+type StockItem = { id: string; code?: string; barcode?: string | null; name_ar?: string; category?: { id?: string; name_ar: string } | null; category_id?: string | null; unit?: unknown; purchase_price?: number | null; selling_price?: number | null; min_stock_level?: number | null }
 
 export default function StockList() {
+  const { user } = useAuth()
+  const isAdmin = roleName(user?.role) === 'admin'
+  const canEditItems = ['admin', 'warehouse_manager'].includes(roleName(user?.role) || '')
+
   const [stock, setStock] = useState<InventoryWithDetails[]>([])
   const [branches, setBranches] = useState<Branch[]>([])
+  const [mainWarehouseId, setMainWarehouseId] = useState<string | null>(null)
+  const [mainWarehouseName, setMainWarehouseName] = useState('')
   const [categories, setCategories] = useState<{ id: string; name_ar: string }[]>([])
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState('')
   const [selectedBranch, setSelectedBranch] = useState<string>('')
   const [selectedCategory, setSelectedCategory] = useState<string>('')
   const [search, setSearch] = useState('')
-  const [isMainWarehouse, setIsMainWarehouse] = useState(true)
   const [currentPage, setCurrentPage] = useState(1)
   const [itemsPerPage] = useState(250)
-  const fileInputRef = useRef<HTMLInputElement>(null)
+  const [showImport, setShowImport] = useState(false)
   const [editingItemId, setEditingItemId] = useState<string | null>(null)
-  const [editingInvId, setEditingInvId] = useState<string | null>(null)
-  const [editFormData, setEditFormData] = useState<{
-    name_ar: string
-    code: string
-    barcode: string
-    purchase_price: number
-    selling_price: number
-    quantity: number
-    opening_balance: number
-    category_id: string
-  }>({
-    name_ar: '',
-    code: '',
-    barcode: '',
-    purchase_price: 0,
-    selling_price: 0,
-    quantity: 0,
-    opening_balance: 0,
-    category_id: ''
-  })
+  const [editingInv, setEditingInv] = useState<InventoryWithDetails | null>(null)
+  const [editFormData, setEditFormData] = useState<EditForm>(EMPTY_EDIT)
+  const [editOriginal, setEditOriginal] = useState<EditForm>(EMPTY_EDIT)
   const [saving, setSaving] = useState(false)
   const [showBarcode, setShowBarcode] = useState(false)
   const [copiedId, setCopiedId] = useState<string | null>(null)
   const [selectedItems, setSelectedItems] = useState<Set<string>>(new Set())
   const [bulkDeleting, setBulkDeleting] = useState(false)
+  const [busyRowId, setBusyRowId] = useState<string | null>(null)
+  const stockRequestRef = useRef(0)
+
+  // The branch whose stock is shown: the selected branch, or the main warehouse
+  const stockBranchId = selectedBranch || mainWarehouseId || ''
+  const isMainWarehouse = !selectedBranch
 
   useEffect(() => {
     fetchData()
   }, [])
 
   useEffect(() => {
-    fetchStock()
-  }, [selectedBranch])
+    if (stockBranchId) fetchStock()
+  }, [stockBranchId])
 
   const fetchData = async () => {
     const [branchesRes, categoriesRes] = await Promise.all([
       branchesService.getActive(),
       inventoryService.getCategories(),
     ])
+    if (branchesRes.error || categoriesRes.error) {
+      setLoadError('تعذر تحميل الفروع أو المجموعات: ' + toUserMessage(branchesRes.error || categoriesRes.error))
+    }
     const allBranches = branchesRes.data || []
     // Filter out main warehouse from dropdown (it's the default option)
-    const nonMainBranches = allBranches.filter(b => !b.is_main_warehouse)
-    setBranches(nonMainBranches)
+    setBranches(allBranches.filter(b => !b.is_main_warehouse))
     setCategories(categoriesRes.data || [])
 
-    // Get main warehouse ID and fetch its stock
     const mainWarehouse = allBranches.find(b => b.is_main_warehouse)
     if (mainWarehouse) {
-      const stockRes = await inventoryService.getStockByBranch(mainWarehouse.id)
-      setStock(stockRes.data || [])
+      setMainWarehouseId(mainWarehouse.id)
+      setMainWarehouseName(mainWarehouse.name_ar || '')
+    } else {
+      if (!branchesRes.error) setLoadError('لم يتم تحديد مخزن رئيسي. حدّده من صفحة الفروع')
+      setLoading(false)
     }
-    setLoading(false)
   }
 
   const fetchStock = async () => {
+    const branchId = stockBranchId
+    if (!branchId) return
+    const request = ++stockRequestRef.current
     setLoading(true)
-
-    if (selectedBranch) {
-      // Fetch selected branch stock
-      const { data } = await inventoryService.getStockByBranch(selectedBranch)
-      setStock(data || [])
-      setIsMainWarehouse(false)
-    } else {
-      // Fetch main warehouse stock (not all stock)
-      const { data: allBranches } = await branchesService.getActive()
-      const mainWarehouse = allBranches?.find(b => b.is_main_warehouse)
-      if (mainWarehouse) {
-        const { data } = await inventoryService.getStockByBranch(mainWarehouse.id)
-        setStock(data || [])
-      } else {
-        setStock([])
-      }
-      setIsMainWarehouse(true)
-    }
-
+    const { data, error } = await inventoryService.getStockByBranch(branchId)
+    if (request !== stockRequestRef.current) return // a newer branch was selected meanwhile
+    if (error) setLoadError('تعذر تحميل المخزون: ' + toUserMessage(error))
+    else setLoadError('')
+    setStock(data || [])
     setLoading(false)
   }
 
   const filteredStock = stock.filter((inv) => {
-    const item = inv.item as { name_ar?: string; code?: string; category?: { id: string } }
+    const item = inv.item as unknown as StockItem
+    const term = search.trim()
     const matchesSearch =
-      item?.name_ar?.includes(search) ||
-      item?.code?.toLowerCase().includes(search.toLowerCase())
+      !term ||
+      item?.name_ar?.includes(term) ||
+      item?.code?.toLowerCase().includes(term.toLowerCase()) ||
+      (item?.barcode || '').includes(term)
     const matchesCategory = !selectedCategory || item?.category?.id === selectedCategory
     return matchesSearch && matchesCategory
   })
@@ -120,140 +139,139 @@ export default function StockList() {
     setCurrentPage(1)
   }, [search, selectedCategory, selectedBranch])
 
+  // A selection only ever covers rows the user can see: clear it when the filters, branch or page change
+  useEffect(() => {
+    setSelectedItems(new Set())
+  }, [search, selectedCategory, selectedBranch, currentPage])
+
   // Handle edit item
   const handleEditItem = (inv: InventoryWithDetails) => {
-    const item = inv.item as { id: string; name_ar?: string; code?: string; barcode?: string; purchase_price?: number; selling_price?: number; category_id?: string; category?: { id: string } }
-    // Convert scientific notation to full number string
-    const toFullString = (v: string | number | undefined) => {
-      if (!v) return ''
-      const s = String(v)
-      if (/[eE]/.test(s)) {
-        const n = Number(s)
-        if (!isNaN(n) && isFinite(n)) try { return BigInt(Math.round(n)).toString() } catch { return n.toLocaleString('en-US', { useGrouping: false, maximumFractionDigits: 0 }) }
-      }
-      if (typeof v === 'number') try { return BigInt(Math.round(v)).toString() } catch { return v.toLocaleString('en-US', { useGrouping: false, maximumFractionDigits: 0 }) }
-      return s
+    const item = inv.item as unknown as StockItem
+    // Codes are kept exactly as stored (no number conversion: '1E5' stays '1E5')
+    const values: EditForm = {
+      name_ar: item.name_ar || '',
+      code: displayCode(item.code),
+      barcode: displayCode(item.barcode),
+      purchase_price: String(item.purchase_price ?? 0),
+      selling_price: String(item.selling_price ?? 0),
+      quantity: String(inv.quantity ?? 0),
+      opening_balance: String(inv.opening_balance ?? 0),
+      category_id: item.category_id || item.category?.id || ''
     }
     setEditingItemId(item.id)
-    setEditingInvId(inv.id)
-    setEditFormData({
-      name_ar: item.name_ar || '',
-      code: toFullString(item.code),
-      barcode: toFullString(item.barcode),
-      purchase_price: item.purchase_price || 0,
-      selling_price: item.selling_price || 0,
-      quantity: inv.quantity || 0,
-      opening_balance: inv.opening_balance || 0,
-      category_id: item.category_id || item.category?.id || ''
-    })
+    setEditingInv(inv)
+    setEditFormData(values)
+    setEditOriginal(values)
   }
 
   const handleCancelEdit = () => {
     setEditingItemId(null)
-    setEditingInvId(null)
-    setEditFormData({
-      name_ar: '',
-      code: '',
-      barcode: '',
-      purchase_price: 0,
-      selling_price: 0,
-      quantity: 0,
-      opening_balance: 0,
-      category_id: ''
-    })
+    setEditingInv(null)
+    setEditFormData(EMPTY_EDIT)
+    setEditOriginal(EMPTY_EDIT)
   }
 
   const handleSaveEdit = async () => {
-    if (!editingItemId) return
-    
-    setSaving(true)
-    
-    // Update item in database
-    const itemUpdateData: Record<string, unknown> = {
-      name_ar: editFormData.name_ar,
-      code: editFormData.code,
-      barcode: editFormData.barcode || null,
-      purchase_price: editFormData.purchase_price,
-      selling_price: editFormData.selling_price,
-      updated_at: new Date().toISOString()
+    if (!editingItemId || !editingInv || saving) return
+
+    // Numbers: empty or invalid input is rejected, never silently turned into 0
+    const readNumber = (text: string, label: string): number | string => {
+      const value = parseDecimal(text)
+      if (value === null) return `قيمة "${label}" غير صحيحة`
+      if (value < 0) return `قيمة "${label}" لا يمكن أن تكون سالبة`
+      return value
     }
-    if (editFormData.category_id) {
-      itemUpdateData.category_id = editFormData.category_id
-    }
-    
-    const { error } = await supabase
-      .from('items')
-      .update(itemUpdateData)
-      .eq('id', editingItemId)
-    
-    if (error) {
-      alert('فشل في حفظ تعديلات الصنف: ' + error.message)
-      setSaving(false)
+    const purchase = readNumber(editFormData.purchase_price, 'سعر الشراء')
+    const selling = readNumber(editFormData.selling_price, 'سعر البيع')
+    const quantity = readNumber(editFormData.quantity, 'الكمية')
+    const opening = readNumber(editFormData.opening_balance, 'رصيد أول المدة')
+    const invalid = [purchase, selling, quantity, opening].find(v => typeof v === 'string')
+    if (typeof invalid === 'string') {
+      alert(invalid)
       return
     }
-    
-    // Update inventory record (quantity + opening_balance)
-    if (editingInvId) {
-      const { error: invError } = await supabase
-        .from('inventory')
-        .update({
-          quantity: editFormData.quantity,
-          opening_balance: editFormData.opening_balance,
-          updated_at: new Date().toISOString()
-        })
-        .eq('id', editingInvId)
-      
-      if (invError) {
-        alert('تم حفظ بيانات الصنف لكن فشل تحديث الكمية: ' + invError.message)
-        setSaving(false)
-        return
-      }
+    if (!editFormData.code.trim() || !editFormData.name_ar.trim()) {
+      alert('كود الصنف واسم الصنف مطلوبان')
+      return
     }
-    
-    // Refresh stock data
-    await fetchStock()
-    handleCancelEdit()
-    alert('تم حفظ التعديلات بنجاح')
-    
+
+    // Send only what the user changed, so nothing else is overwritten with values loaded earlier
+    const changed = (field: keyof EditForm) => editFormData[field].trim() !== editOriginal[field].trim()
+    const itemChanges: ItemSaveData = {}
+    if (changed('name_ar')) itemChanges.name_ar = editFormData.name_ar.trim()
+    if (changed('code')) itemChanges.code = editFormData.code.trim()
+    if (changed('barcode')) itemChanges.barcode = editFormData.barcode.trim() || null
+    if (changed('purchase_price')) itemChanges.purchase_price = roundMoney(purchase as number)
+    if (changed('selling_price')) itemChanges.selling_price = roundMoney(selling as number)
+    if (changed('category_id')) itemChanges.category_id = editFormData.category_id || null
+    const quantityChanged = roundQuantity(quantity as number) !== roundQuantity(Number(editingInv.quantity ?? 0))
+    const openingChanged = roundQuantity(opening as number) !== roundQuantity(Number(editingInv.opening_balance ?? 0))
+
+    if (Object.keys(itemChanges).length === 0 && !quantityChanged && !openingChanged) {
+      handleCancelEdit()
+      return
+    }
+
+    setSaving(true)
+    // One database call: item fields, opening balance and the quantity (as a logged adjustment;
+    // refused when the stock moved since this list was loaded)
+    const { error } = await inventoryService.saveStockRow({
+      inventoryId: editingInv.id,
+      item: itemChanges,
+      quantity: quantityChanged ? roundQuantity(quantity as number) : null,
+      expectedQuantity: quantityChanged ? Number(editingInv.quantity ?? 0) : null,
+      openingBalance: openingChanged ? roundQuantity(opening as number) : null,
+    })
     setSaving(false)
+
+    if (error) {
+      alert('فشل في حفظ التعديلات: ' + toUserMessage(error))
+      return
+    }
+
+    handleCancelEdit()
+    await fetchStock()
+    alert('تم حفظ التعديلات بنجاح')
   }
 
-  // Handle delete item
-  const handleDeleteItem = async (inv: InventoryWithDetails) => {
-    const item = inv.item as { id: string; name_ar?: string; code?: string }
+  // Remove the item from this branch's stock list (the item itself stays in the system)
+  const handleRemoveFromBranch = async (inv: InventoryWithDetails) => {
+    if (busyRowId) return
+    const item = inv.item as unknown as StockItem
     const itemName = item?.name_ar || item?.code || 'غير معروف'
-    
-    if (!confirm(`هل أنت متأكد من حذف الصنف "${itemName}"؟\nسيتم حذف الصنف ومخزونه نهائياً.`)) {
+    const qty = Number(inv.quantity || 0)
+    let message = `إزالة الصنف "${itemName}" من مخزون ${selectedBranchName}؟\nالصنف نفسه يبقى في النظام وفي الفروع الأخرى.`
+    if (qty > 0) message += `\nسيتم تصفير رصيده (${formatNumber(qty)}) وتسجيل ذلك كتسوية مخزون.`
+    if (!confirm(message)) return
+
+    setBusyRowId(inv.id)
+    const { data: removed, error } = await inventoryService.removeStockRows([inv.id])
+    setBusyRowId(null)
+    if (error) {
+      alert('فشل في حذف الصنف من مخزون الفرع: ' + toUserMessage(error))
       return
     }
+    setStock(prev => prev.filter(s => s.id !== inv.id))
+    alert(removed ? `تم حذف "${itemName}" من مخزون ${selectedBranchName}` : `"${itemName}" محذوف من مخزون الفرع بالفعل`)
+  }
 
-    try {
-      // First delete the inventory record
-      const { error: invError } = await supabase
-        .from('inventory')
-        .delete()
-        .eq('id', inv.id)
-
-      if (invError) {
-        alert('فشل في حذف سجل المخزون: ' + invError.message)
-        return
-      }
-
-      // Then delete the item itself
-      const { error: itemError } = await inventoryService.deleteItem(item.id)
-      
-      if (itemError) {
-        // Item might have other references, just remove from local state
-        console.warn('Could not delete item (may have other references):', itemError.message)
-      }
-
-      // Remove from local state
-      setStock(prev => prev.filter(s => s.id !== inv.id))
-      alert(`تم حذف الصنف "${itemName}" بنجاح`)
-    } catch (error) {
-      console.error('Delete error:', error)
-      alert('حدث خطأ أثناء الحذف')
+  // Delete the item from the whole system (refused while it has stock, is a recipe ingredient or has history)
+  const handleDeleteItem = async (inv: InventoryWithDetails) => {
+    if (busyRowId) return
+    const item = inv.item as unknown as StockItem
+    const itemName = item?.name_ar || item?.code || 'غير معروف'
+    if (!confirm(`حذف الصنف "${itemName}" من النظام نهائياً (من كل الفروع)؟\nلا يمكن حذف صنف له رصيد أو مستخدم في وصفة أو له عمليات سابقة؛ اجعله غير نشط بدلاً من ذلك.`)) {
+      return
     }
+    setBusyRowId(inv.id)
+    const { error } = await inventoryService.deleteItem(item.id)
+    setBusyRowId(null)
+    if (error) {
+      alert('فشل حذف الصنف: ' + toUserMessage(error))
+      return
+    }
+    setStock(prev => prev.filter(s => s.id !== inv.id))
+    alert(`تم حذف الصنف "${itemName}" من النظام`)
   }
 
   // Copy code/barcode to clipboard
@@ -277,8 +295,10 @@ export default function StockList() {
     })
   }
 
+  const allOnPageSelected = paginatedStock.length > 0 && paginatedStock.every(inv => selectedItems.has(inv.id))
+
   const handleSelectAll = () => {
-    if (selectedItems.size === paginatedStock.length) {
+    if (allOnPageSelected) {
       // Deselect all
       setSelectedItems(new Set())
     } else {
@@ -287,91 +307,36 @@ export default function StockList() {
     }
   }
 
-  const handleBulkDelete = async () => {
-    if (selectedItems.size === 0) return
-    
-    const count = selectedItems.size
-    if (!confirm(`هل أنت متأكد من حذف ${count} صنف؟\nسيتم حذف الأصناف ومخزونها نهائياً.`)) {
-      return
-    }
+  // Only rows that are visible right now can be acted on
+  const selectedVisible = filteredStock.filter(inv => selectedItems.has(inv.id))
+
+  const handleBulkRemove = async () => {
+    if (selectedVisible.length === 0 || bulkDeleting) return
+
+    const count = selectedVisible.length
+    const withStock = selectedVisible.filter(inv => Number(inv.quantity || 0) > 0).length
+    let message = `إزالة ${count} صنف من مخزون ${selectedBranchName}؟\nالأصناف نفسها تبقى في النظام.`
+    if (withStock > 0) message += `\n${withStock} منها لها رصيد سيتم تصفيره وتسجيله كتسوية مخزون.`
+    if (!confirm(message)) return
 
     setBulkDeleting(true)
-    let successCount = 0
-    let errorCount = 0
-
-    const itemsToDelete = stock.filter(inv => selectedItems.has(inv.id))
-
-    // Process in batches of 20
-    const BATCH_SIZE = 20
-    for (let i = 0; i < itemsToDelete.length; i += BATCH_SIZE) {
-      const batch = itemsToDelete.slice(i, i + BATCH_SIZE)
-      
-      for (const inv of batch) {
-        try {
-          const item = inv.item as { id: string }
-          // Delete inventory record
-          const { error: invError } = await supabase
-            .from('inventory')
-            .delete()
-            .eq('id', inv.id)
-
-          if (invError) {
-            errorCount++
-            continue
-          }
-
-          // Try to delete item (may fail if referenced elsewhere)
-          await inventoryService.deleteItem(item.id).catch(() => {})
-          successCount++
-        } catch {
-          errorCount++
-        }
-      }
-    }
-
-    // Update local state
-    setStock(prev => prev.filter(s => !selectedItems.has(s.id)))
-    setSelectedItems(new Set())
+    const { data: removed, error } = await inventoryService.removeStockRows(selectedVisible.map(inv => inv.id))
     setBulkDeleting(false)
-
-    let msg = `تم حذف ${successCount} صنف بنجاح`
-    if (errorCount > 0) msg += `\nفشل حذف ${errorCount} صنف`
+    if (error) {
+      alert('فشل الحذف ولم يتم حذف أي صنف: ' + toUserMessage(error))
+      return
+    }
+    setSelectedItems(new Set())
+    await fetchStock()
+    let msg = `تم حذف ${removed ?? 0} صنف من مخزون ${selectedBranchName}`
+    if ((removed ?? 0) < count) msg += `\n${count - (removed ?? 0)} صنف كان محذوفاً بالفعل`
     alert(msg)
-  }
-
-  // Convert scientific notation (3.50E+12) to full number string (3500000000000)
-  const formatCodeValue = (value: string | number | undefined | null): string => {
-    if (value === null || value === undefined || value === '') return '-'
-    // Strip invisible characters, Arabic formatting chars, and whitespace
-    let str = String(value).replace(/[\u200E\u200F\u202A-\u202E\s]/g, '')
-    // Check if it's scientific notation (contains E or e)
-    if (/[eE]/.test(str)) {
-      const cleanNumStr = str.replace(/[^0-9eE.+-]/g, '')
-      const num = Number(cleanNumStr)
-      if (!isNaN(num) && isFinite(num)) {
-        // Use BigInt for large integers to avoid precision loss
-        try {
-          return BigInt(Math.round(num)).toString()
-        } catch {
-          return num.toLocaleString('en-US', { useGrouping: false, maximumFractionDigits: 0 })
-        }
-      }
-    }
-    // If it's a plain number type, also convert properly
-    if (typeof value === 'number') {
-      try {
-        return BigInt(Math.round(value)).toString()
-      } catch {
-        return value.toLocaleString('en-US', { useGrouping: false, maximumFractionDigits: 0 })
-      }
-    }
-    return str
   }
 
   // Group by category for display
   const groupedStock = paginatedStock.reduce(
     (acc, inv) => {
-      const item = inv.item as { category?: { name_ar: string } }
+      const item = inv.item as unknown as StockItem
       const categoryName = item?.category?.name_ar || 'بدون تصنيف'
       if (!acc[categoryName]) {
         acc[categoryName] = []
@@ -382,288 +347,43 @@ export default function StockList() {
     {} as Record<string, InventoryWithDetails[]>
   )
 
-  // Get selected branch name
+  // Get selected branch name (the main warehouse's real name, as the export writes it)
   const selectedBranchName = selectedBranch
     ? branches.find(b => b.id === selectedBranch)?.name_ar || 'الفرع'
-    : 'المخزن الرئيسي'
+    : mainWarehouseName || 'المخزن الرئيسي'
 
-  // Format date helper
+  // Format date helper (Cairo calendar date)
   const formatDate = (date: string) => {
-    const d = new Date(date)
-    return `${d.getDate()}/${d.getMonth() + 1}/${d.getFullYear()}`
+    const [y, m, d] = toLocalDate(date).split('-')
+    return `${Number(d)}/${Number(m)}/${y}`
   }
 
   // Generate document number
-  const getDocNumber = (date: string, index: number) => {
-    const d = new Date(date)
-    return `${d.getDate()}/${d.getMonth() + 1}/${d.getFullYear()}-${String(index + 1).padStart(2, '0')}`
-  }
+  const getDocNumber = (date: string, index: number) => `${formatDate(date)}-${String(index + 1).padStart(2, '0')}`
 
-  // Export to Excel
+  // Export to Excel (codes are written so Excel keeps them as text)
   const handleExport = () => {
     const exportData = filteredStock.map(inv => {
-      const item = inv.item as { code?: string; name_ar?: string; unit?: { name_ar?: string; code?: string } | string; purchase_price?: number; selling_price?: number; category?: { name_ar?: string } }
-      const branch = inv.branch as { name_ar?: string }
-      // Handle unit as object or string
-      const unitValue = typeof item?.unit === 'object'
-        ? (item?.unit?.name_ar || item?.unit?.code || '')
-        : (item?.unit || '')
+      const item = inv.item as unknown as StockItem
+      const branch = inv.branch as { name_ar?: string } | undefined
       return {
-        item_code: item?.code || '',
+        item_code: displayCode(item?.code),
         item_name: item?.name_ar || '',
         category_name: item?.category?.name_ar || '',
         branch_name: branch?.name_ar || selectedBranchName,
-        quantity: inv.quantity || 0,
-        unit: unitValue,
-        min_quantity: inv.min_quantity || 0,
-        opening_balance: inv.opening_balance || 0, // رصيد أول المدة - actual field
-        purchase_price: item?.purchase_price || 0,
-        selling_price: item?.selling_price || 0,
+        quantity: Number(inv.quantity || 0),
+        unit: unitLabel(item?.unit, ''),
+        min_quantity: Number(inv.min_quantity || 0),
+        opening_balance: Number(inv.opening_balance || 0), // رصيد أول المدة - actual field
+        purchase_price: Number(item?.purchase_price || 0),
+        selling_price: Number(item?.selling_price || 0),
       }
     })
     exportToExcel(exportData, inventoryColumns, `مخزون_${selectedBranchName}`)
   }
 
-  // Import from Excel
-  const handleImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0]
-    if (!file) return
-
-    try {
-      setLoading(true)
-      const text = await readFileAsText(file)
-      const data = parseCSV(text)
-      console.log('Imported data:', data)
-
-      if (data.length === 0) {
-        alert('الملف فارغ أو غير صالح')
-        setLoading(false)
-        return
-      }
-
-      // Get target branch (selected or main warehouse)
-      let targetBranchId = selectedBranch
-      if (!targetBranchId) {
-        const { data: allBranches } = await branchesService.getActive()
-        const mainWarehouse = allBranches?.find(b => b.is_main_warehouse)
-        targetBranchId = mainWarehouse?.id || ''
-      }
-      if (!targetBranchId) {
-        alert('يرجى اختيار الفرع أولاً')
-        setLoading(false)
-        return
-      }
-
-      // Get all items to match by code
-      const { data: allItems } = await inventoryService.getAllItems()
-      const itemMap = new Map((allItems || []).map(i => [i.code?.toLowerCase(), i]))
-
-      // Get units for mapping
-      const { data: units } = await inventoryService.getUnits()
-      const defaultUnit = units?.find(u => u.code === 'PC' || u.code === 'KG') || units?.[0]
-
-      // Get existing categories and build a lookup map by name
-      const { data: existingCategories } = await inventoryService.getCategories()
-      const categoryMap = new Map((existingCategories || []).map(c => [c.name_ar.trim(), c.id]))
-
-      let successCount = 0
-      let newItemsCount = 0
-      let newCategoriesCount = 0
-      let errorCount = 0
-      const errors: string[] = []
-
-      console.log('CSV Headers:', Object.keys(data[0] || {}))
-      console.log('Default unit:', defaultUnit)
-      console.log(`Starting import of ${data.length} items in batches of 50...`)
-
-      // Process in batches of 50
-      const BATCH_SIZE = 50
-      const totalBatches = Math.ceil(data.length / BATCH_SIZE)
-
-      for (let batchIndex = 0; batchIndex < totalBatches; batchIndex++) {
-        const start = batchIndex * BATCH_SIZE
-        const end = Math.min(start + BATCH_SIZE, data.length)
-        const batch = data.slice(start, end)
-
-        console.log(`Processing batch ${batchIndex + 1}/${totalBatches} (items ${start + 1}-${end})`)
-
-        for (const row of batch) {
-          // Get item data from CSV
-          const itemCode = (row['كود الصنف'] || row['item_code'] || row['كود'] || '').toString().trim()
-          const itemName = (row['اسم الصنف'] || row['item_name'] || row['الاسم'] || '').toString().trim()
-          const categoryName = (row['مجموعة'] || row['category_name'] || row['المجموعة'] || '').toString().trim()
-          const quantity = parseFloat(row['الكمية'] || row['quantity'] || row['الرصيد إجمالي'] || '0')
-          const openingBalance = parseFloat(row['رصيد أول المدة'] || row['opening_balance'] || row['الحد الأدنى'] || '0')
-          const purchasePrice = parseFloat(row['سعر الشراء'] || row['purchase_price'] || '0')
-          const sellingPrice = parseFloat(row['سعر البيع'] || row['selling_price'] || '0')
-          // Handle unit - could be string or [object Object] from bad export
-          let unitRaw = row['الوحدة'] || row['unit'] || row['وصف المحتوى'] || ''
-          const unitName = (typeof unitRaw === 'object' ? '' : unitRaw.toString()).trim()
-
-          if (!itemCode) {
-            errorCount++
-            errors.push(`سطر بدون كود صنف`)
-            continue
-          }
-
-          if (!itemName) {
-            errorCount++
-            errors.push(`سطر بدون اسم صنف: ${itemCode}`)
-            continue
-          }
-
-          // Resolve category: look up existing or create new
-          let categoryId: string | undefined = undefined
-          if (categoryName) {
-            if (categoryMap.has(categoryName)) {
-              categoryId = categoryMap.get(categoryName)
-            } else {
-              // Create new category
-              const { data: newCat, error: catError } = await inventoryService.createCategory(categoryName)
-              if (catError || !newCat) {
-                console.error(`❌ Failed to create category: ${categoryName}`, catError)
-                errors.push(`فشل إنشاء مجموعة "${categoryName}": ${catError?.message || 'خطأ غير معروف'}`)
-              } else {
-                categoryMap.set(categoryName, newCat.id)
-                categoryId = newCat.id
-                newCategoriesCount++
-                console.log(`✅ Created new category: ${categoryName} (${newCat.id})`)
-              }
-            }
-          }
-
-          let item = itemMap.get(itemCode.toLowerCase())
-
-          // If item doesn't exist, create it
-          if (!item) {
-            // Find matching unit or use default
-            const matchedUnit = units?.find(u =>
-              u.name_ar === unitName ||
-              u.code?.toLowerCase() === unitName.toLowerCase()
-            ) || defaultUnit
-
-            if (!matchedUnit || !matchedUnit.id) {
-              errorCount++
-              errors.push(`لا توجد وحدة قياس للصنف ${itemCode}`)
-              console.error(`No valid unit found for item ${itemCode}. unitName: ${unitName}`)
-              continue
-            }
-
-            const itemToCreate: Parameters<typeof inventoryService.createItem>[0] = {
-              code: itemCode,
-              name: itemName,
-              name_ar: itemName,
-              unit: matchedUnit.id,
-              min_stock_level: 0,
-              purchase_price: purchasePrice || 0,
-              selling_price: sellingPrice || 0,
-              status: 'active' as const,
-              ...(categoryId ? { category_id: categoryId } : {}),
-            }
-
-            const { data: newItem, error: createError } = await inventoryService.createItem(itemToCreate)
-
-            if (createError || !newItem) {
-              errorCount++
-              const errorMsg = createError?.message || 'خطأ غير معروف'
-              errors.push(`فشل إنشاء الصنف ${itemCode}: ${errorMsg}`)
-              console.error(`❌ Failed to create item: ${itemCode}`, createError)
-              continue
-            }
-
-            item = newItem
-            itemMap.set(itemCode.toLowerCase(), newItem)
-            newItemsCount++
-          } else {
-            // Update existing item prices and/or category if provided
-            const updateData: { purchase_price?: number; selling_price?: number; category_id?: string } = {}
-            if (purchasePrice > 0) updateData.purchase_price = purchasePrice
-            if (sellingPrice > 0) updateData.selling_price = sellingPrice
-            if (categoryId) updateData.category_id = categoryId
-
-            if (Object.keys(updateData).length > 0) {
-              await inventoryService.updateItem(item.id, updateData)
-            }
-          }
-
-          // Update stock
-          if (!item || !item.id) {
-            errorCount++
-            errors.push(`فشل في الحصول على معرف الصنف ${itemCode}`)
-            continue
-          }
-
-          // For first-time import: if quantity is 0 but opening balance exists, use opening balance as quantity
-          const finalQuantity = (quantity === 0 && openingBalance > 0) ? openingBalance : quantity
-
-          const { error: stockError } = await inventoryService.updateStock(
-            targetBranchId, 
-            item.id, 
-            finalQuantity,
-            openingBalance // Pass opening balance
-          )
-
-          if (stockError) {
-            errorCount++
-            errors.push(`فشل تحديث مخزون ${itemCode}: ${stockError.message}`)
-            console.error(`Stock update failed for ${itemCode}:`, stockError)
-          } else {
-            successCount++
-          }
-        }
-
-        // Small delay between batches to avoid rate limiting
-        if (batchIndex < totalBatches - 1) {
-          await new Promise(resolve => setTimeout(resolve, 100))
-        }
-
-        console.log(`✅ Batch ${batchIndex + 1}/${totalBatches} complete. Success: ${successCount}, Errors: ${errorCount}`)
-      }
-
-      // Show result
-      let message = `تم استيراد ${successCount} سجل بنجاح من أصل ${data.length}`
-      if (newItemsCount > 0) {
-        message += `\nتم إنشاء ${newItemsCount} صنف جديد`
-      }
-      if (newCategoriesCount > 0) {
-        message += `\nتم إنشاء ${newCategoriesCount} مجموعة جديدة`
-      }
-      if (errorCount > 0) {
-        message += `\nفشل ${errorCount} سجل`
-        if (errors.length > 0 && errors.length <= 10) {
-          message += `:\n${errors.slice(0, 10).join('\n')}`
-        } else if (errors.length > 10) {
-          message += `\nأول 10 أخطاء:\n${errors.slice(0, 10).join('\n')}`
-        }
-      }
-      alert(message)
-
-      console.log(`Import complete! Total: ${data.length}, Success: ${successCount}, New items: ${newItemsCount}, New categories: ${newCategoriesCount}, Errors: ${errorCount}`)
-
-      // Refresh data
-      await new Promise(resolve => setTimeout(resolve, 500))
-      const { data: freshData, error: fetchError } = await inventoryService.getStockByBranch(targetBranchId)
-
-      if (fetchError) {
-        console.error('Failed to refresh inventory:', fetchError)
-        alert('تم الاستيراد بنجاح ولكن فشل تحديث العرض. يرجى تحديث الصفحة.')
-      } else {
-        setStock(freshData || [])
-      }
-
-      setLoading(false)
-
-    } catch (error) {
-      console.error('Import error:', error)
-      alert('فشل في قراءة الملف')
-      setLoading(false)
-    }
-
-    // Reset input
-    if (fileInputRef.current) {
-      fileInputRef.current.value = ''
-    }
-  }
+  const totalQuantity = roundQuantity(filteredStock.reduce((sum, i) => sum + Number(i.quantity || 0), 0))
+  const lowStockCount = filteredStock.filter(i => Number(i.quantity || 0) < Number(i.item?.min_stock_level ?? 10)).length
 
   if (loading) {
     return (
@@ -672,6 +392,178 @@ export default function StockList() {
       </div>
     )
   }
+
+  const renderCodeCell = (item: StockItem, displayValue: string) => (
+    <div className="flex items-center gap-2">
+      {showBarcode && displayValue !== '-' ? (
+        <div className="bg-white p-1 rounded border border-gray-200 inline-block overflow-hidden flex-shrink-0" style={{ maxWidth: '100px' }}>
+          <ReactBarcode
+            value={displayValue}
+            height={30}
+            width={1.2}
+            fontSize={11}
+            margin={0}
+            background="transparent"
+          />
+        </div>
+      ) : (
+        <span className="text-gray-900 font-mono text-sm select-all" dir="ltr" style={{ fontVariantNumeric: 'tabular-nums' }}>{displayValue}</span>
+      )}
+      {displayValue !== '-' && (
+        <button
+          type="button"
+          onClick={() => handleCopyCode(displayValue, item.id)}
+          className="p-1 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded transition-colors shrink-0"
+          title="نسخ الكود"
+        >
+          {copiedId === item.id ? <Check className="w-3.5 h-3.5 text-green-500" /> : <Copy className="w-3.5 h-3.5" />}
+        </button>
+      )}
+    </div>
+  )
+
+  const renderCodeInputs = () => (
+    <div className="space-y-1">
+      <input
+        type="text"
+        value={editFormData.code}
+        onChange={(e) => setEditFormData({ ...editFormData, code: e.target.value })}
+        className="w-full px-2 py-1 border border-blue-300 rounded text-sm font-mono"
+        dir="ltr"
+        placeholder="الكود"
+        title="كود الصنف"
+      />
+      <input
+        type="text"
+        value={editFormData.barcode}
+        onChange={(e) => setEditFormData({ ...editFormData, barcode: e.target.value })}
+        className="w-full px-2 py-1 border border-orange-300 rounded text-sm font-mono"
+        dir="ltr"
+        placeholder="الباركود"
+        title="الباركود"
+      />
+    </div>
+  )
+
+  const renderCategoryCell = (isEditing: boolean, categoryName: string) =>
+    isEditing ? (
+      <select
+        value={editFormData.category_id}
+        onChange={(e) => setEditFormData({ ...editFormData, category_id: e.target.value })}
+        className="w-full px-2 py-1 border border-blue-300 rounded text-sm"
+        aria-label="المجموعة"
+      >
+        <option value="">بدون تصنيف</option>
+        {editOriginal.category_id && !categories.some(c => c.id === editOriginal.category_id) && (
+          <option value={editOriginal.category_id}>{categoryName} (غير نشطة)</option>
+        )}
+        {categories.map((cat) => (
+          <option key={cat.id} value={cat.id}>
+            {cat.name_ar}
+          </option>
+        ))}
+      </select>
+    ) : (
+      categoryName
+    )
+
+  const renderNumberInput = (field: 'quantity' | 'opening_balance' | 'purchase_price' | 'selling_price', width: string, title: string) => (
+    <input
+      type="text"
+      inputMode="decimal"
+      value={editFormData[field]}
+      onChange={(e) => setEditFormData({ ...editFormData, [field]: e.target.value })}
+      className={`${width} px-2 py-1 border border-blue-300 rounded text-sm`}
+      dir="ltr"
+      title={title}
+      aria-label={title}
+    />
+  )
+
+  const renderActions = (inv: InventoryWithDetails, isEditing: boolean) =>
+    isEditing ? (
+      <div className="flex items-center justify-center gap-2">
+        <button
+          type="button"
+          onClick={handleSaveEdit}
+          disabled={saving}
+          className="p-1.5 text-green-600 hover:bg-green-50 rounded-lg disabled:opacity-50"
+          title="حفظ"
+        >
+          <Save className="w-4 h-4" />
+        </button>
+        <button
+          type="button"
+          onClick={handleCancelEdit}
+          disabled={saving}
+          className="p-1.5 text-red-600 hover:bg-red-50 rounded-lg disabled:opacity-50"
+          title="إلغاء"
+        >
+          <X className="w-4 h-4" />
+        </button>
+      </div>
+    ) : (
+      <div className="flex items-center justify-center gap-1">
+        <button
+          type="button"
+          onClick={() => handleEditItem(inv)}
+          disabled={editingItemId !== null}
+          className="p-1.5 text-blue-600 hover:bg-blue-50 rounded-lg disabled:opacity-40"
+          title="تعديل"
+        >
+          <Edit2 className="w-4 h-4" />
+        </button>
+        <button
+          type="button"
+          onClick={() => handleRemoveFromBranch(inv)}
+          disabled={busyRowId !== null}
+          className="p-1.5 text-orange-600 hover:bg-orange-50 rounded-lg disabled:opacity-40"
+          title="حذف من مخزون هذا الفرع"
+        >
+          <Trash2 className="w-4 h-4" />
+        </button>
+        {isAdmin && (
+          <button
+            type="button"
+            onClick={() => handleDeleteItem(inv)}
+            disabled={busyRowId !== null}
+            className="p-1.5 text-red-600 hover:bg-red-50 rounded-lg disabled:opacity-40"
+            title="حذف الصنف من النظام نهائياً"
+          >
+            <PackageX className="w-4 h-4" />
+          </button>
+        )}
+      </div>
+    )
+
+  const renderSelectAll = (hoverClass: string, checkedClass: string) => (
+    <button
+      type="button"
+      onClick={handleSelectAll}
+      className={`p-1 ${hoverClass} rounded transition-colors`}
+      title={allOnPageSelected ? 'إلغاء اختيار الكل' : 'اختيار الكل'}
+    >
+      {allOnPageSelected ? (
+        <CheckSquare className={`w-4 h-4 ${checkedClass}`} />
+      ) : (
+        <Square className="w-4 h-4 text-gray-500" />
+      )}
+    </button>
+  )
+
+  const renderRowCheckbox = (invId: string, hoverClass: string, checkedClass: string) => (
+    <button
+      type="button"
+      onClick={() => handleToggleSelect(invId)}
+      className={`p-1 ${hoverClass} rounded transition-colors`}
+    >
+      {selectedItems.has(invId) ? (
+        <CheckSquare className={`w-4 h-4 ${checkedClass}`} />
+      ) : (
+        <Square className="w-4 h-4 text-gray-400" />
+      )}
+    </button>
+  )
 
   return (
     <div className="space-y-6">
@@ -693,21 +585,14 @@ export default function StockList() {
           </button>
           <button
             type="button"
-            onClick={() => fileInputRef.current?.click()}
-            className="flex items-center gap-2 px-4 py-2 bg-orange-600 text-white rounded-lg hover:bg-orange-700"
-            title="استيراد من Excel"
+            onClick={() => setShowImport(true)}
+            disabled={!stockBranchId}
+            className="flex items-center gap-2 px-4 py-2 bg-orange-600 text-white rounded-lg hover:bg-orange-700 disabled:opacity-50"
+            title="استيراد من ملف CSV"
           >
             <Upload className="w-5 h-5" />
             استيراد
           </button>
-          <input
-            ref={fileInputRef}
-            type="file"
-            accept=".csv,.xlsx,.xls"
-            onChange={handleImport}
-            className="hidden"
-            aria-label="استيراد ملف Excel"
-          />
           <Link
             to="/inventory/items/new"
             className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
@@ -717,6 +602,10 @@ export default function StockList() {
           </Link>
         </div>
       </div>
+
+      {loadError && (
+        <div className="p-4 bg-red-50 border border-red-200 rounded-lg text-red-700">{loadError}</div>
+      )}
 
       {/* Filters */}
       <div className="bg-white rounded-lg shadow-sm border border-gray-100 p-4">
@@ -739,7 +628,10 @@ export default function StockList() {
 
           <select
             value={selectedBranch}
-            onChange={(e) => setSelectedBranch(e.target.value)}
+            onChange={(e) => {
+              handleCancelEdit()
+              setSelectedBranch(e.target.value)
+            }}
             aria-label="الفرع"
             className="px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
           >
@@ -768,6 +660,7 @@ export default function StockList() {
           <button
             type="button"
             onClick={() => {
+              handleCancelEdit()
               setSearch('')
               setSelectedBranch('')
               setSelectedCategory('')
@@ -779,13 +672,13 @@ export default function StockList() {
         </div>
       </div>
 
-      {/* Bulk Delete Action Bar */}
-      {selectedItems.size > 0 && (
+      {/* Bulk Remove Action Bar */}
+      {selectedVisible.length > 0 && (
         <div className="bg-red-50 border border-red-200 rounded-lg p-4 flex items-center justify-between">
           <div className="flex items-center gap-3">
             <CheckSquare className="w-5 h-5 text-red-600" />
             <span className="font-medium text-red-800">
-              تم اختيار {selectedItems.size} صنف
+              تم اختيار {selectedVisible.length} صنف
             </span>
           </div>
           <div className="flex items-center gap-2">
@@ -798,7 +691,7 @@ export default function StockList() {
             </button>
             <button
               type="button"
-              onClick={handleBulkDelete}
+              onClick={handleBulkRemove}
               disabled={bulkDeleting}
               className="px-4 py-2 bg-red-600 text-white rounded-lg hover:bg-red-700 flex items-center gap-2 disabled:opacity-50"
             >
@@ -807,7 +700,7 @@ export default function StockList() {
               ) : (
                 <Trash2 className="w-4 h-4" />
               )}
-              حذف المحدد ({selectedItems.size})
+              حذف المحدد من مخزون الفرع ({selectedVisible.length})
             </button>
           </div>
         </div>
@@ -822,7 +715,7 @@ export default function StockList() {
         <div className="bg-white rounded-lg shadow-sm p-4 border border-gray-100">
           <p className="text-sm text-gray-500">إجمالي الكمية</p>
           <p className="text-2xl font-bold text-blue-600">
-            {formatNumber(filteredStock.reduce((sum, i) => sum + (i.quantity || 0), 0))}
+            {formatNumber(totalQuantity)}
           </p>
         </div>
         <div className="bg-white rounded-lg shadow-sm p-4 border border-gray-100">
@@ -832,7 +725,7 @@ export default function StockList() {
         <div className="bg-white rounded-lg shadow-sm p-4 border border-gray-100">
           <p className="text-sm text-gray-500">مخزون منخفض</p>
           <p className="text-2xl font-bold text-red-600">
-            {formatNumber(filteredStock.filter((i) => i.quantity < (i.item?.min_stock_level || 10)).length)}
+            {formatNumber(lowStockCount)}
           </p>
         </div>
       </div>
@@ -844,25 +737,14 @@ export default function StockList() {
             <Package className="w-12 h-12 text-gray-300 mx-auto mb-4" />
             <p className="text-gray-500">لا توجد بيانات</p>
           </div>
-        ) : isMainWarehouse || !selectedBranch ? (
+        ) : isMainWarehouse ? (
           /* Main Warehouse Table - Blue Header */
           <div className="overflow-x-auto">
             <table className="w-full">
               <thead className="bg-blue-100">
                 <tr>
                   <th className="px-2 py-3 text-center">
-                    <button
-                      type="button"
-                      onClick={handleSelectAll}
-                      className="p-1 hover:bg-blue-200 rounded transition-colors"
-                      title={selectedItems.size === paginatedStock.length ? 'إلغاء اختيار الكل' : 'اختيار الكل'}
-                    >
-                      {selectedItems.size === paginatedStock.length && paginatedStock.length > 0 ? (
-                        <CheckSquare className="w-4 h-4 text-blue-700" />
-                      ) : (
-                        <Square className="w-4 h-4 text-gray-500" />
-                      )}
-                    </button>
+                    {renderSelectAll('hover:bg-blue-200', 'text-blue-700')}
                   </th>
                   <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">م</th>
                   <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">مجموعة</th>
@@ -892,101 +774,24 @@ export default function StockList() {
               </thead>
               <tbody className="divide-y divide-gray-100">
                 {paginatedStock.map((inv, index) => {
-                  const item = inv.item as unknown as { id: string; code?: string; barcode?: string; name_ar?: string; category?: { name_ar: string }; unit?: { name_ar: string; code: string }; purchase_price?: number; selling_price?: number }
+                  const item = inv.item as unknown as StockItem
                   const categoryName = item?.category?.name_ar || '-'
-                  const unitName = item?.unit?.name_ar || item?.unit?.code || 'كرتونة'
+                  const unitName = unitLabel(item?.unit, 'كرتونة')
                   const purchasePrice = item?.purchase_price || 0
                   const sellingPrice = item?.selling_price || 0
                   const globalIndex = startIndex + index + 1
                   const isEditing = editingItemId === item.id
-                  const displayCode = showBarcode 
-                    ? formatCodeValue(item?.barcode || item?.code) 
-                    : formatCodeValue(item?.code)
-                  
+                  const displayValue = (showBarcode ? displayCode(item?.barcode) || displayCode(item?.code) : displayCode(item?.code)) || '-'
+
                   return (
                     <tr key={inv.id} className={`${index % 2 === 0 ? 'bg-white' : 'bg-gray-50'} ${selectedItems.has(inv.id) ? '!bg-blue-50' : ''}`}>
                       <td className="px-2 py-3 text-center">
-                        <button
-                          type="button"
-                          onClick={() => handleToggleSelect(inv.id)}
-                          className="p-1 hover:bg-blue-100 rounded transition-colors"
-                        >
-                          {selectedItems.has(inv.id) ? (
-                            <CheckSquare className="w-4 h-4 text-blue-600" />
-                          ) : (
-                            <Square className="w-4 h-4 text-gray-400" />
-                          )}
-                        </button>
+                        {renderRowCheckbox(inv.id, 'hover:bg-blue-100', 'text-blue-600')}
                       </td>
                       <td className="px-4 py-3 text-gray-900">{globalIndex}</td>
-                      <td className="px-4 py-3 text-gray-600">
-                        {isEditing ? (
-                          <select
-                            value={editFormData.category_id}
-                            onChange={(e) => setEditFormData({ ...editFormData, category_id: e.target.value })}
-                            className="w-full px-2 py-1 border border-blue-300 rounded text-sm"
-                          >
-                            <option value="">بدون تصنيف</option>
-                            {categories.map((cat) => (
-                              <option key={cat.id} value={cat.id}>
-                                {cat.name_ar}
-                              </option>
-                            ))}
-                          </select>
-                        ) : (
-                          categoryName
-                        )}
-                      </td>
+                      <td className="px-4 py-3 text-gray-600">{renderCategoryCell(isEditing, categoryName)}</td>
                       <td className="px-4 py-3">
-                        {isEditing ? (
-                          <div className="space-y-1">
-                            <input
-                              type="text"
-                              value={editFormData.code}
-                              onChange={(e) => setEditFormData({ ...editFormData, code: e.target.value })}
-                              className="w-full px-2 py-1 border border-blue-300 rounded text-sm font-mono"
-                              dir="ltr"
-                              placeholder="الكود"
-                              title="كود الصنف"
-                            />
-                            <input
-                              type="text"
-                              value={editFormData.barcode}
-                              onChange={(e) => setEditFormData({ ...editFormData, barcode: e.target.value })}
-                              className="w-full px-2 py-1 border border-orange-300 rounded text-sm font-mono"
-                              dir="ltr"
-                              placeholder="الباركود"
-                              title="الباركود"
-                            />
-                          </div>
-                        ) : (
-                          <div className="flex items-center gap-2">
-                            {showBarcode && displayCode !== '-' ? (
-                              <div className="bg-white p-1 rounded border border-gray-200 inline-block overflow-hidden flex-shrink-0" style={{ maxWidth: '100px' }}>
-                                <ReactBarcode 
-                                  value={displayCode} 
-                                  height={30} 
-                                  width={1.2} 
-                                  fontSize={11} 
-                                  margin={0} 
-                                  background="transparent"
-                                />
-                              </div>
-                            ) : (
-                              <span className="text-gray-900 font-mono text-sm select-all" style={{ fontVariantNumeric: 'tabular-nums' }}>{displayCode}</span>
-                            )}
-                            {displayCode !== '-' && (
-                              <button
-                                type="button"
-                                onClick={() => handleCopyCode(displayCode, item.id)}
-                                className="p-1 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded transition-colors shrink-0"
-                                title="نسخ الكود"
-                              >
-                                {copiedId === item.id ? <Check className="w-3.5 h-3.5 text-green-500" /> : <Copy className="w-3.5 h-3.5" />}
-                              </button>
-                            )}
-                          </div>
-                        )}
+                        {isEditing ? renderCodeInputs() : renderCodeCell(item, displayValue)}
                       </td>
                       <td className="px-4 py-3">
                         {isEditing ? (
@@ -995,113 +800,32 @@ export default function StockList() {
                             value={editFormData.name_ar}
                             onChange={(e) => setEditFormData({ ...editFormData, name_ar: e.target.value })}
                             className="w-full px-2 py-1 border border-blue-300 rounded text-sm"
+                            aria-label="اسم الصنف"
                           />
                         ) : (
                           <span className="text-gray-900">{item?.name_ar || '-'}</span>
                         )}
                       </td>
                       <td className="px-4 py-3 text-gray-600">
-                        {isEditing ? (
-                          <input
-                            type="number"
-                            step="0.01"
-                            value={editFormData.opening_balance}
-                            onChange={(e) => setEditFormData({ ...editFormData, opening_balance: parseFloat(e.target.value) || 0 })}
-                            className="w-24 px-2 py-1 border border-blue-300 rounded text-sm"
-                            dir="ltr"
-                          />
-                        ) : (
-                          formatNumber(inv.opening_balance || 0)
-                        )}
+                        {isEditing ? renderNumberInput('opening_balance', 'w-24', 'رصيد أول المدة') : formatNumber(inv.opening_balance || 0)}
                       </td>
                       <td className="px-4 py-3 text-gray-600">-</td>
                       <td className="px-4 py-3 text-gray-600">-</td>
                       <td className="px-4 py-3 text-gray-900 font-medium">
-                        {isEditing ? (
-                          <input
-                            type="number"
-                            step="0.01"
-                            value={editFormData.quantity}
-                            onChange={(e) => setEditFormData({ ...editFormData, quantity: parseFloat(e.target.value) || 0 })}
-                            className="w-24 px-2 py-1 border border-blue-300 rounded text-sm"
-                            dir="ltr"
-                          />
-                        ) : (
-                          formatNumber(inv.quantity)
-                        )}
+                        {isEditing ? renderNumberInput('quantity', 'w-24', 'الرصيد') : formatNumber(inv.quantity)}
                       </td>
                       <td className="px-4 py-3 text-gray-500 text-sm">{unitName}</td>
                       <td className="px-4 py-3">
-                        {isEditing ? (
-                          <input
-                            type="number"
-                            step="0.01"
-                            value={editFormData.purchase_price}
-                            onChange={(e) => setEditFormData({ ...editFormData, purchase_price: parseFloat(e.target.value) || 0 })}
-                            className="w-24 px-2 py-1 border border-blue-300 rounded text-sm"
-                            dir="ltr"
-                          />
-                        ) : (
+                        {isEditing ? renderNumberInput('purchase_price', 'w-24', 'سعر الشراء') : (
                           <span className="text-blue-600 font-medium">{formatNumber(purchasePrice)} ج</span>
                         )}
                       </td>
                       <td className="px-4 py-3">
-                        {isEditing ? (
-                          <input
-                            type="number"
-                            step="0.01"
-                            value={editFormData.selling_price}
-                            onChange={(e) => setEditFormData({ ...editFormData, selling_price: parseFloat(e.target.value) || 0 })}
-                            className="w-24 px-2 py-1 border border-blue-300 rounded text-sm"
-                            dir="ltr"
-                          />
-                        ) : (
+                        {isEditing ? renderNumberInput('selling_price', 'w-24', 'سعر البيع') : (
                           <span className="text-green-600 font-medium">{formatNumber(sellingPrice)} ج</span>
                         )}
                       </td>
-                      <td className="px-4 py-3">
-                        {isEditing ? (
-                          <div className="flex items-center justify-center gap-2">
-                            <button
-                              type="button"
-                              onClick={handleSaveEdit}
-                              disabled={saving}
-                              className="p-1.5 text-green-600 hover:bg-green-50 rounded-lg disabled:opacity-50"
-                              title="حفظ"
-                            >
-                              <Save className="w-4 h-4" />
-                            </button>
-                            <button
-                              type="button"
-                              onClick={handleCancelEdit}
-                              disabled={saving}
-                              className="p-1.5 text-red-600 hover:bg-red-50 rounded-lg disabled:opacity-50"
-                              title="إلغاء"
-                            >
-                              <X className="w-4 h-4" />
-                            </button>
-                          </div>
-                        ) : (
-                          <div className="flex items-center justify-center gap-1">
-                            <button
-                              type="button"
-                              onClick={() => handleEditItem(inv)}
-                              className="p-1.5 text-blue-600 hover:bg-blue-50 rounded-lg"
-                              title="تعديل"
-                            >
-                              <Edit2 className="w-4 h-4" />
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => handleDeleteItem(inv)}
-                              className="p-1.5 text-red-600 hover:bg-red-50 rounded-lg"
-                              title="حذف"
-                            >
-                              <Trash2 className="w-4 h-4" />
-                            </button>
-                          </div>
-                        )}
-                      </td>
+                      <td className="px-4 py-3">{renderActions(inv, isEditing)}</td>
                     </tr>
                   )
                 })}
@@ -1115,18 +839,7 @@ export default function StockList() {
               <thead className="bg-red-100">
                 <tr>
                   <th className="px-2 py-3 text-center">
-                    <button
-                      type="button"
-                      onClick={handleSelectAll}
-                      className="p-1 hover:bg-red-200 rounded transition-colors"
-                      title={selectedItems.size === paginatedStock.length ? 'إلغاء اختيار الكل' : 'اختيار الكل'}
-                    >
-                      {selectedItems.size === paginatedStock.length && paginatedStock.length > 0 ? (
-                        <CheckSquare className="w-4 h-4 text-red-700" />
-                      ) : (
-                        <Square className="w-4 h-4 text-gray-500" />
-                      )}
-                    </button>
+                    {renderSelectAll('hover:bg-red-200', 'text-red-700')}
                   </th>
                   <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">م</th>
                   <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">مجموعة</th>
@@ -1157,105 +870,28 @@ export default function StockList() {
               </thead>
               <tbody className="divide-y divide-gray-100">
                 {paginatedStock.map((inv, index) => {
-                  const item = inv.item as unknown as { id: string; code?: string; barcode?: string; name_ar?: string; category?: { name_ar: string }; unit?: { name_ar: string; code: string }; purchase_price?: number; selling_price?: number }
+                  const item = inv.item as unknown as StockItem
                   const categoryName = item?.category?.name_ar || '-'
-                  const unitName = item?.unit?.name_ar || item?.unit?.code || 'قطعة'
-                  const totalQty = inv.quantity || 0
+                  const unitName = unitLabel(item?.unit, 'قطعة')
+                  const totalQty = Number(inv.quantity || 0)
                   const createdAt = (inv as unknown as { created_at?: string }).created_at || new Date().toISOString()
                   const purchasePrice = item?.purchase_price || 0
                   const sellingPrice = item?.selling_price || 0
                   const globalIndex = startIndex + index + 1
                   const isEditing = editingItemId === item.id
-                  const displayCode = showBarcode 
-                    ? formatCodeValue(item?.barcode || item?.code) 
-                    : formatCodeValue(item?.code)
+                  const displayValue = (showBarcode ? displayCode(item?.barcode) || displayCode(item?.code) : displayCode(item?.code)) || '-'
 
                   return (
                     <tr key={inv.id} className={`${index % 2 === 0 ? 'bg-white' : 'bg-gray-50'} ${selectedItems.has(inv.id) ? '!bg-red-50' : ''}`}>
                       <td className="px-2 py-3 text-center">
-                        <button
-                          type="button"
-                          onClick={() => handleToggleSelect(inv.id)}
-                          className="p-1 hover:bg-red-100 rounded transition-colors"
-                        >
-                          {selectedItems.has(inv.id) ? (
-                            <CheckSquare className="w-4 h-4 text-red-600" />
-                          ) : (
-                            <Square className="w-4 h-4 text-gray-400" />
-                          )}
-                        </button>
+                        {renderRowCheckbox(inv.id, 'hover:bg-red-100', 'text-red-600')}
                       </td>
                       <td className="px-4 py-3 text-gray-900">{globalIndex}</td>
-                      <td className="px-4 py-3 text-gray-600">
-                        {isEditing ? (
-                          <select
-                            value={editFormData.category_id}
-                            onChange={(e) => setEditFormData({ ...editFormData, category_id: e.target.value })}
-                            className="w-full px-2 py-1 border border-blue-300 rounded text-sm"
-                          >
-                            <option value="">بدون تصنيف</option>
-                            {categories.map((cat) => (
-                              <option key={cat.id} value={cat.id}>
-                                {cat.name_ar}
-                              </option>
-                            ))}
-                          </select>
-                        ) : (
-                          categoryName
-                        )}
-                      </td>
+                      <td className="px-4 py-3 text-gray-600">{renderCategoryCell(isEditing, categoryName)}</td>
                       <td className="px-4 py-3 text-gray-600">{formatDate(createdAt)}</td>
                       <td className="px-4 py-3 text-gray-900 font-mono">{getDocNumber(createdAt, index)}</td>
                       <td className="px-4 py-3">
-                        {isEditing ? (
-                          <div className="space-y-1">
-                            <input
-                              type="text"
-                              value={editFormData.code}
-                              onChange={(e) => setEditFormData({ ...editFormData, code: e.target.value })}
-                              className="w-full px-2 py-1 border border-blue-300 rounded text-sm font-mono"
-                              dir="ltr"
-                              placeholder="الكود"
-                              title="كود الصنف"
-                            />
-                            <input
-                              type="text"
-                              value={editFormData.barcode}
-                              onChange={(e) => setEditFormData({ ...editFormData, barcode: e.target.value })}
-                              className="w-full px-2 py-1 border border-orange-300 rounded text-sm font-mono"
-                              dir="ltr"
-                              placeholder="الباركود"
-                              title="الباركود"
-                            />
-                          </div>
-                        ) : (
-                          <div className="flex items-center gap-2">
-                            {showBarcode && displayCode !== '-' ? (
-                              <div className="bg-white p-1 rounded border border-gray-200 inline-block overflow-hidden flex-shrink-0" style={{ maxWidth: '100px' }}>
-                                <ReactBarcode 
-                                  value={displayCode} 
-                                  height={30} 
-                                  width={1.2} 
-                                  fontSize={11} 
-                                  margin={0} 
-                                  background="transparent"
-                                />
-                              </div>
-                            ) : (
-                              <span className="text-gray-900 font-mono text-sm select-all" style={{ fontVariantNumeric: 'tabular-nums' }}>{displayCode}</span>
-                            )}
-                            {displayCode !== '-' && (
-                              <button
-                                type="button"
-                                onClick={() => handleCopyCode(displayCode, item.id)}
-                                className="p-1 text-gray-400 hover:text-blue-600 hover:bg-blue-50 rounded transition-colors shrink-0"
-                                title="نسخ الكود"
-                              >
-                                {copiedId === item.id ? <Check className="w-3.5 h-3.5 text-green-500" /> : <Copy className="w-3.5 h-3.5" />}
-                              </button>
-                            )}
-                          </div>
-                        )}
+                        {isEditing ? renderCodeInputs() : renderCodeCell(item, displayValue)}
                       </td>
                       <td className="px-4 py-3">
                         {isEditing ? (
@@ -1264,106 +900,35 @@ export default function StockList() {
                             value={editFormData.name_ar}
                             onChange={(e) => setEditFormData({ ...editFormData, name_ar: e.target.value })}
                             className="w-full px-2 py-1 border border-blue-300 rounded text-sm"
+                            aria-label="اسم الصنف"
                           />
                         ) : (
                           <span className="text-gray-900">{item?.name_ar || '-'}</span>
                         )}
                       </td>
                       <td className="px-4 py-3 text-gray-600">
-                        {isEditing ? (
-                          <input
-                            type="number"
-                            step="0.01"
-                            value={editFormData.quantity}
-                            onChange={(e) => setEditFormData({ ...editFormData, quantity: parseFloat(e.target.value) || 0 })}
-                            className="w-20 px-2 py-1 border border-blue-300 rounded text-sm"
-                            dir="ltr"
-                            title="جزئي"
-                          />
-                        ) : (
-                          formatNumber(Math.floor(totalQty))
-                        )}
+                        {isEditing ? renderNumberInput('quantity', 'w-20', 'جزئي') : formatNumber(Math.floor(totalQty))}
                       </td>
                       <td className="px-4 py-3 text-gray-600">1</td>
                       <td className="px-4 py-3 text-gray-900 font-medium">
                         {isEditing ? (
-                          <span className="font-medium">{formatNumber(editFormData.quantity)}</span>
+                          <span className="font-medium">{editFormData.quantity}</span>
                         ) : (
                           formatNumber(totalQty)
                         )}
                       </td>
                       <td className="px-4 py-3 text-gray-500 text-sm">{unitName}</td>
                       <td className="px-4 py-3">
-                        {isEditing ? (
-                          <input
-                            type="number"
-                            step="0.01"
-                            value={editFormData.purchase_price}
-                            onChange={(e) => setEditFormData({ ...editFormData, purchase_price: parseFloat(e.target.value) || 0 })}
-                            className="w-24 px-2 py-1 border border-blue-300 rounded text-sm"
-                            dir="ltr"
-                          />
-                        ) : (
+                        {isEditing ? renderNumberInput('purchase_price', 'w-24', 'سعر الشراء') : (
                           <span className="text-blue-600 font-medium">{formatNumber(purchasePrice)} ج</span>
                         )}
                       </td>
                       <td className="px-4 py-3">
-                        {isEditing ? (
-                          <input
-                            type="number"
-                            step="0.01"
-                            value={editFormData.selling_price}
-                            onChange={(e) => setEditFormData({ ...editFormData, selling_price: parseFloat(e.target.value) || 0 })}
-                            className="w-24 px-2 py-1 border border-blue-300 rounded text-sm"
-                            dir="ltr"
-                          />
-                        ) : (
+                        {isEditing ? renderNumberInput('selling_price', 'w-24', 'سعر البيع') : (
                           <span className="text-green-600 font-medium">{formatNumber(sellingPrice)} ج</span>
                         )}
                       </td>
-                      <td className="px-4 py-3">
-                        {isEditing ? (
-                          <div className="flex items-center justify-center gap-2">
-                            <button
-                              type="button"
-                              onClick={handleSaveEdit}
-                              disabled={saving}
-                              className="p-1.5 text-green-600 hover:bg-green-50 rounded-lg disabled:opacity-50"
-                              title="حفظ"
-                            >
-                              <Save className="w-4 h-4" />
-                            </button>
-                            <button
-                              type="button"
-                              onClick={handleCancelEdit}
-                              disabled={saving}
-                              className="p-1.5 text-red-600 hover:bg-red-50 rounded-lg disabled:opacity-50"
-                              title="إلغاء"
-                            >
-                              <X className="w-4 h-4" />
-                            </button>
-                          </div>
-                        ) : (
-                          <div className="flex items-center justify-center gap-1">
-                            <button
-                              type="button"
-                              onClick={() => handleEditItem(inv)}
-                              className="p-1.5 text-blue-600 hover:bg-blue-50 rounded-lg"
-                              title="تعديل"
-                            >
-                              <Edit2 className="w-4 h-4" />
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => handleDeleteItem(inv)}
-                              className="p-1.5 text-red-600 hover:bg-red-50 rounded-lg"
-                              title="حذف"
-                            >
-                              <Trash2 className="w-4 h-4" />
-                            </button>
-                          </div>
-                        )}
-                      </td>
+                      <td className="px-4 py-3">{renderActions(inv, isEditing)}</td>
                     </tr>
                   )
                 })}
@@ -1395,7 +960,7 @@ export default function StockList() {
               >
                 السابق
               </button>
-              
+
               <div className="flex items-center gap-1">
                 {Array.from({ length: Math.min(5, totalPages) }, (_, i) => {
                   let pageNum
@@ -1408,7 +973,7 @@ export default function StockList() {
                   } else {
                     pageNum = currentPage - 2 + i
                   }
-                  
+
                   return (
                     <button
                       key={pageNum}
@@ -1442,6 +1007,16 @@ export default function StockList() {
             </div>
           </div>
         </div>
+      )}
+
+      {showImport && stockBranchId && (
+        <StockImportDialog
+          branchId={stockBranchId}
+          branchName={selectedBranchName}
+          canEditItems={canEditItems}
+          onClose={() => setShowImport(false)}
+          onImported={fetchStock}
+        />
       )}
     </div>
   )

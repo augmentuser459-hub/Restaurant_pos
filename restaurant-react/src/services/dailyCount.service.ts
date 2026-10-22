@@ -1,11 +1,18 @@
-import { supabase } from '../lib/supabase'
+import type { PostgrestError } from '@supabase/supabase-js'
+import { supabase, fixEncodingInData } from '../lib/supabase'
+import { fetchAll } from '../lib/fetchAll'
 import { DailyInventoryCount, DailyInventoryCountItem } from '../types/database.types'
+
+// Real counts are 'opening' / 'closing'. Chef consumption is stored in the same table with count_type 'morning'
+// and is listed on its own page, never here.
+const COUNT_TYPES = ['opening', 'closing']
+
+export type DailyCountStatus = 'draft' | 'completed' | 'approved' | 'rejected'
 
 export interface CreateDailyCountData {
   branch_id: string
   count_date: string
   count_type: 'opening' | 'closing'
-  counted_by: string
   notes?: string
   items: {
     item_id: string
@@ -15,146 +22,97 @@ export interface CreateDailyCountData {
   }[]
 }
 
-export interface DailyCountWithDetails extends Omit<DailyInventoryCount, 'branch' | 'items'> {
-  branch: { id: string; name_ar: string; code: string }
-  items: (DailyInventoryCountItem & { item: { id: string; name_ar: string; code: string; unit: string } })[]
+interface UserName {
+  full_name: string
+  full_name_ar?: string | null
+}
+
+export type DailyCountItemWithDetails = Omit<DailyInventoryCountItem, 'item'> & {
+  item: { id: string; name_ar: string; code: string; unit: { name_ar: string; code: string } | null } | null
+}
+
+export interface DailyCountWithDetails extends Omit<DailyInventoryCount, 'branch' | 'items' | 'status'> {
+  status: DailyCountStatus
+  branch: { id: string; name_ar: string; code: string } | null
+  counted_by_user?: UserName | null
+  approved_by_user?: UserName | null
+  items: DailyCountItemWithDetails[]
 }
 
 export const dailyCountService = {
   async getAll(branchId?: string) {
-    let query = supabase
-      .from('daily_inventory_counts')
-      .select('*, branch:branches(id, name_ar, code)')
-      .order('count_date', { ascending: false })
-
-    if (branchId) query = query.eq('branch_id', branchId)
-
-    const { data, error } = await query
-    return { data: data as DailyCountWithDetails[], error }
+    try {
+      const data = await fetchAll<DailyCountWithDetails>((from, to) => {
+        let query = supabase
+          .from('daily_inventory_counts')
+          .select('*, branch:branches(id, name_ar, code)')
+          .in('count_type', COUNT_TYPES)
+          .order('count_date', { ascending: false })
+          .order('created_at', { ascending: false })
+          .order('id')
+        if (branchId) query = query.eq('branch_id', branchId)
+        return query.range(from, to)
+      })
+      return { data: fixEncodingInData(data) as DailyCountWithDetails[], error: null }
+    } catch (error) {
+      return { data: null, error: error as PostgrestError }
+    }
   },
 
   async getById(id: string) {
-    const { data, error } = await supabase
+    const { data: count, error } = await supabase
       .from('daily_inventory_counts')
-      .select('*, branch:branches(id, name_ar, code), items:daily_inventory_count_items(*, item:items(id, name_ar, code, unit))')
+      .select(`*, branch:branches(id, name_ar, code),
+        counted_by_user:users!daily_inventory_counts_counted_by_fkey(full_name, full_name_ar),
+        approved_by_user:users!daily_inventory_counts_approved_by_fkey(full_name, full_name_ar)`)
       .eq('id', id)
-      .single()
+      .in('count_type', COUNT_TYPES)
+      .maybeSingle()
+    if (error || !count) return { data: null, error }
 
-    return { data: data as DailyCountWithDetails, error }
+    try {
+      const items = await fetchAll<DailyCountItemWithDetails>((from, to) =>
+        supabase
+          .from('daily_inventory_count_items')
+          .select('*, item:items(id, name_ar, code, unit:units(name_ar, code))')
+          .eq('count_id', id)
+          .order('id')
+          .range(from, to)
+      )
+      items.sort((a, b) => (a.item?.code || '').localeCompare(b.item?.code || ''))
+      return { data: fixEncodingInData({ ...count, items }) as DailyCountWithDetails, error: null }
+    } catch (itemsError) {
+      return { data: null, error: itemsError as PostgrestError }
+    }
   },
 
+  /** Saves the count as a draft (one database call). Returns the new count id. */
   async create(countData: CreateDailyCountData) {
-    const { data: count, error: countError } = await supabase
-      .from('daily_inventory_counts')
-      .insert({
-        branch_id: countData.branch_id,
-        count_date: countData.count_date,
-        count_type: countData.count_type,
-        status: 'draft',
-        notes: countData.notes,
-        counted_by: countData.counted_by,
-      })
-      .select()
-      .single()
-
-    if (countError) return { data: null, error: countError }
-
-    const countItems = countData.items.map(item => ({
-      count_id: count.id,
-      item_id: item.item_id,
-      system_quantity: item.system_quantity,
-      actual_quantity: item.actual_quantity,
-      variance_reason: item.variance_reason,
-    }))
-
-    const { error: itemsError } = await supabase
-      .from('daily_inventory_count_items')
-      .insert(countItems)
-
-    if (itemsError) return { data: null, error: itemsError }
-
-    return { data: count as DailyInventoryCount, error: null }
+    const { data, error } = await supabase.rpc('daily_count_create', {
+      p_branch_id: countData.branch_id,
+      p_count_date: countData.count_date,
+      p_count_type: countData.count_type,
+      p_notes: countData.notes ?? null,
+      p_items: countData.items,
+    })
+    return { data: data as string | null, error }
   },
 
+  /** draft -> completed (sent for approval) */
   async submit(id: string) {
-    const { error } = await supabase
-      .from('daily_inventory_counts')
-      .update({ status: 'completed', submitted_at: new Date().toISOString() })
-      .eq('id', id)
-
+    const { error } = await supabase.rpc('daily_count_submit', { p_count_id: id })
     return { error }
   },
 
-  async approve(id: string, approvedBy: string) {
-    // Get count details with items
-    const { data: count, error: fetchError } = await this.getById(id)
-    if (fetchError || !count) {
-      return { error: fetchError || new Error('Count not found') }
-    }
-
-    // Update status
-    const { error: updateError } = await supabase
-      .from('daily_inventory_counts')
-      .update({ status: 'approved', approved_by: approvedBy, approved_at: new Date().toISOString() })
-      .eq('id', id)
-
-    if (updateError) return { error: updateError }
-
-    // If this is a closing count, adjust inventory based on actual quantities
-    if (count.count_type === 'closing') {
-      for (const item of count.items || []) {
-        // Update inventory to match actual count
-        const { data: inventory } = await supabase
-          .from('inventory')
-          .select('id')
-          .eq('branch_id', count.branch_id)
-          .eq('item_id', item.item_id)
-          .single()
-
-        if (inventory) {
-          await supabase
-            .from('inventory')
-            .update({ 
-              quantity: item.actual_quantity,
-              updated_at: new Date().toISOString()
-            })
-            .eq('id', inventory.id)
-        }
-      }
-    }
-
-    return { error: null }
+  /** completed -> approved: stock is corrected by each item's variance. Returns how many items were adjusted. */
+  async approve(id: string) {
+    const { data, error } = await supabase.rpc('daily_count_approve', { p_count_id: id })
+    return { data: data as number | null, error }
   },
 
-  async getConsumption(branchId: string, date: string) {
-    const { data: opening } = await supabase
-      .from('daily_inventory_counts')
-      .select('*, items:daily_inventory_count_items(*)')
-      .eq('branch_id', branchId)
-      .eq('count_date', date)
-      .eq('count_type', 'opening')
-      .single()
-
-    const { data: closing } = await supabase
-      .from('daily_inventory_counts')
-      .select('*, items:daily_inventory_count_items(*)')
-      .eq('branch_id', branchId)
-      .eq('count_date', date)
-      .eq('count_type', 'closing')
-      .single()
-
-    if (!opening || !closing) return { data: null, error: new Error('Missing counts') }
-
-    const consumption = opening.items.map((openItem: DailyInventoryCountItem) => {
-      const closeItem = closing.items.find((c: DailyInventoryCountItem) => c.item_id === openItem.item_id)
-      return {
-        item_id: openItem.item_id,
-        opening_quantity: openItem.actual_quantity,
-        closing_quantity: closeItem?.actual_quantity || 0,
-        consumption: openItem.actual_quantity - (closeItem?.actual_quantity || 0),
-      }
-    })
-
-    return { data: consumption, error: null }
+  /** draft / completed -> rejected (stock unchanged) */
+  async reject(id: string, reason: string) {
+    const { error } = await supabase.rpc('daily_count_reject', { p_count_id: id, p_reason: reason })
+    return { error }
   },
 }

@@ -1,6 +1,8 @@
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { supabase, fixEncodingInData } from '../../lib/supabase'
+import { toUserMessage } from '../../lib/errors'
+import { inventoryService } from '../../services/inventory.service'
 import { Plus, Edit2, Trash2, FolderOpen, Package, ChefHat } from 'lucide-react'
 
 interface Category {
@@ -21,6 +23,8 @@ export default function CategoriesList() {
   const [activeTab, setActiveTab] = useState<TabType>('items')
   const [categories, setCategories] = useState<Category[]>([])
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  const [busyId, setBusyId] = useState<string | null>(null)
 
   useEffect(() => {
     fetchCategories()
@@ -28,6 +32,7 @@ export default function CategoriesList() {
 
   const fetchCategories = async () => {
     setLoading(true)
+    setError('')
     
     if (activeTab === 'items') {
       // Fetch item categories with item count
@@ -37,9 +42,11 @@ export default function CategoriesList() {
           *,
           items:items(count)
         `)
+        .eq('items.is_recipe', false)
         .order('sort_order')
         .order('name_ar')
 
+      if (error) setError('تعذر تحميل المجموعات: ' + toUserMessage(error))
       if (!error && data) {
         const categoriesWithCount = data.map(cat => ({
           ...cat,
@@ -59,6 +66,7 @@ export default function CategoriesList() {
         .order('sort_order')
         .order('name_ar')
 
+      if (error) setError('تعذر تحميل المجموعات: ' + toUserMessage(error))
       if (!error && data) {
         const categoriesWithCount = data.map(cat => ({
           ...cat,
@@ -72,41 +80,38 @@ export default function CategoriesList() {
   }
 
   const handleDelete = async (id: string, name: string) => {
+    if (busyId) return
     if (!confirm(`هل أنت متأكد من حذف المجموعة "${name}"؟`)) return
 
-    const { error } = await supabase
-      .from('categories')
-      .delete()
-      .eq('id', id)
-
+    setBusyId(id)
+    const { error } = await inventoryService.deleteCategory(id)
+    setBusyId(null)
     if (error) {
-      alert('فشل في حذف المجموعة: ' + error.message)
+      alert('فشل في حذف المجموعة: ' + toUserMessage(error))
     } else {
       fetchCategories()
     }
   }
 
   const handleToggleActive = async (id: string, currentStatus: boolean) => {
-    const { error } = await supabase
-      .from('categories')
-      .update({ is_active: !currentStatus })
-      .eq('id', id)
-
+    if (busyId) return
+    setBusyId(id)
+    const { error } = await inventoryService.saveCategory(id, { is_active: !currentStatus })
+    setBusyId(null)
     if (error) {
-      alert('فشل في تحديث الحالة')
+      alert('فشل في تحديث الحالة: ' + toUserMessage(error))
     } else {
       fetchCategories()
     }
   }
 
   const handleToggleKitchen = async (id: string, currentStatus: boolean) => {
-    const { error } = await supabase
-      .from('categories')
-      .update({ is_kitchen: !currentStatus })
-      .eq('id', id)
-
+    if (busyId) return
+    setBusyId(id)
+    const { error } = await inventoryService.saveCategory(id, { is_kitchen: !currentStatus })
+    setBusyId(null)
     if (error) {
-      alert('فشل في تحديث إعداد المطبخ')
+      alert('فشل في تحديث إعداد المطبخ: ' + toUserMessage(error))
     } else {
       fetchCategories()
     }
@@ -136,6 +141,10 @@ export default function CategoriesList() {
           مجموعة جديدة
         </Link>
       </div>
+
+      {error && (
+        <div className="p-4 bg-red-50 border border-red-200 rounded-lg text-red-700">{error}</div>
+      )}
 
       {/* Tabs */}
       <div className="bg-white rounded-lg shadow-sm border border-gray-100">
@@ -207,6 +216,7 @@ export default function CategoriesList() {
                       <button
                         type="button"
                         onClick={() => handleDelete(category.id, category.name_ar)}
+                        disabled={busyId !== null}
                         className="p-1.5 text-red-600 hover:bg-red-50 rounded"
                         title="حذف"
                       >
@@ -234,6 +244,7 @@ export default function CategoriesList() {
                       <button
                         type="button"
                         onClick={() => handleToggleKitchen(category.id, category.is_kitchen)}
+                        disabled={busyId !== null}
                         className={`px-3 py-1 text-xs font-medium rounded-full flex items-center gap-1 ${
                           category.is_kitchen
                             ? 'bg-orange-100 text-orange-700'
@@ -247,6 +258,7 @@ export default function CategoriesList() {
                       <button
                         type="button"
                         onClick={() => handleToggleActive(category.id, category.is_active)}
+                        disabled={busyId !== null}
                         className={`px-3 py-1 text-xs font-medium rounded-full ${
                           category.is_active
                             ? 'bg-green-100 text-green-700'

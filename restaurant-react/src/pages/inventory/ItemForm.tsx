@@ -5,6 +5,9 @@ import { Category, ItemStatus } from '../../types/database.types'
 import { Save, ArrowRight, AlertCircle, Barcode } from 'lucide-react'
 import { supabase, fixEncodingInData } from '../../lib/supabase'
 import { useAuth } from '../../contexts/AuthContext'
+import { toUserMessage } from '../../lib/errors'
+import { parseDecimal, roundMoney, roundQuantity } from '../../lib/utils'
+import { roleName } from './stockHelpers'
 
 interface Unit {
   id: string
@@ -12,21 +15,24 @@ interface Unit {
   name_ar: string
 }
 
+// Number fields are kept as typed text and validated on save
 interface ItemFormData {
   code: string
   barcode: string
   name: string
   name_ar: string
-  description?: string
+  description: string
   unit_id: string
-  category_id?: string
-  min_stock_level: number
-  max_stock_level?: number
-  reorder_level?: number
-  purchase_price?: number
-  selling_price?: number
-  status?: ItemStatus
+  category_id: string
+  min_stock_level: string
+  max_stock_level: string
+  reorder_level: string
+  purchase_price: string
+  selling_price: string
+  status: ItemStatus
 }
+
+const numberText = (value: number | null | undefined) => (value === null || value === undefined ? '' : String(value))
 
 export default function ItemForm() {
   const { id } = useParams()
@@ -35,9 +41,7 @@ export default function ItemForm() {
   const isEdit = Boolean(id)
 
   // Get user role
-  const userRole = typeof user?.role === 'object' && user?.role !== null 
-    ? (user.role as { name: string }).name 
-    : user?.role
+  const userRole = roleName(user?.role)
 
   // Determine back path based on role
   const backPath = userRole === 'warehouse_manager' ? '/transfers' : '/inventory'
@@ -56,11 +60,11 @@ export default function ItemForm() {
     description: '',
     unit_id: '',
     category_id: '',
-    min_stock_level: 10,
-    max_stock_level: 100,
-    reorder_level: 20,
-    purchase_price: 0,
-    selling_price: 0,
+    min_stock_level: '10',
+    max_stock_level: '100',
+    reorder_level: '20',
+    purchase_price: '0',
+    selling_price: '0',
     status: 'active',
   })
 
@@ -74,8 +78,11 @@ export default function ItemForm() {
       inventoryService.getCategories(),
       supabase.from('units').select('id, code, name_ar').eq('is_active', true).order('name_ar'),
     ])
+    if (categoriesRes.error || unitsRes.error) {
+      setError('تعذر تحميل المجموعات أو الوحدات: ' + toUserMessage(categoriesRes.error || unitsRes.error))
+    }
     setCategories(categoriesRes.data || [])
-    setUnits(fixEncodingInData(unitsRes.data) as Unit[] || [])
+    setUnits((fixEncodingInData(unitsRes.data) as Unit[]) || [])
   }
 
   const fetchItem = async (itemId: string) => {
@@ -84,93 +91,84 @@ export default function ItemForm() {
       .select('*')
       .eq('id', itemId)
       .single()
-    
+
     if (error) {
-      setError('فشل في تحميل بيانات الصنف')
+      setError('فشل في تحميل بيانات الصنف: ' + toUserMessage(error))
     } else if (data) {
+      // ?? keeps a stored 0 (|| would replace it with the defaults and write them back on save)
       setFormData({
         code: data.code,
-        barcode: data.barcode || '',
-        name: data.name,
-        name_ar: data.name_ar,
-        description: data.description || '',
-        unit_id: data.unit_id || '',
-        category_id: data.category_id || '',
-        min_stock_level: data.min_stock_level || 10,
-        max_stock_level: data.max_stock_level || 100,
-        reorder_level: data.reorder_level || 20,
-        purchase_price: data.purchase_price || 0,
-        selling_price: data.selling_price || 0,
-        status: data.status || 'active',
+        barcode: data.barcode ?? '',
+        name: data.name ?? '',
+        name_ar: data.name_ar ?? '',
+        description: data.description ?? '',
+        unit_id: data.unit_id ?? '',
+        category_id: data.category_id ?? '',
+        min_stock_level: numberText(data.min_stock_level ?? 0),
+        max_stock_level: numberText(data.max_stock_level),
+        reorder_level: numberText(data.reorder_level),
+        purchase_price: numberText(data.purchase_price ?? 0),
+        selling_price: numberText(data.selling_price ?? 0),
+        status: data.status ?? 'active',
       })
     }
     setFetchLoading(false)
   }
 
+  /** Empty -> null; invalid or negative -> error message. */
+  const readNumber = (value: string, label: string): { value: number | null; error?: string } => {
+    if (value.trim() === '') return { value: null }
+    const parsed = parseDecimal(value)
+    if (parsed === null) return { value: null, error: `قيمة "${label}" غير صحيحة` }
+    if (parsed < 0) return { value: null, error: `قيمة "${label}" لا يمكن أن تكون سالبة` }
+    return { value: parsed }
+  }
+
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault()
+    if (loading) return
     setError('')
-    setLoading(true)
 
-    // Check if code exists
-    const { exists } = await inventoryService.itemCodeExists(formData.code, id)
-    if (exists) {
-      setError(`كود الصنف "${formData.code}" موجود مسبقاً. يمكنك مشاهدة جميع الأصناف من قائمة الأصناف أو استخدام كود مختلف.`)
-      setLoading(false)
+    const purchase = readNumber(formData.purchase_price, 'سعر الشراء')
+    const selling = readNumber(formData.selling_price, 'سعر البيع')
+    const minLevel = readNumber(formData.min_stock_level, 'الحد الأدنى')
+    const maxLevel = readNumber(formData.max_stock_level, 'الحد الأقصى')
+    const reorder = readNumber(formData.reorder_level, 'حد إعادة الطلب')
+    const numberError = [purchase, selling, minLevel, maxLevel, reorder].find(n => n.error)?.error
+    if (numberError) {
+      setError(numberError)
       return
     }
 
-    const itemData = {
-      ...formData,
+    setLoading(true)
+
+    // One database call: code/barcode uniqueness checked there; empty barcode saved as NULL
+    // (items.barcode is UNIQUE, so '' could be stored only once); a new item also gets its main-warehouse stock row
+    const { error: saveError } = await inventoryService.saveItem(isEdit && id ? id : null, {
+      code: formData.code.trim(),
+      barcode: formData.barcode.trim() || null,
+      name: formData.name.trim(),
+      name_ar: formData.name_ar.trim(),
+      description: formData.description.trim() || null,
+      unit_id: formData.unit_id,
       category_id: formData.category_id || null,
-    }
+      purchase_price: roundMoney(purchase.value ?? 0),
+      selling_price: roundMoney(selling.value ?? 0),
+      min_stock_level: roundQuantity(minLevel.value ?? 0),
+      max_stock_level: maxLevel.value === null ? null : roundQuantity(maxLevel.value),
+      reorder_level: reorder.value === null ? null : roundQuantity(reorder.value),
+      status: formData.status,
+    })
 
-    let result
-    if (isEdit && id) {
-      result = await supabase
-        .from('items')
-        .update({ ...itemData, updated_at: new Date().toISOString() })
-        .eq('id', id)
-        .select()
-        .single()
-    } else {
-      result = await supabase
-        .from('items')
-        .insert(itemData)
-        .select()
-        .single()
+    if (saveError) {
+      setError('فشل في حفظ البيانات: ' + toUserMessage(saveError))
+      setLoading(false)
+      return
     }
-
-    if (result.error) {
-      setError('فشل في حفظ البيانات: ' + result.error.message)
-    } else {
-      // If creating new item, add inventory record for main warehouse with quantity 0
-      if (!isEdit && result.data) {
-        // Get main warehouse (المخزن الرئيسي)
-        const { data: mainBranch } = await supabase
-          .from('branches')
-          .select('id')
-          .eq('is_main_warehouse', true)
-          .single()
-
-        if (mainBranch) {
-          // Create inventory record with 0 quantity
-          await supabase
-            .from('inventory')
-            .insert({
-              branch_id: mainBranch.id,
-              item_id: result.data.id,
-              quantity: 0,
-              min_quantity: formData.min_stock_level || 0
-            })
-        }
-      }
-      navigate(backPath)
-    }
-    setLoading(false)
+    navigate(backPath)
   }
 
-  const handleChange = (field: keyof ItemFormData, value: string | number) => {
+  const handleChange = (field: keyof ItemFormData, value: string) => {
     setFormData(prev => ({ ...prev, [field]: value }))
   }
 
@@ -254,6 +252,10 @@ export default function ItemForm() {
               type="text"
               value={formData.barcode}
               onChange={(e) => handleChange('barcode', e.target.value)}
+              onKeyDown={(e) => {
+                // a scanner's Enter must not save the form before the rest is filled in
+                if (e.key === 'Enter') e.preventDefault()
+              }}
               className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500"
               placeholder="1234567890123"
               dir="ltr"
@@ -359,9 +361,10 @@ export default function ItemForm() {
             <input
               id="purchase_price"
               type="number"
+              min="0"
               step="0.01"
               value={formData.purchase_price}
-              onChange={(e) => handleChange('purchase_price', Number(e.target.value))}
+              onChange={(e) => handleChange('purchase_price', e.target.value)}
               className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500"
               placeholder="0.00"
               dir="ltr"
@@ -376,9 +379,10 @@ export default function ItemForm() {
             <input
               id="selling_price"
               type="number"
+              min="0"
               step="0.01"
               value={formData.selling_price}
-              onChange={(e) => handleChange('selling_price', Number(e.target.value))}
+              onChange={(e) => handleChange('selling_price', e.target.value)}
               className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500"
               placeholder="0.00"
               dir="ltr"
@@ -396,7 +400,7 @@ export default function ItemForm() {
               min="0"
               step="0.001"
               value={formData.min_stock_level}
-              onChange={(e) => handleChange('min_stock_level', Number(e.target.value))}
+              onChange={(e) => handleChange('min_stock_level', e.target.value)}
               className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500"
               placeholder="10"
               dir="ltr"
@@ -414,7 +418,7 @@ export default function ItemForm() {
               min="0"
               step="0.001"
               value={formData.max_stock_level}
-              onChange={(e) => handleChange('max_stock_level', Number(e.target.value))}
+              onChange={(e) => handleChange('max_stock_level', e.target.value)}
               className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500"
               placeholder="100"
               dir="ltr"

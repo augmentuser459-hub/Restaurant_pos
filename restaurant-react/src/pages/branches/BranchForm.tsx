@@ -3,6 +3,7 @@ import { useNavigate, useParams } from 'react-router-dom'
 import { branchesService, CreateBranchData } from '../../services/branches.service'
 import { BranchStatus } from '../../types/database.types'
 import { Save, ArrowRight, AlertCircle } from 'lucide-react'
+import { toUserMessage } from '../../lib/errors'
 
 export default function BranchForm() {
   const { id } = useParams()
@@ -12,6 +13,8 @@ export default function BranchForm() {
   const [loading, setLoading] = useState(false)
   const [fetchLoading, setFetchLoading] = useState(isEdit)
   const [error, setError] = useState('')
+  // this branch is the main warehouse now (it can only be moved by ticking another branch)
+  const [wasMain, setWasMain] = useState(false)
 
   const [formData, setFormData] = useState<CreateBranchData>({
     code: '',
@@ -35,8 +38,9 @@ export default function BranchForm() {
   const fetchBranch = async (branchId: string) => {
     const { data, error } = await branchesService.getById(branchId)
     if (error) {
-      setError('فشل في تحميل بيانات الفرع')
+      setError('فشل في تحميل بيانات الفرع: ' + toUserMessage(error))
     } else if (data) {
+      setWasMain(Boolean(data.is_main_warehouse))
       setFormData({
         code: data.code,
         name: data.name,
@@ -46,8 +50,9 @@ export default function BranchForm() {
         email: data.email || '',
         status: data.status,
         is_main_warehouse: data.is_main_warehouse,
-        opening_time: data.opening_time || '',
-        closing_time: data.closing_time || '',
+        // NULL times load as '' for the time inputs and are saved back as NULL
+        opening_time: data.opening_time ? data.opening_time.slice(0, 5) : '',
+        closing_time: data.closing_time ? data.closing_time.slice(0, 5) : '',
       })
     }
     setFetchLoading(false)
@@ -55,27 +60,48 @@ export default function BranchForm() {
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault()
+    if (loading) return
     setError('')
+    if (formData.is_main_warehouse && formData.status !== 'active') {
+      setError('المخزن الرئيسي يجب أن يكون نشطاً')
+      return
+    }
     setLoading(true)
 
-    // Validate code uniqueness
-    const { exists } = await branchesService.codeExists(formData.code, id)
-    if (exists) {
-      setError('كود الفرع موجود مسبقاً')
+    // Ticking another branch moves the main warehouse (there is exactly one): ask before unticking the current one
+    let replaceMain = false
+    if (formData.is_main_warehouse && !wasMain) {
+      const { data: currentMain, error: mainError } = await branchesService.getMainWarehouse()
+      if (mainError) {
+        setError('تعذر التحقق من المخزن الرئيسي: ' + toUserMessage(mainError))
+        setLoading(false)
+        return
+      }
+      if (currentMain && currentMain.id !== id) {
+        if (!confirm(`المخزن الرئيسي حالياً هو "${currentMain.name_ar}".\nهل تريد نقل المخزن الرئيسي إلى هذا الفرع؟ سيُلغى تحديد "${currentMain.name_ar}" كمخزن رئيسي.`)) {
+          setLoading(false)
+          return
+        }
+        replaceMain = true
+      }
+    }
+
+    // One database call. It checks the code is unique and that exactly one active branch is the main warehouse;
+    // empty optional fields and times are saved as NULL ('' is not a valid TIME)
+    const { error: saveError } = await branchesService.save(isEdit && id ? id : null, {
+      ...formData,
+      code: formData.code.trim(),
+      name: formData.name.trim(),
+      name_ar: formData.name_ar.trim(),
+      ...(replaceMain ? { replace_main_warehouse: true } : {}),
+    })
+
+    if (saveError) {
+      setError('فشل في حفظ البيانات: ' + toUserMessage(saveError))
       setLoading(false)
       return
     }
-
-    const result = isEdit && id
-      ? await branchesService.update(id, formData)
-      : await branchesService.create(formData)
-
-    if (result.error) {
-      setError('فشل في حفظ البيانات')
-    } else {
-      navigate('/branches')
-    }
-    setLoading(false)
+    navigate('/branches')
   }
 
   const handleChange = (field: keyof CreateBranchData, value: string | boolean) => {
@@ -95,6 +121,7 @@ export default function BranchForm() {
       {/* Header */}
       <div className="flex items-center gap-4 mb-6">
         <button
+          type="button"
           onClick={() => navigate('/branches')}
           className="p-2 hover:bg-gray-100 rounded-lg transition-colors"
           title="رجوع"
@@ -255,10 +282,16 @@ export default function BranchForm() {
                 type="checkbox"
                 checked={formData.is_main_warehouse}
                 onChange={(e) => handleChange('is_main_warehouse', e.target.checked)}
-                className="w-5 h-5 text-blue-600 border-gray-300 rounded focus:ring-blue-500"
+                disabled={wasMain}
+                className="w-5 h-5 text-blue-600 border-gray-300 rounded focus:ring-blue-500 disabled:opacity-60"
               />
               <span className="text-sm font-medium text-gray-700">هذا هو المخزن الرئيسي</span>
             </label>
+            <p className="text-xs text-gray-500 mt-1 mr-8">
+              {wasMain
+                ? 'هذا الفرع هو المخزن الرئيسي. لنقله افتح الفرع الآخر وحدده كمخزن رئيسي'
+                : 'يوجد مخزن رئيسي واحد فقط؛ تحديد هذا الفرع ينقل المخزن الرئيسي إليه بعد التأكيد'}
+            </p>
           </div>
         </div>
 

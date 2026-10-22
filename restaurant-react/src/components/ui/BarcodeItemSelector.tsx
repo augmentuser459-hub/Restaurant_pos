@@ -1,17 +1,25 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { supabase, fixEncodingInData } from '../../lib/supabase'
+import { fetchAll } from '../../lib/fetchAll'
+import { toUserMessage } from '../../lib/errors'
+import { findItemsByScan } from '../../pages/inventory/stockHelpers'
 import BarcodeScanner from './BarcodeScanner'
 import { AlertCircle, Package, Check } from 'lucide-react'
 
-interface Item {
+/** Item as the selector loads it and passes to onItemSelect. */
+export interface BarcodeSelectableItem {
   id: string
   code: string
   barcode: string | null
   name_ar: string
   name: string
   purchase_price: number
+  unit_id: string
+  is_recipe: boolean
   unit?: { id: string; name_ar: string; code: string } | null
 }
+
+type Item = BarcodeSelectableItem
 
 interface BarcodeItemSelectorProps {
   onItemSelect: (item: Item) => void
@@ -20,6 +28,7 @@ interface BarcodeItemSelectorProps {
   showInventory?: boolean
   className?: string
   disabled?: boolean
+  excludeRecipes?: boolean // Optional: hide recipe items (e.g. when picking recipe ingredients)
 }
 
 /**
@@ -34,9 +43,10 @@ export default function BarcodeItemSelector({
   branchId,
   showInventory = false,
   className = '',
-  disabled = false
+  disabled = false,
+  excludeRecipes = false
 }: BarcodeItemSelectorProps) {
-  const [items, setItems] = useState<Item[]>([])
+  const [allItems, setAllItems] = useState<Item[]>([])
   const [selectedItem, setSelectedItem] = useState<Item | null>(null)
   const [inventoryQty, setInventoryQty] = useState<number | null>(null)
   const [error, setError] = useState('')
@@ -45,6 +55,9 @@ export default function BarcodeItemSelector({
   const [searchTerm, setSearchTerm] = useState('')
   const [suggestions, setSuggestions] = useState<Item[]>([])
   const [showSuggestions, setShowSuggestions] = useState(false)
+  const inventoryRequestRef = useRef(0) // ignores a late quantity response for a previous item/branch
+
+  const items = excludeRecipes ? allItems.filter(i => !i.is_recipe) : allItems
 
   useEffect(() => {
     fetchItems()
@@ -60,45 +73,74 @@ export default function BarcodeItemSelector({
         }
       }
     }
-  }, [selectedItemId, items, branchId, showInventory])
+  }, [selectedItemId, allItems, branchId, showInventory])
 
   const fetchItems = async () => {
-    const { data, error } = await supabase
-      .from('items')
-      .select('id, code, barcode, name_ar, name, purchase_price, unit:units(id, name_ar, code)')
-      .eq('status', 'active')
-      .order('name_ar')
-    
-    if (!error && data) {
+    try {
+      // All active items (more than the 1000 rows one request returns)
+      const data = await fetchAll<Record<string, unknown>>((from, to) =>
+        supabase
+          .from('items')
+          .select('id, code, barcode, name_ar, name, purchase_price, unit_id, is_recipe, unit:units(id, name_ar, code)')
+          .eq('status', 'active')
+          .order('name_ar')
+          .order('id')
+          .range(from, to)
+      )
       // Transform data to match Item interface (unit is object, not array)
-      const transformedData = data.map((item: Record<string, unknown>) => ({
+      const transformedData = data.map(item => ({
         ...item,
+        is_recipe: Boolean(item.is_recipe),
         unit: Array.isArray(item.unit) ? item.unit[0] || null : item.unit
       }))
-      setItems(fixEncodingInData(transformedData) as unknown as Item[])
+      setAllItems(fixEncodingInData(transformedData) as unknown as Item[])
+    } catch (loadError) {
+      setError('تعذر تحميل الأصناف: ' + toUserMessage(loadError))
     }
   }
 
   const fetchInventory = async (itemId: string, branchId: string) => {
-    const { data } = await supabase
+    const request = ++inventoryRequestRef.current
+    setInventoryQty(null)
+    const { data, error: invError } = await supabase
       .from('inventory')
       .select('quantity')
       .eq('item_id', itemId)
       .eq('branch_id', branchId)
-      .single()
-    
-    setInventoryQty(data?.quantity || 0)
+      .maybeSingle()
+
+    if (request !== inventoryRequestRef.current) return // another item or branch was selected meanwhile
+    if (invError) {
+      setError('تعذر تحميل الكمية المتاحة: ' + toUserMessage(invError))
+      setInventoryQty(null)
+      return
+    }
+    setInventoryQty(Number(data?.quantity ?? 0))
   }
 
-  const handleBarcodeScan = async (barcode: string) => {
+  const matchSearch = (value: string) => {
+    const searchLower = value.toLowerCase()
+    return items.filter(item =>
+      item.barcode?.toLowerCase().includes(searchLower) ||
+      item.code.toLowerCase().includes(searchLower) ||
+      item.name_ar.toLowerCase().includes(searchLower) ||
+      item.name?.toLowerCase().includes(searchLower)
+    )
+  }
+
+  const handleBarcodeScan = async (scanned: string) => {
+    const barcode = scanned.trim()
     setError('')
     setLoading(true)
     setShowSuggestions(false)
 
-    // Search by barcode first, then by code
-    let item = items.find(i => i.barcode === barcode)
-    if (!item) {
-      item = items.find(i => i.code === barcode)
+    // Barcode first, then code (also codes stored in quotes, e.g. "6223000123456"), then the only
+    // partial code match; a typed name with exactly one match is accepted too
+    const scanMatches = findItemsByScan(items, barcode)
+    let item = scanMatches.length === 1 ? scanMatches[0] : undefined
+    if (!item && scanMatches.length === 0 && barcode.length >= 2) {
+      const matches = matchSearch(barcode)
+      if (matches.length === 1) item = matches[0]
     }
 
     if (item) {
@@ -109,9 +151,18 @@ export default function BarcodeItemSelector({
         await fetchInventory(item.id, branchId)
       }
     } else {
-      setError(`لم يتم العثور على صنف بالباركود: ${barcode}`)
       setSelectedItem(null)
+      inventoryRequestRef.current++
       setInventoryQty(null)
+      if (scanMatches.length > 1) {
+        // e.g. two items whose codes differ only by quotes: let the user pick one from the suggestions
+        setError(`يوجد ${scanMatches.length} أصناف تطابق "${barcode}". اختر الصنف المطلوب من القائمة`)
+        setSearchTerm(barcode)
+        setSuggestions(scanMatches.slice(0, 10))
+        setShowSuggestions(true)
+      } else {
+        setError(`لم يتم العثور على صنف بالباركود: ${barcode}`)
+      }
     }
 
     setLoading(false)
@@ -122,14 +173,7 @@ export default function BarcodeItemSelector({
     setError('')
 
     if (value.length >= 2) {
-      const searchLower = value.toLowerCase()
-      const filtered = items.filter(item =>
-        item.barcode?.toLowerCase().includes(searchLower) ||
-        item.code.toLowerCase().includes(searchLower) ||
-        item.name_ar.toLowerCase().includes(searchLower) ||
-        item.name?.toLowerCase().includes(searchLower)
-      ).slice(0, 10) // Show max 10 suggestions
-
+      const filtered = matchSearch(value).slice(0, 10) // Show max 10 suggestions
       setSuggestions(filtered)
       setShowSuggestions(filtered.length > 0)
     } else {
@@ -144,7 +188,7 @@ export default function BarcodeItemSelector({
     setSearchTerm('')
     setSuggestions([])
     setShowSuggestions(false)
-    
+
     if (showInventory && branchId) {
       await fetchInventory(item.id, branchId)
     }
@@ -182,8 +226,8 @@ export default function BarcodeItemSelector({
           type="button"
           onClick={() => setSearchMode('barcode')}
           className={`px-3 py-1 text-sm rounded-lg ${
-            searchMode === 'barcode' 
-              ? 'bg-blue-600 text-white' 
+            searchMode === 'barcode'
+              ? 'bg-blue-600 text-white'
               : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
           }`}
         >
@@ -193,8 +237,8 @@ export default function BarcodeItemSelector({
           type="button"
           onClick={() => setSearchMode('dropdown')}
           className={`px-3 py-1 text-sm rounded-lg ${
-            searchMode === 'dropdown' 
-              ? 'bg-blue-600 text-white' 
+            searchMode === 'dropdown'
+              ? 'bg-blue-600 text-white'
               : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
           }`}
         >
@@ -212,7 +256,7 @@ export default function BarcodeItemSelector({
             value={searchTerm}
             onChange={handleSearchChange}
           />
-          
+
           {/* Suggestions Dropdown */}
           {showSuggestions && suggestions.length > 0 && (
             <div className="absolute z-50 w-full mt-1 bg-white border border-gray-300 rounded-lg shadow-lg max-h-60 overflow-y-auto">

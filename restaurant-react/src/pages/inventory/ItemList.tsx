@@ -3,55 +3,47 @@ import { Link } from 'react-router-dom'
 import { inventoryService } from '../../services/inventory.service'
 import { Item } from '../../types/database.types'
 import { formatCurrency } from '../../lib/utils'
+import { toUserMessage } from '../../lib/errors'
 import { Plus, Edit, Trash2, Package, Search } from 'lucide-react'
+import { displayCode, unitLabel } from './stockHelpers'
 
 export default function ItemList() {
   const [items, setItems] = useState<Item[]>([])
   const [loading, setLoading] = useState(true)
   const [search, setSearch] = useState('')
   const [deleteId, setDeleteId] = useState<string | null>(null)
-
-  // Convert scientific notation (3.50E+12) to full number string
-  const formatCodeValue = (value: string | number | undefined | null): string => {
-    if (value === null || value === undefined || value === '') return ''
-    const str = String(value)
-    if (/[eE]/.test(str)) {
-      const num = Number(str)
-      if (!isNaN(num) && isFinite(num)) {
-        try { return BigInt(Math.round(num)).toString() } catch { return num.toLocaleString('en-US', { useGrouping: false, maximumFractionDigits: 0 }) }
-      }
-    }
-    if (typeof value === 'number') {
-      try { return BigInt(Math.round(value)).toString() } catch { return value.toLocaleString('en-US', { useGrouping: false, maximumFractionDigits: 0 }) }
-    }
-    return str
-  }
+  const [loadError, setLoadError] = useState('')
 
   useEffect(() => {
     fetchItems()
   }, [])
 
   const fetchItems = async () => {
-    const { data } = await inventoryService.getAllItems()
+    const { data, error } = await inventoryService.getAllItems()
+    if (error) setLoadError('تعذر تحميل الأصناف: ' + toUserMessage(error))
     setItems(data || [])
     setLoading(false)
   }
 
   const handleDelete = async (id: string) => {
-    if (!confirm('هل أنت متأكد من حذف هذا الصنف؟')) return
+    if (deleteId) return
+    if (!confirm('هل أنت متأكد من حذف هذا الصنف من النظام نهائياً؟\nلا يمكن حذف صنف له رصيد أو مستخدم في وصفة أو له عمليات سابقة؛ اجعله غير نشط بدلاً من ذلك.')) return
     
     setDeleteId(id)
     const { error } = await inventoryService.deleteItem(id)
-    if (!error) {
-      setItems(items.filter(i => i.id !== id))
+    if (error) {
+      alert('فشل حذف الصنف: ' + toUserMessage(error))
+    } else {
+      setItems(prev => prev.filter(i => i.id !== id))
     }
     setDeleteId(null)
   }
 
   const filteredItems = items.filter(item =>
-    item.name_ar.includes(search) ||
-    item.name.toLowerCase().includes(search.toLowerCase()) ||
-    item.code.toLowerCase().includes(search.toLowerCase())
+    (item.name_ar || '').includes(search) ||
+    (item.name || '').toLowerCase().includes(search.toLowerCase()) ||
+    (item.code || '').toLowerCase().includes(search.toLowerCase()) ||
+    (item.barcode || '').includes(search.trim())
   )
 
   const getStatusBadge = (status: string) => {
@@ -95,6 +87,10 @@ export default function ItemList() {
         </Link>
       </div>
 
+      {loadError && (
+        <div className="p-4 bg-red-50 border border-red-200 rounded-lg text-red-700">{loadError}</div>
+      )}
+
       {/* Search */}
       <div className="relative">
         <Search className="absolute right-3 top-1/2 -translate-y-1/2 w-5 h-5 text-gray-400" />
@@ -132,15 +128,15 @@ export default function ItemList() {
                       </div>
                       <div>
                         <p className="font-medium text-gray-900">{item.name_ar}</p>
-                        <p className="text-sm text-gray-500 font-mono select-all" dir="ltr" style={{ fontVariantNumeric: 'tabular-nums' }}>{formatCodeValue(item.code)}</p>
+                        <p className="text-sm text-gray-500 font-mono select-all" dir="ltr" style={{ fontVariantNumeric: 'tabular-nums' }}>{displayCode(item.code)}</p>
                         {item.barcode && (
-                          <p className="text-xs text-gray-400 font-mono select-all" dir="ltr" style={{ fontVariantNumeric: 'tabular-nums' }}>{formatCodeValue(item.barcode)}</p>
+                          <p className="text-xs text-gray-400 font-mono select-all" dir="ltr" style={{ fontVariantNumeric: 'tabular-nums' }}>{displayCode(item.barcode)}</p>
                         )}
                       </div>
                     </div>
                   </td>
                   <td className="px-6 py-4 text-gray-600">
-                    {typeof item.unit === 'object' && item.unit?.name_ar ? item.unit.name_ar : item.unit}
+                    {unitLabel(item.unit)}
                   </td>
                   <td className="px-6 py-4 text-gray-600">
                     {item.purchase_price ? formatCurrency(item.purchase_price) : '-'}

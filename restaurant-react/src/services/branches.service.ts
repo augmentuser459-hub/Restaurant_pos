@@ -14,7 +14,24 @@ export interface CreateBranchData {
   closing_time?: string
 }
 
-export interface UpdateBranchData extends Partial<CreateBranchData> {}
+export interface UpdateBranchData extends Partial<CreateBranchData> {
+  /** Moving the main warehouse: untick the current one in the same save (asked for after the user confirms) */
+  replace_main_warehouse?: boolean
+}
+
+// Optional text and TIME columns: an empty input is stored as NULL ('' is not a valid time)
+const OPTIONAL_FIELDS = ['address', 'phone', 'email', 'opening_time', 'closing_time'] as const
+
+function toSaveData(branchData: UpdateBranchData): Record<string, unknown> {
+  const data: Record<string, unknown> = { ...branchData }
+  for (const field of OPTIONAL_FIELDS) {
+    if (field in data) {
+      const value = typeof data[field] === 'string' ? (data[field] as string).trim() : data[field]
+      data[field] = value ? value : null
+    }
+  }
+  return data
+}
 
 export const branchesService = {
   // Get all branches
@@ -38,36 +55,25 @@ export const branchesService = {
     return { data: fixEncodingInData(data) as Branch, error }
   },
 
+  /** Creates (id null) or updates a branch in one database call. Returns the branch id. */
+  async save(id: string | null, branchData: UpdateBranchData) {
+    const { data, error } = await supabase.rpc('inv_branch_save', { p_branch_id: id, p_branch: toSaveData(branchData) })
+    return { data: data as string | null, error }
+  },
+
   // Create new branch
   async create(branchData: CreateBranchData) {
-    const { data, error } = await supabase
-      .from('branches')
-      .insert(branchData)
-      .select()
-      .single()
-
-    return { data: data as Branch, error }
+    return this.save(null, branchData)
   },
 
   // Update branch
   async update(id: string, branchData: UpdateBranchData) {
-    const { data, error } = await supabase
-      .from('branches')
-      .update({ ...branchData, updated_at: new Date().toISOString() })
-      .eq('id', id)
-      .select()
-      .single()
-
-    return { data: data as Branch, error }
+    return this.save(id, branchData)
   },
 
-  // Delete branch
+  // Delete branch (refused for the main warehouse, a branch with stock, or one with history)
   async delete(id: string) {
-    const { error } = await supabase
-      .from('branches')
-      .delete()
-      .eq('id', id)
-
+    const { error } = await supabase.rpc('inv_branch_delete', { p_branch_id: id })
     return { error }
   },
 
@@ -82,15 +88,15 @@ export const branchesService = {
     return { data: fixEncodingInData(data) as Branch[], error }
   },
 
-  // Get main warehouse
+  // Get main warehouse (at most one: unique index branches_one_main_warehouse)
   async getMainWarehouse() {
     const { data, error } = await supabase
       .from('branches')
       .select('*')
       .eq('is_main_warehouse', true)
-      .single()
+      .maybeSingle()
 
-    return { data: fixEncodingInData(data) as Branch, error }
+    return { data: fixEncodingInData(data) as Branch | null, error }
   },
 
   // Check if code exists
@@ -106,6 +112,6 @@ export const branchesService = {
 
     const { data, error } = await query
 
-    return { exists: data && data.length > 0, error }
+    return { exists: Boolean(data && data.length > 0), error }
   },
 }

@@ -1,22 +1,12 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useParams } from 'react-router-dom'
 import { supabase, fixEncodingInData } from '../../lib/supabase'
+import { inventoryService, InventoryWithDetails } from '../../services/inventory.service'
+import { toUserMessage } from '../../lib/errors'
+import { toLocalDate } from '../../lib/dates'
 import { Package, Search, Filter } from 'lucide-react'
-import { formatNumber } from '../../lib/utils'
-
-interface BranchStockItem {
-  id: string
-  quantity: number
-  min_quantity: number
-  created_at: string
-  item: {
-    id: string
-    code: string
-    name_ar: string
-    unit?: { name_ar: string; code: string }
-    category?: { name_ar: string }
-  }
-}
+import { formatNumber, roundQuantity } from '../../lib/utils'
+import { displayCode, unitLabel } from './stockHelpers'
 
 interface Branch {
   id: string
@@ -26,12 +16,14 @@ interface Branch {
 
 export default function BranchStock() {
   const { branchId } = useParams()
-  const [stock, setStock] = useState<BranchStockItem[]>([])
+  const [stock, setStock] = useState<InventoryWithDetails[]>([])
   const [branch, setBranch] = useState<Branch | null>(null)
   const [branches, setBranches] = useState<Branch[]>([])
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
   const [search, setSearch] = useState('')
   const [selectedBranch, setSelectedBranch] = useState(branchId || '')
+  const requestRef = useRef(0)
 
   useEffect(() => {
     fetchBranches()
@@ -44,66 +36,67 @@ export default function BranchStock() {
   }, [selectedBranch])
 
   const fetchBranches = async () => {
-    const { data } = await supabase
+    // Active branches other than the main warehouse (columns: status, is_main_warehouse)
+    const { data, error: branchesError } = await supabase
       .from('branches')
       .select('id, name_ar, code')
-      .eq('is_active', true)
-      .neq('branch_type', 'main_warehouse')
+      .eq('status', 'active')
+      .eq('is_main_warehouse', false)
       .order('name_ar')
-    
-    const branchList = fixEncodingInData(data) as Branch[] || []
+
+    if (branchesError) setError('تعذر تحميل الفروع: ' + toUserMessage(branchesError))
+    const branchList = (fixEncodingInData(data) as Branch[]) || []
     setBranches(branchList)
-    
-    if (!selectedBranch && branchList.length > 0) {
-      setSelectedBranch(branchList[0].id)
+
+    if (!selectedBranch) {
+      if (branchList.length > 0) setSelectedBranch(branchList[0].id)
+      else setLoading(false) // nothing to show: stop the spinner
     }
   }
 
   const fetchStock = async (branchIdToFetch: string) => {
+    const request = ++requestRef.current
     setLoading(true)
-    
+
     // Get branch info
-    const { data: branchData } = await supabase
+    const { data: branchData, error: branchError } = await supabase
       .from('branches')
       .select('id, name_ar, code')
       .eq('id', branchIdToFetch)
-      .single()
-    
-    setBranch(fixEncodingInData(branchData) as Branch)
+      .maybeSingle()
 
-    // Get stock
-    const { data } = await supabase
-      .from('inventory')
-      .select(`
-        id, quantity, min_quantity, created_at,
-        item:items(id, code, name_ar, unit:units(name_ar, code), category:categories(name_ar))
-      `)
-      .eq('branch_id', branchIdToFetch)
-      .order('created_at', { ascending: false })
+    // Get stock (every row, not only the first 1000)
+    const { data, error: stockError } = await inventoryService.getStockByBranch(branchIdToFetch)
+    if (request !== requestRef.current) return
 
-    setStock(fixEncodingInData(data) as unknown as BranchStockItem[] || [])
+    if (branchError || stockError) setError('تعذر تحميل مخزون الفرع: ' + toUserMessage(branchError || stockError))
+    else if (!branchData) setError('الفرع غير موجود')
+    else setError('')
+    setBranch(fixEncodingInData(branchData) as Branch | null)
+    setStock(data || [])
     setLoading(false)
   }
 
   const filteredStock = stock.filter((inv) => {
     const item = inv.item
+    const term = search.trim()
     return (
-      item?.name_ar?.includes(search) ||
-      item?.code?.toLowerCase().includes(search.toLowerCase())
+      !term ||
+      item?.name_ar?.includes(term) ||
+      item?.code?.toLowerCase().includes(term.toLowerCase())
     )
   })
 
-  // Generate document number based on date
-  const getDocNumber = (date: string, index: number) => {
-    const d = new Date(date)
-    const dateStr = `${d.getDate()}/${d.getMonth() + 1}/${d.getFullYear()}`
-    return `${dateStr}-${String(index + 1).padStart(2, '0')}`
+  // Cairo calendar date of a timestamp: D/M/YYYY
+  const formatDate = (date: string) => {
+    const [y, m, d] = toLocalDate(date).split('-')
+    return `${Number(d)}/${Number(m)}/${y}`
   }
 
-  const formatDate = (date: string) => {
-    const d = new Date(date)
-    return `${d.getDate()}/${d.getMonth() + 1}/${d.getFullYear()}`
-  }
+  // Generate document number based on date
+  const getDocNumber = (date: string, index: number) => `${formatDate(date)}-${String(index + 1).padStart(2, '0')}`
+
+  const totalQuantity = roundQuantity(filteredStock.reduce((sum, i) => sum + Number(i.quantity || 0), 0))
 
   if (loading && !branch) {
     return (
@@ -124,6 +117,8 @@ export default function BranchStock() {
           <p className="text-gray-600">أرصدة المخزون للفرع</p>
         </div>
       </div>
+
+      {error && <div className="p-4 bg-red-50 border border-red-200 rounded-lg text-red-700">{error}</div>}
 
       {/* Filters */}
       <div className="bg-white rounded-lg shadow-sm border border-gray-100 p-4">
@@ -150,6 +145,9 @@ export default function BranchStock() {
             aria-label="الفرع"
             className="px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
           >
+            {selectedBranch && !branches.some(b => b.id === selectedBranch) && (
+              <option value={selectedBranch}>{branch?.name_ar || 'الفرع'}</option>
+            )}
             {branches.map((b) => (
               <option key={b.id} value={b.id}>
                 {b.name_ar}
@@ -168,20 +166,24 @@ export default function BranchStock() {
         <div className="bg-white rounded-lg shadow-sm p-4 border border-gray-100">
           <p className="text-sm text-gray-500">إجمالي الكمية</p>
           <p className="text-2xl font-bold text-blue-600">
-            {formatNumber(filteredStock.reduce((sum, i) => sum + (i.quantity || 0), 0))}
+            {formatNumber(totalQuantity)}
           </p>
         </div>
         <div className="bg-white rounded-lg shadow-sm p-4 border border-gray-100">
           <p className="text-sm text-gray-500">مخزون منخفض</p>
           <p className="text-2xl font-bold text-red-600">
-            {formatNumber(filteredStock.filter((i) => i.quantity < (i.min_quantity || 10)).length)}
+            {formatNumber(filteredStock.filter((i) => Number(i.quantity || 0) < Number(i.min_quantity || 10)).length)}
           </p>
         </div>
       </div>
 
       {/* Stock Table - Branch Style */}
       <div className="bg-white rounded-lg shadow-sm border border-gray-100 overflow-hidden">
-        {filteredStock.length === 0 ? (
+        {loading ? (
+          <div className="flex items-center justify-center py-12">
+            <div className="w-8 h-8 border-4 border-blue-600 border-t-transparent rounded-full animate-spin" />
+          </div>
+        ) : filteredStock.length === 0 ? (
           <div className="text-center py-12">
             <Package className="w-12 h-12 text-gray-300 mx-auto mb-4" />
             <p className="text-gray-500">لا توجد بيانات</p>
@@ -205,17 +207,17 @@ export default function BranchStock() {
               <tbody className="divide-y divide-gray-100">
                 {filteredStock.map((inv, index) => {
                   const item = inv.item
-                  const unitName = item?.unit?.name_ar || item?.unit?.code || 'قطعة'
-                  const totalQty = inv.quantity || 0
+                  const unitName = unitLabel(item?.unit, 'قطعة')
+                  const totalQty = Number(inv.quantity || 0)
                   const partialQty = Math.floor(totalQty)
                   const contentQty = 1 // Default content multiplier
-                  
+
                   return (
                     <tr key={inv.id} className={index % 2 === 0 ? 'bg-white' : 'bg-gray-50'}>
                       <td className="px-4 py-3 text-gray-900">{index + 1}</td>
                       <td className="px-4 py-3 text-gray-600">{formatDate(inv.created_at)}</td>
                       <td className="px-4 py-3 text-gray-900 font-mono">{getDocNumber(inv.created_at, index)}</td>
-                      <td className="px-4 py-3 text-gray-900 font-mono">{item?.code || '-'}</td>
+                      <td className="px-4 py-3 text-gray-900 font-mono" dir="ltr">{displayCode(item?.code) || '-'}</td>
                       <td className="px-4 py-3 text-gray-900">{item?.name_ar || '-'}</td>
                       <td className="px-4 py-3 text-gray-600">{formatNumber(partialQty)}</td>
                       <td className="px-4 py-3 text-gray-600">{formatNumber(contentQty)}</td>

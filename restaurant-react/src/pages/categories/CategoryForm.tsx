@@ -1,7 +1,10 @@
 import { useState, useEffect, FormEvent } from 'react'
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { supabase, fixEncodingInData } from '../../lib/supabase'
-import { Save, ArrowRight, Package, ChefHat, Search, X, Trash2 } from 'lucide-react'
+import { fetchAll } from '../../lib/fetchAll'
+import { toUserMessage } from '../../lib/errors'
+import { inventoryService } from '../../services/inventory.service'
+import { Save, ArrowRight, Package, ChefHat, Search, X } from 'lucide-react'
 
 interface CategoryFormData {
   code: string
@@ -30,7 +33,7 @@ export default function CategoryForm() {
   const [loading, setLoading] = useState(false)
   const [fetchLoading, setFetchLoading] = useState(isEdit)
   const [error, setError] = useState('')
-  
+
   const [formData, setFormData] = useState<CategoryFormData>({
     code: '',
     name: '',
@@ -42,6 +45,8 @@ export default function CategoryForm() {
 
   const [allItems, setAllItems] = useState<Item[]>([])
   const [selectedItems, setSelectedItems] = useState<Set<string>>(new Set())
+  // Items that were in the category when the page loaded (to send only what changed)
+  const [originalItems, setOriginalItems] = useState<Set<string>>(new Set())
   const [searchTerm, setSearchTerm] = useState('')
 
   useEffect(() => {
@@ -49,179 +54,90 @@ export default function CategoryForm() {
   }, [id, isEdit, categoryType])
 
   const loadData = async () => {
-    console.log('🔄 Loading data for category:', id, 'type:', categoryType, 'isEdit:', isEdit)
-    
-    // First, fetch ALL items (paginated to bypass 1000 limit)
-    let allItemsData: Item[] = []
-    let start = 0
-    const BATCH_SIZE = 1000
-    let hasMore = true
-
-    while (hasMore) {
-      const { data: itemsBatch, error: itemsError } = await supabase
-        .from('items')
-        .select('id, code, name_ar, is_recipe, category_id')
-        .eq('is_recipe', categoryType === 'recipes')
-        .eq('status', 'active')
-        .order('name_ar')
-        .range(start, start + BATCH_SIZE - 1)
-
-      if (itemsError) {
-        console.error('❌ Items error:', itemsError)
-        break
-      }
-
-      if (itemsBatch && itemsBatch.length > 0) {
-        allItemsData = [...allItemsData, ...itemsBatch]
-        hasMore = itemsBatch.length === BATCH_SIZE
-        start += BATCH_SIZE
-        console.log('📦 Loaded batch:', itemsBatch.length, 'items. Total so far:', allItemsData.length)
-      } else {
-        hasMore = false
-      }
+    setError('')
+    let items: Item[] = []
+    try {
+      // All items of this type (more than the 1000 rows one request returns)
+      const data = await fetchAll<Item>((from, to) =>
+        supabase
+          .from('items')
+          .select('id, code, name_ar, is_recipe, category_id')
+          .eq('is_recipe', categoryType === 'recipes')
+          .eq('status', 'active')
+          .order('name_ar')
+          .order('id')
+          .range(from, to)
+      )
+      items = fixEncodingInData(data) as Item[]
+      setAllItems(items)
+    } catch (itemsError) {
+      setError('تعذر تحميل الأصناف: ' + toUserMessage(itemsError))
     }
 
-    console.log('📦 Total items loaded:', allItemsData.length)
+    // If editing, fetch the category and mark the items already in it
+    if (isEdit && id) {
+      const { data: categoryData, error: categoryError } = await supabase
+        .from('categories')
+        .select('*')
+        .eq('id', id)
+        .single()
 
-    if (allItemsData.length > 0) {
-      const items = fixEncodingInData(allItemsData) as Item[]
-      setAllItems(items)
-      console.log('✅ Set allItems:', items.length)
+      if (categoryError) {
+        setError('فشل في تحميل بيانات المجموعة: ' + toUserMessage(categoryError))
+      } else if (categoryData) {
+        setFormData({
+          code: categoryData.code,
+          name: categoryData.name,
+          name_ar: categoryData.name_ar,
+          description: categoryData.description || '',
+          sort_order: categoryData.sort_order || 0,
+          is_active: categoryData.is_active,
+        })
 
-      // Then, if editing, fetch category and set selected items
-      if (isEdit && id) {
-        console.log('📝 Fetching category:', id)
-        const { data: categoryData, error: categoryError } = await supabase
-          .from('categories')
-          .select('*')
-          .eq('id', id)
-          .single()
-
-        console.log('📂 Category data:', categoryData)
-        if (categoryError) console.error('❌ Category error:', categoryError)
-
-        if (categoryError) {
-          setError('فشل في تحميل بيانات المجموعة')
-        } else if (categoryData) {
-          setFormData({
-            code: categoryData.code,
-            name: categoryData.name,
-            name_ar: categoryData.name_ar,
-            description: categoryData.description || '',
-            sort_order: categoryData.sort_order || 0,
-            is_active: categoryData.is_active,
-          })
-
-          // Get items in this category from the loaded items
-          console.log('🔍 Filtering items for category_id:', id)
-          
-          // Debug: Show sample of category_ids in loaded items
-          const categoryIdsInItems = new Set(items.map(i => i.category_id).filter(Boolean))
-          console.log('📋 Unique category_ids in loaded items:', Array.from(categoryIdsInItems).slice(0, 10))
-          console.log('📋 Total unique categories:', categoryIdsInItems.size)
-          console.log('📋 Total items with category_id:', items.filter(i => i.category_id).length)
-          console.log('📋 Total items without category_id:', items.filter(i => !i.category_id).length)
-          console.log('📋 Looking for category_id:', id)
-          console.log('📋 Category exists in items?', categoryIdsInItems.has(id))
-          
-          const itemsInCategory = items.filter(item => {
-            const matches = item.category_id === id
-            if (matches) {
-              console.log('✓ Found item:', item.name_ar, 'category_id:', item.category_id)
-            }
-            return matches
-          })
-          
-          console.log('📊 Found', itemsInCategory.length, 'items in category')
-          console.log('Items:', itemsInCategory.map(i => i.name_ar))
-          
-          const itemIds = itemsInCategory.map(item => item.id)
-          setSelectedItems(new Set(itemIds))
-          console.log('✅ Set selectedItems:', itemIds.length, 'items')
-        }
+        const itemIds = items.filter(item => item.category_id === id).map(item => item.id)
+        setSelectedItems(new Set(itemIds))
+        setOriginalItems(new Set(itemIds))
       }
     }
     setFetchLoading(false)
-    console.log('✅ Loading complete')
   }
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault()
+    if (loading) return
     setError('')
-    setLoading(true)
 
-    // Check if code exists
-    const { data: existing } = await supabase
-      .from('categories')
-      .select('id')
-      .eq('code', formData.code)
-      .neq('id', id || '')
-      .single()
-
-    if (existing) {
-      setError(`كود المجموعة "${formData.code}" موجود مسبقاً`)
-      setLoading(false)
+    if (!Number.isInteger(formData.sort_order) || formData.sort_order < 0) {
+      setError('ترتيب العرض يجب أن يكون رقماً صحيحاً (صفر أو أكثر)')
       return
     }
 
-    let categoryId = id
+    // Only the changes are sent: items added to / taken out of this category
+    const addItemIds = [...selectedItems].filter(itemId => !originalItems.has(itemId))
+    const removeItemIds = [...originalItems].filter(itemId => !selectedItems.has(itemId))
 
-    if (isEdit && id) {
-      // Update category
-      const { error: updateError } = await supabase
-        .from('categories')
-        .update({
-          ...formData,
-          updated_at: new Date().toISOString()
-        })
-        .eq('id', id)
+    setLoading(true)
+    // One database call: the category (code uniqueness checked there) and its item assignments
+    const { error: saveError } = await inventoryService.saveCategory(
+      isEdit && id ? id : null,
+      {
+        code: formData.code.trim(),
+        name: formData.name.trim(),
+        name_ar: formData.name_ar.trim(),
+        description: formData.description.trim() || null,
+        sort_order: formData.sort_order,
+        is_active: formData.is_active,
+      },
+      addItemIds,
+      removeItemIds
+    )
 
-      if (updateError) {
-        setError('فشل في تحديث المجموعة: ' + updateError.message)
-        setLoading(false)
-        return
-      }
-    } else {
-      // Create category
-      const { data: newCategory, error: createError } = await supabase
-        .from('categories')
-        .insert(formData)
-        .select()
-        .single()
-
-      if (createError || !newCategory) {
-        setError('فشل في إنشاء المجموعة: ' + (createError?.message || ''))
-        setLoading(false)
-        return
-      }
-      categoryId = newCategory.id
+    if (saveError) {
+      setError('فشل في حفظ المجموعة: ' + toUserMessage(saveError))
+      setLoading(false)
+      return
     }
-
-    // Update item categories
-    if (categoryId) {
-      // Remove category from items not selected
-      const itemsToRemove = allItems
-        .filter(item => item.category_id === categoryId && !selectedItems.has(item.id))
-        .map(item => item.id)
-
-      if (itemsToRemove.length > 0) {
-        await supabase
-          .from('items')
-          .update({ category_id: null })
-          .in('id', itemsToRemove)
-      }
-
-      // Add category to selected items
-      if (selectedItems.size > 0) {
-        await supabase
-          .from('items')
-          .update({ category_id: categoryId })
-          .in('id', Array.from(selectedItems))
-      }
-    }
-
     navigate('/categories')
-    setLoading(false)
   }
 
   const handleChange = (field: keyof CategoryFormData, value: string | number | boolean) => {
@@ -359,6 +275,8 @@ export default function CategoryForm() {
               <input
                 id="sort_order"
                 type="number"
+                min={0}
+                step={1}
                 value={formData.sort_order}
                 onChange={(e) => handleChange('sort_order', Number(e.target.value))}
                 className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500"

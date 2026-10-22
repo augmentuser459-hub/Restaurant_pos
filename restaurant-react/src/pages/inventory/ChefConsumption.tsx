@@ -1,10 +1,13 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Link, Navigate } from 'react-router-dom'
 import { supabase, fixEncodingInData } from '../../lib/supabase'
+import { fetchAll } from '../../lib/fetchAll'
+import { toUserMessage } from '../../lib/errors'
 import { Package, Search, Filter, Plus, Download } from 'lucide-react'
 import { formatNumber } from '../../lib/utils'
-import { exportToExcel, consumptionColumns, formatDateForExcel } from '../../lib/excel'
+import { exportToExcel, consumptionColumns } from '../../lib/excel'
 import { useAuth } from '../../contexts/AuthContext'
+import { displayCode, roleName, unitLabel } from './stockHelpers'
 
 interface ConsumptionItem {
   id: string
@@ -13,106 +16,110 @@ interface ConsumptionItem {
     id: string
     code: string
     name_ar: string
-    unit?: { name_ar: string; code: string }
-  }
+    unit?: { name_ar: string; code: string } | null
+  } | null
   actual_quantity: number
   system_quantity: number
-  variance_reason: string
+  variance_reason: string | null
   count: {
     id: string
-    branch: { name_ar: string }
-  }
+    count_date: string
+    branch: { name_ar: string } | null
+  } | null
+}
+
+// Chef consumption records are daily_inventory_counts rows with count_type 'morning' (real counts are opening/closing)
+const CONSUMPTION_TYPE = 'morning'
+
+/** 'YYYY-MM-DD' -> 'D-M-YYYY' without going through Date (no time zone shift) */
+const formatDate = (date: string) => {
+  if (!date) return '-'
+  const [y, m, d] = date.slice(0, 10).split('-')
+  return `${Number(d)}-${Number(m)}-${y}`
+}
+
+const getDocNumber = (date: string, index: number) => {
+  if (!date) return '-'
+  const [y, m, d] = date.slice(0, 10).split('-')
+  return `${Number(d)}/${Number(m)}/${y}-${String(index + 1).padStart(2, '0')}`
 }
 
 export default function ChefConsumption() {
   const { user } = useAuth()
   const [items, setItems] = useState<ConsumptionItem[]>([])
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
   const [search, setSearch] = useState('')
   const [selectedDate, setSelectedDate] = useState('')
+  const requestRef = useRef(0) // ignores a late response for a previously selected date
 
   // Check if user has permission to access this page
-  const userRole = typeof user?.role === 'object' && user?.role !== null 
-    ? (user.role as { name: string }).name 
-    : user?.role
-
-  // Only admin and warehouse_manager can access chef consumption
-  if (userRole && !['admin', 'warehouse_manager'].includes(userRole)) {
-    return <Navigate to="/dashboard" replace />
-  }
+  const userRole = roleName(user?.role)
+  const allowed = !userRole || ['admin', 'warehouse_manager'].includes(userRole)
 
   useEffect(() => {
-    fetchConsumption()
-  }, [selectedDate])
+    if (allowed) fetchConsumption()
+  }, [selectedDate, allowed])
 
   const fetchConsumption = async () => {
+    const request = ++requestRef.current
     setLoading(true)
-    
-    let query = supabase
-      .from('daily_inventory_count_items')
-      .select(`
-        id, actual_quantity, system_quantity, variance_reason, created_at,
-        item:items(id, code, name_ar, unit:units(name_ar, code)),
-        count:daily_inventory_counts(id, count_date, branch:branches(name_ar))
-      `)
-      .order('created_at', { ascending: false })
-      .limit(100)
+    setError('')
+    try {
+      // Only chef consumption (inner join on the record type), the date filtered in the query, every row loaded
+      const data = await fetchAll<Record<string, unknown>>((from, to) => {
+        let query = supabase
+          .from('daily_inventory_count_items')
+          .select(`
+            id, actual_quantity, system_quantity, variance_reason, created_at,
+            item:items(id, code, name_ar, unit:units(name_ar, code)),
+            count:daily_inventory_counts!inner(id, count_date, count_type, branch:branches(name_ar))
+          `)
+          .eq('count.count_type', CONSUMPTION_TYPE)
+        if (selectedDate) query = query.eq('count.count_date', selectedDate)
+        return query.order('created_at', { ascending: false }).order('id').range(from, to)
+      })
 
-    const { data } = await query
-    
-    // Transform data to include count_date at item level
-    const transformedData = (data || []).map(item => ({
-      ...item,
-      count_date: (item.count as { count_date?: string })?.count_date || '',
-    }))
-    
-    // Filter by date if selected
-    let filteredData = transformedData
-    if (selectedDate) {
-      filteredData = transformedData.filter(item => 
-        item.count_date?.startsWith(selectedDate)
-      )
+      const transformedData = data.map(row => ({
+        ...row,
+        count_date: (row.count as { count_date?: string } | null)?.count_date || '',
+      }))
+      if (request !== requestRef.current) return // a newer date was selected meanwhile
+      setItems((fixEncodingInData(transformedData) as unknown as ConsumptionItem[]) || [])
+    } catch (loadError) {
+      if (request !== requestRef.current) return
+      setError('تعذر تحميل سجل الاستهلاك: ' + toUserMessage(loadError))
+      setItems([])
     }
-    
-    setItems(fixEncodingInData(filteredData) as unknown as ConsumptionItem[] || [])
     setLoading(false)
   }
 
-  const formatDate = (date: string) => {
-    if (!date) return '-'
-    const d = new Date(date)
-    return `${d.getDate()}-${d.getMonth() + 1}-${d.getFullYear()}`
-  }
-
-  const getDocNumber = (date: string, index: number) => {
-    if (!date) return '-'
-    const d = new Date(date)
-    return `${d.getDate()}/${d.getMonth() + 1}/${d.getFullYear()}-${String(index + 1).padStart(2, '0')}`
+  // Only admin and warehouse_manager can access chef consumption (checked after all hooks ran)
+  if (!allowed) {
+    return <Navigate to="/dashboard" replace />
   }
 
   const filteredItems = items.filter((item) => {
-    const itemData = item.item as { code?: string; name_ar?: string }
+    const itemData = item.item
+    const term = search.trim()
     return (
-      itemData?.name_ar?.includes(search) ||
-      itemData?.code?.toLowerCase().includes(search.toLowerCase())
+      !term ||
+      itemData?.name_ar?.includes(term) ||
+      itemData?.code?.toLowerCase().includes(term.toLowerCase())
     )
   })
 
   // Export to Excel
   const handleExport = () => {
-    const exportData = filteredItems.map(item => {
-      const itemData = item.item as { code?: string; name_ar?: string }
-      const countData = item.count as { branch?: { name_ar?: string } }
-      return {
-        date: item.count_date ? formatDateForExcel(item.count_date) : '',
-        branch_name: countData?.branch?.name_ar || '',
-        item_code: itemData?.code || '',
-        item_name: itemData?.name_ar || '',
-        quantity: item.actual_quantity || 0,
-        chef_name: '',
-        notes: item.variance_reason || '',
-      }
-    })
+    const exportData = filteredItems.map(item => ({
+      date: item.count_date || '',
+      branch_name: item.count?.branch?.name_ar || '',
+      item_code: displayCode(item.item?.code),
+      item_name: item.item?.name_ar || '',
+      quantity: Number(item.actual_quantity || 0),
+      chef_name: '',
+      notes: item.variance_reason || '',
+    }))
     exportToExcel(exportData, consumptionColumns, 'استهلاك_الطباخ')
   }
 
@@ -151,6 +158,8 @@ export default function ChefConsumption() {
           </Link>
         </div>
       </div>
+
+      {error && <div className="p-4 bg-red-50 border border-red-200 rounded-lg text-red-700">{error}</div>}
 
       {/* Filters */}
       <div className="bg-white rounded-lg shadow-sm border border-gray-100 p-4">
@@ -205,6 +214,7 @@ export default function ChefConsumption() {
                   <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">م</th>
                   <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">التاريخ</th>
                   <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">رقم المستند</th>
+                  <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">الفرع</th>
                   <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">كود الصنف</th>
                   <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">اسم الصنف</th>
                   <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">جزئي</th>
@@ -215,18 +225,19 @@ export default function ChefConsumption() {
               </thead>
               <tbody className="divide-y divide-gray-100">
                 {filteredItems.map((item, index) => {
-                  const itemData = item.item as { code?: string; name_ar?: string; unit?: { name_ar: string; code: string } }
-                  const unitName = itemData?.unit?.name_ar || itemData?.unit?.code || 'كيلو'
-                  const totalQty = item.actual_quantity || 0
+                  const itemData = item.item
+                  const unitName = unitLabel(itemData?.unit, 'كيلو')
+                  const totalQty = Number(item.actual_quantity || 0)
                   const partialQty = Math.floor(totalQty)
-                  const contentQty = item.system_quantity || 1
-                  
+                  const contentQty = Number(item.system_quantity || 1)
+
                   return (
                     <tr key={item.id} className={index % 2 === 0 ? 'bg-white' : 'bg-gray-50'}>
                       <td className="px-4 py-3 text-gray-900">{index + 1}</td>
                       <td className="px-4 py-3 text-gray-600">{formatDate(item.count_date)}</td>
                       <td className="px-4 py-3 text-gray-900 font-mono">{getDocNumber(item.count_date, index)}</td>
-                      <td className="px-4 py-3 text-gray-900 font-mono">{itemData?.code || '-'}</td>
+                      <td className="px-4 py-3 text-gray-600">{item.count?.branch?.name_ar || '-'}</td>
+                      <td className="px-4 py-3 text-gray-900 font-mono" dir="ltr">{displayCode(itemData?.code) || '-'}</td>
                       <td className="px-4 py-3 text-gray-900">{itemData?.name_ar || '-'}</td>
                       <td className="px-4 py-3 text-gray-600">{formatNumber(partialQty)}</td>
                       <td className="px-4 py-3 text-gray-600">{formatNumber(contentQty)}</td>
