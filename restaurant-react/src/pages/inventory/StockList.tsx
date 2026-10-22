@@ -402,7 +402,7 @@ export default function StockList() {
   // Export to Excel
   const handleExport = () => {
     const exportData = filteredStock.map(inv => {
-      const item = inv.item as { code?: string; name_ar?: string; unit?: { name_ar?: string; code?: string } | string; purchase_price?: number; selling_price?: number; category?: { name_ar?: string } }
+      const item = inv.item as { code?: string; barcode?: string; name_ar?: string; unit?: { name_ar?: string; code?: string } | string; purchase_price?: number; selling_price?: number; category?: { name_ar?: string } }
       const branch = inv.branch as { name_ar?: string }
       // Handle unit as object or string
       const unitValue = typeof item?.unit === 'object'
@@ -410,6 +410,7 @@ export default function StockList() {
         : (item?.unit || '')
       return {
         item_code: item?.code || '',
+        item_barcode: item?.barcode || '',
         item_name: item?.name_ar || '',
         category_name: item?.category?.name_ar || '',
         branch_name: branch?.name_ar || selectedBranchName,
@@ -488,8 +489,8 @@ export default function StockList() {
         console.log(`Processing batch ${batchIndex + 1}/${totalBatches} (items ${start + 1}-${end})`)
 
         for (const row of batch) {
-          // Get item data from CSV
-          const itemCode = (row['كود الصنف'] || row['item_code'] || row['كود'] || '').toString().trim()
+          // IMPORTANT: "كود الصنف" column contains BARCODES (what cashier scans)
+          const barcode = (row['كود الصنف'] || row['barcode'] || row['الباركود'] || '').toString().trim()
           const itemName = (row['اسم الصنف'] || row['item_name'] || row['الاسم'] || '').toString().trim()
           const categoryName = (row['مجموعة'] || row['category_name'] || row['المجموعة'] || '').toString().trim()
           const quantity = parseFloat(row['الكمية'] || row['quantity'] || row['الرصيد إجمالي'] || '0')
@@ -500,17 +501,22 @@ export default function StockList() {
           let unitRaw = row['الوحدة'] || row['unit'] || row['وصف المحتوى'] || ''
           const unitName = (typeof unitRaw === 'object' ? '' : unitRaw.toString()).trim()
 
-          if (!itemCode) {
+          if (!barcode && !itemName) {
             errorCount++
-            errors.push(`سطر بدون كود صنف`)
+            errors.push(`سطر بدون باركود أو اسم`)
             continue
           }
 
           if (!itemName) {
             errorCount++
-            errors.push(`سطر بدون اسم صنف: ${itemCode}`)
+            errors.push(`سطر بدون اسم صنف: ${barcode}`)
             continue
           }
+
+          // Use barcode as code (for internal reference - cashier uses barcode field)
+          const itemCode = barcode
+          
+          console.log(`Processing: barcode="${barcode}", name="${itemName}"`)
 
           // Resolve category: look up existing or create new
           let categoryId: string | undefined = undefined
@@ -532,7 +538,27 @@ export default function StockList() {
             }
           }
 
-          let item = itemMap.get(itemCode.toLowerCase())
+          // Try to find item by barcode first, then by code, then by name
+          let item = allItems?.find(i => i.barcode === barcode)
+          let matchMethod = 'none'
+          
+          if (item) {
+            matchMethod = 'barcode'
+          } else {
+            item = itemMap.get(itemCode.toLowerCase())
+            if (item) {
+              matchMethod = 'code'
+            } else {
+              item = allItems?.find(i => i.name_ar?.trim().toLowerCase() === itemName.trim().toLowerCase())
+              if (item) {
+                matchMethod = 'name'
+              }
+            }
+          }
+          
+          if (item) {
+            console.log(`Found existing item by ${matchMethod}: "${itemName}" (ID: ${item.id})`)
+          }
 
           // If item doesn't exist, create it
           if (!item) {
@@ -544,13 +570,14 @@ export default function StockList() {
 
             if (!matchedUnit || !matchedUnit.id) {
               errorCount++
-              errors.push(`لا توجد وحدة قياس للصنف ${itemCode}`)
-              console.error(`No valid unit found for item ${itemCode}. unitName: ${unitName}`)
+              errors.push(`لا توجد وحدة قياس للصنف ${barcode}`)
+              console.error(`No valid unit found for item ${barcode}. unitName: ${unitName}`)
               continue
             }
 
             const itemToCreate: Parameters<typeof inventoryService.createItem>[0] = {
-              code: itemCode,
+              code: itemCode,        // Same as barcode
+              barcode: barcode,      // What cashier scans - EXACT from Excel
               name: itemName,
               name_ar: itemName,
               unit: matchedUnit.id,
@@ -561,35 +588,50 @@ export default function StockList() {
               ...(categoryId ? { category_id: categoryId } : {}),
             }
 
+            console.log(`Creating new item: barcode="${barcode}", name="${itemName}"`)
+
             const { data: newItem, error: createError } = await inventoryService.createItem(itemToCreate)
 
             if (createError || !newItem) {
               errorCount++
               const errorMsg = createError?.message || 'خطأ غير معروف'
-              errors.push(`فشل إنشاء الصنف ${itemCode}: ${errorMsg}`)
-              console.error(`❌ Failed to create item: ${itemCode}`, createError)
+              errors.push(`فشل إنشاء الصنف ${barcode}: ${errorMsg}`)
+              console.error(`❌ Failed to create item: ${barcode}`, createError)
               continue
             }
 
             item = newItem
             itemMap.set(itemCode.toLowerCase(), newItem)
             newItemsCount++
+            console.log(`✅ Created item: ${itemName} (barcode: ${barcode})`)
           } else {
-            // Update existing item prices and/or category if provided
-            const updateData: { purchase_price?: number; selling_price?: number; category_id?: string } = {}
+            // Update existing item prices, category, and barcode
+            const updateData: { purchase_price?: number; selling_price?: number; category_id?: string; barcode?: string | null; code?: string } = {}
             if (purchasePrice > 0) updateData.purchase_price = purchasePrice
             if (sellingPrice > 0) updateData.selling_price = sellingPrice
             if (categoryId) updateData.category_id = categoryId
+            
+            // Always update barcode if provided (even if item already has one)
+            if (barcode) {
+              updateData.barcode = barcode
+              updateData.code = itemCode  // Also update code to match barcode
+            }
 
             if (Object.keys(updateData).length > 0) {
-              await inventoryService.updateItem(item.id, updateData)
+              const { error: updateError } = await inventoryService.updateItem(item.id, updateData)
+              if (updateError) {
+                console.error(`❌ Failed to update item: ${itemName}`, updateError)
+                errors.push(`فشل تحديث الصنف "${itemName}": ${updateError.message}`)
+              } else {
+                console.log(`✅ Updated item: ${itemName} (barcode: ${barcode}, prices updated)`)
+              }
             }
           }
 
           // Update stock
           if (!item || !item.id) {
             errorCount++
-            errors.push(`فشل في الحصول على معرف الصنف ${itemCode}`)
+            errors.push(`فشل في الحصول على معرف الصنف ${barcode}`)
             continue
           }
 
