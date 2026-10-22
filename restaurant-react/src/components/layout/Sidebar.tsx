@@ -11,7 +11,7 @@ import {
   ChefHat,
   BarChart3,
   ClipboardList,
-  Settings,
+  ClipboardCheck,
   Truck,
   Undo2,
   UtensilsCrossed,
@@ -23,6 +23,7 @@ import {
   FolderOpen,
 } from 'lucide-react'
 import { UserRole } from '../../types/database.types'
+import { ACCESS, getUserRole } from './roleAccess'
 
 interface SidebarProps {
   isOpen: boolean
@@ -36,40 +37,42 @@ interface NavItem {
   roles?: UserRole[]
 }
 
+// Link roles come from the same lists that guard the routes (roleAccess.ts). A few links are hidden from
+// the admin on purpose (the admin reaches those pages another way); those lists are a subset of the route's.
 const navigation: NavItem[] = [
-  { name: 'لوحة التحكم', href: '/dashboard', icon: LayoutDashboard, roles: ['admin'] },
-  { name: 'الفروع', href: '/branches', icon: Building2, roles: ['admin', 'warehouse_manager'] },
-  { name: 'الموردين', href: '/suppliers', icon: Truck, roles: ['admin', 'purchase_manager'] },
-  { name: 'المخزون', href: '/inventory', icon: Package, roles: ['admin'] },
-  { name: 'المجموعات', href: '/categories', icon: FolderOpen, roles: ['admin'] },
+  { name: 'لوحة التحكم', href: '/dashboard', icon: LayoutDashboard, roles: ACCESS.dashboard },
+  { name: 'الفروع', href: '/branches', icon: Building2, roles: ACCESS.branches },
+  { name: 'الموردين', href: '/suppliers', icon: Truck, roles: ACCESS.suppliers },
+  { name: 'المخزون', href: '/inventory', icon: Package, roles: ACCESS.inventory },
+  { name: 'المجموعات', href: '/categories', icon: FolderOpen, roles: ACCESS.categories },
+  // The admin adds items from the inventory screen
   { name: 'إضافة صنف', href: '/inventory/items/new', icon: Package, roles: ['warehouse_manager'] },
-  { name: 'الريسبيات', href: '/recipes', icon: CookingPot, roles: ['admin'] },
-  { name: 'التحويلات', href: '/transfers', icon: ArrowLeftRight, roles: ['admin', 'warehouse_manager', 'branch_supervisor'] },
-  { name: 'المرتجعات', href: '/returns', icon: Undo2, roles: ['admin', 'warehouse_manager', 'branch_supervisor'] },
-  { name: 'التالف', href: '/damages', icon: AlertTriangle, roles: ['admin', 'warehouse_manager', 'branch_supervisor'] },
-  { name: 'استهلاك الطباخ', href: '/inventory/chef-consumption', icon: UtensilsCrossed, roles: ['admin', 'warehouse_manager'] },
+  { name: 'الجرد اليومي', href: '/inventory/daily-count', icon: ClipboardCheck, roles: ACCESS.dailyCount },
+  { name: 'الريسبيات', href: '/recipes', icon: CookingPot, roles: ACCESS.recipes },
+  { name: 'التحويلات', href: '/transfers', icon: ArrowLeftRight, roles: ACCESS.stockMovements },
+  { name: 'المرتجعات', href: '/returns', icon: Undo2, roles: ACCESS.stockMovements },
+  { name: 'التالف', href: '/damages', icon: AlertTriangle, roles: ACCESS.stockMovements },
+  { name: 'استهلاك الطباخ', href: '/inventory/chef-consumption', icon: UtensilsCrossed, roles: ACCESS.chefConsumption },
+  // POS screens work on the signed-in user's branch, so they are listed only for cashiers / chefs
   { name: 'نقطة البيع', href: '/pos/cashier', icon: ShoppingCart, roles: ['cashier'] },
-  { name: 'إدارة نقاط البيع', href: '/pos/management', icon: Store, roles: ['admin'] },
+  { name: 'إدارة نقاط البيع', href: '/pos/management', icon: Store, roles: ACCESS.posManagement },
   { name: 'المطبخ', href: '/pos/kitchen', icon: ChefHat, roles: ['chef'] },
-  { name: 'الأوردرات', href: '/orders', icon: Receipt, roles: ['admin'] },
-  { name: 'الشيفتات', href: '/shifts', icon: Clock, roles: ['admin'] },
-  { name: 'التقارير', href: '/reports', icon: BarChart3, roles: ['admin', 'warehouse_manager'] },
+  { name: 'الأوردرات', href: '/orders', icon: Receipt, roles: ACCESS.orders },
+  { name: 'الشيفتات', href: '/shifts', icon: Clock, roles: ACCESS.shifts },
+  { name: 'التقارير', href: '/reports', icon: BarChart3, roles: ACCESS.reports },
+  // Admin and warehouse manager open the statement from the reports page
   { name: 'كشف حساب المورد', href: '/reports/supplier-statement', icon: BarChart3, roles: ['purchase_manager'] },
-  { name: 'طلبات الشراء', href: '/purchase', icon: ClipboardList, roles: ['admin', 'purchase_manager', 'warehouse_manager'] },
-  { name: 'المستخدمين', href: '/users', icon: Users, roles: ['admin'] },
+  { name: 'طلبات الشراء', href: '/purchase', icon: ClipboardList, roles: ACCESS.purchase },
+  { name: 'المستخدمين', href: '/users', icon: Users, roles: ACCESS.users },
 ]
 
 export default function Sidebar({ isOpen, onClose }: SidebarProps) {
   const { user } = useAuth()
+  const userRole = getUserRole(user)
 
   const filteredNavigation = navigation.filter((item) => {
     if (!item.roles) return true
-    if (!user) return false
-    // Handle role as object (from join) or string
-    const userRole = typeof user.role === 'object' && user.role !== null 
-      ? (user.role as { name: string }).name 
-      : user.role
-    return item.roles.includes(userRole as UserRole)
+    return userRole !== null && item.roles.includes(userRole)
   })
 
   return (

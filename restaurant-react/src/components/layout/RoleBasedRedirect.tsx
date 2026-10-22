@@ -1,5 +1,6 @@
 import { Navigate } from 'react-router-dom'
 import { useAuth } from '../../contexts/AuthContext'
+import { getUserRole } from './roleAccess'
 
 export default function RoleBasedRedirect() {
   const { user } = useAuth()
@@ -8,13 +9,8 @@ export default function RoleBasedRedirect() {
     return <Navigate to="/login" replace />
   }
 
-  // Handle role as object (from join) or string
-  const userRole = typeof user.role === 'object' && user.role !== null
-    ? (user.role as { name: string }).name
-    : user.role
-
   // Redirect based on role
-  switch (userRole) {
+  switch (getUserRole(user)) {
     case 'admin':
       return <Navigate to="/dashboard" replace />
     case 'chef':
@@ -28,6 +24,12 @@ export default function RoleBasedRedirect() {
     case 'purchase_manager':
       return <Navigate to="/purchase" replace />
     default:
-      return <Navigate to="/dashboard" replace />
+      // A role without a home page (e.g. a role added in the database later): don't bounce to an admin page
+      return (
+        <div className="bg-white rounded-lg shadow-sm p-8 text-center">
+          <h1 className="text-2xl font-bold text-gray-900 mb-2">لا توجد صفحة متاحة</h1>
+          <p className="text-gray-600">لم يتم تحديد صلاحيات لدورك الوظيفي، تواصل مع مدير النظام</p>
+        </div>
+      )
   }
 }

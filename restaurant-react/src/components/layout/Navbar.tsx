@@ -1,9 +1,11 @@
 import { useState, useRef, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useAuth } from '../../contexts/AuthContext'
-import { supabase } from '../../lib/supabase'
 import { notificationsService, Notification } from '../../services/notifications.service'
-import { Menu, Bell, User, LogOut, Info, ChevronDown, Check, CheckCheck } from 'lucide-react'
+import { toUserMessage } from '../../lib/errors'
+import ChangePasswordModal from '../../pages/auth/ChangePasswordModal'
+import { getUserRole } from './roleAccess'
+import { Menu, Bell, User, LogOut, Info, ChevronDown, Check, CheckCheck, KeyRound } from 'lucide-react'
 
 interface NavbarProps {
   onMenuClick: () => void
@@ -14,8 +16,11 @@ export default function Navbar({ onMenuClick }: NavbarProps) {
   const navigate = useNavigate()
   const [isDropdownOpen, setIsDropdownOpen] = useState(false)
   const [isNotificationsOpen, setIsNotificationsOpen] = useState(false)
+  // The list holds only unread notifications (getUnread, realtime additions, minus the ones marked read)
   const [notifications, setNotifications] = useState<Notification[]>([])
-  const [unreadCount, setUnreadCount] = useState(0)
+  const unreadCount = notifications.length
+  const [showChangePassword, setShowChangePassword] = useState(false)
+  const [markingRead, setMarkingRead] = useState(false)
   const dropdownRef = useRef<HTMLDivElement>(null)
   const notificationsRef = useRef<HTMLDivElement>(null)
 
@@ -23,48 +28,33 @@ export default function Navbar({ onMenuClick }: NavbarProps) {
   useEffect(() => {
     if (user?.id) {
       fetchNotifications()
-      
-      // Subscribe to realtime notifications
-      const channel = supabase
-        .channel('notifications')
-        .on(
-          'postgres_changes',
-          {
-            event: 'INSERT',
-            schema: 'public',
-            table: 'notifications',
-          },
-          (payload) => {
-            const newNotification = payload.new as Notification
-            // Check if notification is for this user or broadcast
-            if (
-              newNotification.user_id === user.id ||
-              newNotification.user_id === null ||
-              newNotification.branch_id === user.branch_id
-            ) {
-              setNotifications(prev => [newNotification, ...prev])
-              setUnreadCount(prev => prev + 1)
-            }
-          }
-        )
-        .subscribe()
+
+      // Realtime: only notifications this user sees in the bell (same rule as getUnread)
+      // (the 30 s poll may already have loaded it, so it is added only once)
+      const unsubscribe = notificationsService.subscribeToNew(user.id, user.branch_id, n => {
+        setNotifications(prev => (prev.some(p => p.id === n.id) ? prev : [n, ...prev]))
+      })
 
       // Also refresh every 30 seconds as backup
       const interval = setInterval(fetchNotifications, 30000)
-      
+
       return () => {
         clearInterval(interval)
-        supabase.removeChannel(channel)
+        unsubscribe()
       }
     }
   }, [user?.id, user?.branch_id])
 
   const fetchNotifications = async () => {
     if (!user?.id) return
-    const { data } = await notificationsService.getUnread(user.id, user.branch_id || undefined)
+    const { data, error } = await notificationsService.getUnread(user.id, user.branch_id || undefined)
+    if (error) {
+      // Background refresh (every 30 s): keep the last list instead of interrupting the user
+      console.error('Failed to load notifications:', error)
+      return
+    }
     if (data) {
       setNotifications(data)
-      setUnreadCount(data.length)
     }
   }
 
@@ -83,16 +73,33 @@ export default function Navbar({ onMenuClick }: NavbarProps) {
   }, [])
 
   const handleMarkAsRead = async (notificationId: string) => {
-    await notificationsService.markAsRead(notificationId)
-    setNotifications(prev => prev.filter(n => n.id !== notificationId))
-    setUnreadCount(prev => Math.max(0, prev - 1))
+    if (markingRead) return
+    setMarkingRead(true)
+    try {
+      const { error } = await notificationsService.markAsRead(notificationId)
+      if (error) {
+        alert(toUserMessage(error, 'تعذر تحديث الإشعار، حاول مرة أخرى'))
+        return
+      }
+      setNotifications(prev => prev.filter(n => n.id !== notificationId))
+    } finally {
+      setMarkingRead(false)
+    }
   }
 
   const handleMarkAllAsRead = async () => {
-    if (!user?.id) return
-    await notificationsService.markAllAsRead(user.id)
-    setNotifications([])
-    setUnreadCount(0)
+    if (!user?.id || markingRead) return
+    setMarkingRead(true)
+    try {
+      const { error } = await notificationsService.markAllAsRead(user.id)
+      if (error) {
+        alert(toUserMessage(error, 'تعذر تحديث الإشعارات، حاول مرة أخرى'))
+        return
+      }
+      setNotifications([])
+    } finally {
+      setMarkingRead(false)
+    }
   }
 
   const getNotificationIcon = (type: string) => {
@@ -178,7 +185,8 @@ export default function Navbar({ onMenuClick }: NavbarProps) {
                   <button
                     type="button"
                     onClick={handleMarkAllAsRead}
-                    className="text-xs text-blue-600 hover:text-blue-800 flex items-center gap-1"
+                    disabled={markingRead}
+                    className="text-xs text-blue-600 hover:text-blue-800 flex items-center gap-1 disabled:opacity-50"
                   >
                     <CheckCheck className="w-3 h-3" />
                     قراءة الكل
@@ -216,7 +224,8 @@ export default function Navbar({ onMenuClick }: NavbarProps) {
                         <button
                           type="button"
                           onClick={() => handleMarkAsRead(notification.id)}
-                          className="p-1 text-gray-400 hover:text-green-600 hover:bg-green-50 rounded"
+                          disabled={markingRead}
+                          className="p-1 text-gray-400 hover:text-green-600 hover:bg-green-50 rounded disabled:opacity-50"
                           title="تحديد كمقروء"
                         >
                           <Check className="w-4 h-4" />
@@ -249,11 +258,7 @@ export default function Navbar({ onMenuClick }: NavbarProps) {
                 {user?.full_name_ar || user?.full_name || 'مستخدم'}
               </p>
               <p className="text-xs text-gray-500">
-                {user ? getRoleLabel(
-                  typeof user.role === 'object' && user.role !== null 
-                    ? (user.role as { name: string }).name 
-                    : String(user.role || '')
-                ) : ''}
+                {user ? getRoleLabel(getUserRole(user) || '') : ''}
               </p>
             </div>
             <ChevronDown className={`w-4 h-4 text-gray-500 transition-transform ${isDropdownOpen ? 'rotate-180' : ''}`} />
@@ -281,6 +286,17 @@ export default function Navbar({ onMenuClick }: NavbarProps) {
               </button>
               <button
                 type="button"
+                onClick={() => {
+                  setIsDropdownOpen(false)
+                  setShowChangePassword(true)
+                }}
+                className="w-full flex items-center gap-3 px-4 py-2 text-sm text-gray-700 hover:bg-gray-100 transition-colors"
+              >
+                <KeyRound className="w-4 h-4" />
+                تغيير كلمة المرور
+              </button>
+              <button
+                type="button"
                 onClick={handleSignOut}
                 className="w-full flex items-center gap-3 px-4 py-2 text-sm text-red-600 hover:bg-red-50 transition-colors"
               >
@@ -291,6 +307,8 @@ export default function Navbar({ onMenuClick }: NavbarProps) {
           )}
         </div>
       </div>
+
+      {showChangePassword && <ChangePasswordModal onClose={() => setShowChangePassword(false)} />}
     </header>
   )
 }

@@ -1,105 +1,113 @@
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
+import { lazy, Suspense } from 'react'
+import { BrowserRouter, Routes, Route } from 'react-router-dom'
 import { AuthProvider } from './contexts/AuthContext'
 import ProtectedRoute from './components/layout/ProtectedRoute'
 import MainLayout from './components/layout/MainLayout'
 import RoleBasedRedirect from './components/layout/RoleBasedRedirect'
+import { ACCESS } from './components/layout/roleAccess'
 
-// Auth
+// Auth (loaded up front: the first screen of every visit)
 import Login from './pages/auth/Login'
+import NotFound from './pages/auth/NotFound'
+
+// Every page is its own chunk, downloaded the first time it is opened (MainLayout shows a spinner meanwhile),
+// so a cashier or kitchen tablet doesn't download the admin, report and Excel pages.
 
 // Dashboard
-import Dashboard from './pages/dashboard/Dashboard'
+const Dashboard = lazy(() => import('./pages/dashboard/Dashboard'))
 
 // Branches
-import BranchList from './pages/branches/BranchList'
-import BranchForm from './pages/branches/BranchForm'
+const BranchList = lazy(() => import('./pages/branches/BranchList'))
+const BranchForm = lazy(() => import('./pages/branches/BranchForm'))
 
 // Suppliers
-import SupplierList from './pages/suppliers/SupplierList'
-import SupplierForm from './pages/suppliers/SupplierForm'
-import SupplyForm from './pages/suppliers/SupplyForm'
-import PaymentForm from './pages/suppliers/PaymentForm'
+const SupplierList = lazy(() => import('./pages/suppliers/SupplierList'))
+const SupplierDetail = lazy(() => import('./pages/suppliers/SupplierDetail'))
+const SupplierForm = lazy(() => import('./pages/suppliers/SupplierForm'))
+const SupplyForm = lazy(() => import('./pages/suppliers/SupplyForm'))
+const PaymentForm = lazy(() => import('./pages/suppliers/PaymentForm'))
 
 // Inventory
-import ItemList from './pages/inventory/ItemList'
-import ItemForm from './pages/inventory/ItemForm'
-import CategoriesList from './pages/categories/CategoriesList'
-import CategoryForm from './pages/categories/CategoryForm'
-import StockList from './pages/inventory/StockList'
-import BranchStock from './pages/inventory/BranchStock'
-import DailyCountList from './pages/inventory/DailyCountList'
-import DailyCountForm from './pages/inventory/DailyCountForm'
-import ChefConsumption from './pages/inventory/ChefConsumption'
-import ChefConsumptionForm from './pages/inventory/ChefConsumptionForm'
+const ItemList = lazy(() => import('./pages/inventory/ItemList'))
+const ItemForm = lazy(() => import('./pages/inventory/ItemForm'))
+const CategoriesList = lazy(() => import('./pages/categories/CategoriesList'))
+const CategoryForm = lazy(() => import('./pages/categories/CategoryForm'))
+const StockList = lazy(() => import('./pages/inventory/StockList'))
+const BranchStock = lazy(() => import('./pages/inventory/BranchStock'))
+const DailyCountList = lazy(() => import('./pages/inventory/DailyCountList'))
+const DailyCountForm = lazy(() => import('./pages/inventory/DailyCountForm'))
+const DailyCountDetail = lazy(() => import('./pages/inventory/DailyCountDetail'))
+const ChefConsumption = lazy(() => import('./pages/inventory/ChefConsumption'))
+const ChefConsumptionForm = lazy(() => import('./pages/inventory/ChefConsumptionForm'))
 
 // Transfers
-import TransferList from './pages/transfers/TransferList'
-import TransferForm from './pages/transfers/TransferForm'
-import TransferDetail from './pages/transfers/TransferDetail'
+const TransferList = lazy(() => import('./pages/transfers/TransferList'))
+const TransferForm = lazy(() => import('./pages/transfers/TransferForm'))
+const TransferDetail = lazy(() => import('./pages/transfers/TransferDetail'))
 
 // Damages
-import DamageList from './pages/damages/DamageList'
-import DamageForm from './pages/damages/DamageForm'
-import DamageDetail from './pages/damages/DamageDetail'
+const DamageList = lazy(() => import('./pages/damages/DamageList'))
+const DamageForm = lazy(() => import('./pages/damages/DamageForm'))
+const DamageDetail = lazy(() => import('./pages/damages/DamageDetail'))
 
 // Returns
-import ReturnsList from './pages/returns/ReturnsList'
-import SupplierReturnForm from './pages/returns/SupplierReturnForm'
-import BranchReturnForm from './pages/returns/BranchReturnForm'
-import SupplierReturnDetail from './pages/returns/SupplierReturnDetail'
-import BranchReturnDetail from './pages/returns/BranchReturnDetail'
+const ReturnsList = lazy(() => import('./pages/returns/ReturnsList'))
+const SupplierReturnForm = lazy(() => import('./pages/returns/SupplierReturnForm'))
+const BranchReturnForm = lazy(() => import('./pages/returns/BranchReturnForm'))
+const SupplierReturnDetail = lazy(() => import('./pages/returns/SupplierReturnDetail'))
+const BranchReturnDetail = lazy(() => import('./pages/returns/BranchReturnDetail'))
 
 // POS
-import POSCashier from './pages/pos/POSCashier'
-import POSKitchen from './pages/pos/POSKitchen'
-import POSManagement from './pages/pos/POSManagement'
+const POSCashier = lazy(() => import('./pages/pos/POSCashier'))
+const POSKitchen = lazy(() => import('./pages/pos/POSKitchen'))
+const POSManagement = lazy(() => import('./pages/pos/POSManagement'))
 
 // Reports
-import ReportsIndex from './pages/reports/ReportsIndex'
-import SalesReport from './pages/reports/SalesReport'
-import InventoryReport from './pages/reports/InventoryReport'
-import TransfersReport from './pages/reports/TransfersReport'
-import DamagesReport from './pages/reports/DamagesReport'
-import SuppliersReport from './pages/reports/SuppliersReport'
-import SupplierStatement from './pages/reports/SupplierStatement'
-import PerformanceReport from './pages/reports/PerformanceReport'
-import CashierReport from './pages/reports/CashierReport'
+const ReportsIndex = lazy(() => import('./pages/reports/ReportsIndex'))
+const SalesReport = lazy(() => import('./pages/reports/SalesReport'))
+const InventoryReport = lazy(() => import('./pages/reports/InventoryReport'))
+const TransfersReport = lazy(() => import('./pages/reports/TransfersReport'))
+const DamagesReport = lazy(() => import('./pages/reports/DamagesReport'))
+const SuppliersReport = lazy(() => import('./pages/reports/SuppliersReport'))
+const SupplierStatement = lazy(() => import('./pages/reports/SupplierStatement'))
+const PerformanceReport = lazy(() => import('./pages/reports/PerformanceReport'))
+const CashierReport = lazy(() => import('./pages/reports/CashierReport'))
 
 // Purchase
-import PurchaseDashboard from './pages/purchase/PurchaseDashboard'
-import PurchaseRequestList from './pages/purchase/PurchaseRequestList'
-import PurchaseRequestForm from './pages/purchase/PurchaseRequestForm'
-import PurchaseOrderList from './pages/purchase/PurchaseOrderList'
-import PurchaseOrderForm from './pages/purchase/PurchaseOrderForm'
-import PurchaseOrderDetail from './pages/purchase/PurchaseOrderDetail'
+const PurchaseDashboard = lazy(() => import('./pages/purchase/PurchaseDashboard'))
+const PurchaseRequestList = lazy(() => import('./pages/purchase/PurchaseRequestList'))
+const PurchaseRequestForm = lazy(() => import('./pages/purchase/PurchaseRequestForm'))
+const PurchaseRequestDetail = lazy(() => import('./pages/purchase/PurchaseRequestDetail'))
+const PurchaseOrderList = lazy(() => import('./pages/purchase/PurchaseOrderList'))
+const PurchaseOrderForm = lazy(() => import('./pages/purchase/PurchaseOrderForm'))
+const PurchaseOrderDetail = lazy(() => import('./pages/purchase/PurchaseOrderDetail'))
 
 // Recipes
-import RecipeList from './pages/recipes/RecipeList'
-import RecipeForm from './pages/recipes/RecipeForm'
-import RecipeDetail from './pages/recipes/RecipeDetail'
-import ProduceRecipe from './pages/recipes/ProduceRecipe'
-import RecipeImport from './pages/recipes/RecipeImport'
+const RecipeList = lazy(() => import('./pages/recipes/RecipeList'))
+const RecipeForm = lazy(() => import('./pages/recipes/RecipeForm'))
+const RecipeDetail = lazy(() => import('./pages/recipes/RecipeDetail'))
+const ProduceRecipe = lazy(() => import('./pages/recipes/ProduceRecipe'))
+const RecipeImport = lazy(() => import('./pages/recipes/RecipeImport'))
 
 // Orders
-import OrdersList from './pages/orders/OrdersList'
-import OrderDetail from './pages/orders/OrderDetail'
-import OrderEdit from './pages/orders/OrderEdit'
+const OrdersList = lazy(() => import('./pages/orders/OrdersList'))
+const OrderDetail = lazy(() => import('./pages/orders/OrderDetail'))
+const OrderEdit = lazy(() => import('./pages/orders/OrderEdit'))
 
 // Shifts
-import ShiftsList from './pages/shifts/ShiftsList'
-import ShiftDetail from './pages/shifts/ShiftDetail'
+const ShiftsList = lazy(() => import('./pages/shifts/ShiftsList'))
+const ShiftDetail = lazy(() => import('./pages/shifts/ShiftDetail'))
 
 // Users
-import UserList from './pages/users/UserList'
+const UserList = lazy(() => import('./pages/users/UserList'))
 
 // About
-import About from './pages/settings/About'
+const About = lazy(() => import('./pages/settings/About'))
 
-// Placeholder for routes not yet implemented
-const PlaceholderPage = ({ title }: { title: string }) => (
-  <div className="bg-white rounded-lg shadow-sm p-8 text-center">
-    <h1 className="text-2xl font-bold text-gray-900 mb-2">{title}</h1>
-    <p className="text-gray-600">هذه الصفحة قيد التطوير</p>
+// Fallback for anything that suspends outside the main layout
+const AppLoader = () => (
+  <div className="min-h-screen flex items-center justify-center bg-gray-100">
+    <div className="w-12 h-12 border-4 border-blue-600 border-t-transparent rounded-full animate-spin" />
   </div>
 )
 
@@ -110,130 +118,166 @@ function App() {
   return (
     <BrowserRouter basename={basename}>
       <AuthProvider>
-        <Routes>
-          {/* Public routes */}
-          <Route path="/login" element={<Login />} />
+        <Suspense fallback={<AppLoader />}>
+          <Routes>
+            {/* Public routes */}
+            <Route path="/login" element={<Login />} />
 
-          {/* Protected routes */}
-          <Route
-            element={
-              <ProtectedRoute>
-                <MainLayout />
-              </ProtectedRoute>
-            }
-          >
-            <Route path="/" element={<RoleBasedRedirect />} />
-            <Route path="/dashboard" element={<Dashboard />} />
+            {/* Signed-in area. Every page is also guarded by role (lists in components/layout/roleAccess.ts,
+                shared with the Sidebar); typing a URL the role may not open shows "غير مصرح". */}
+            <Route
+              element={
+                <ProtectedRoute>
+                  <MainLayout />
+                </ProtectedRoute>
+              }
+            >
+              <Route path="/" element={<RoleBasedRedirect />} />
+              <Route path="/about" element={<About />} />
 
-            {/* Branches */}
-            <Route path="/branches" element={<BranchList />} />
-            <Route path="/branches/new" element={<BranchForm />} />
-            <Route path="/branches/:id/edit" element={<BranchForm />} />
+              <Route element={<ProtectedRoute allowedRoles={ACCESS.dashboard} />}>
+                <Route path="/dashboard" element={<Dashboard />} />
+              </Route>
 
-            {/* Suppliers */}
-            <Route path="/suppliers" element={<SupplierList />} />
-            <Route path="/suppliers/new" element={<SupplierForm />} />
-            <Route path="/suppliers/:id" element={<PlaceholderPage title="تفاصيل المورد" />} />
-            <Route path="/suppliers/:id/edit" element={<SupplierForm />} />
-            <Route path="/suppliers/:supplierId/supply" element={<SupplyForm />} />
-            <Route path="/supplies/new" element={<SupplyForm />} />
-            <Route path="/suppliers/:supplierId/payment" element={<PaymentForm />} />
-            <Route path="/payments/new" element={<PaymentForm />} />
+              {/* Branches */}
+              <Route element={<ProtectedRoute allowedRoles={ACCESS.branches} />}>
+                <Route path="/branches" element={<BranchList />} />
+                <Route path="/branches/new" element={<BranchForm />} />
+                <Route path="/branches/:id/edit" element={<BranchForm />} />
+              </Route>
 
-            {/* Inventory */}
-            <Route path="/inventory" element={<ProtectedRoute allowedRoles={['admin']}><StockList /></ProtectedRoute>} />
-            <Route path="/inventory/items" element={<ProtectedRoute allowedRoles={['admin']}><ItemList /></ProtectedRoute>} />
-            <Route path="/inventory/items/new" element={<ItemForm />} />
-            <Route path="/inventory/items/:id/edit" element={<ProtectedRoute allowedRoles={['admin']}><ItemForm /></ProtectedRoute>} />
-            
-            {/* Categories */}
-            <Route path="/categories" element={<ProtectedRoute allowedRoles={['admin']}><CategoriesList /></ProtectedRoute>} />
-            <Route path="/categories/new" element={<ProtectedRoute allowedRoles={['admin']}><CategoryForm /></ProtectedRoute>} />
-            <Route path="/categories/:id/edit" element={<ProtectedRoute allowedRoles={['admin']}><CategoryForm /></ProtectedRoute>} />
-            
-            <Route path="/inventory/stock" element={<StockList />} />
-            <Route path="/inventory/branch" element={<BranchStock />} />
-            <Route path="/inventory/branch/:branchId" element={<BranchStock />} />
-            <Route path="/inventory/daily-count" element={<DailyCountList />} />
-            <Route path="/inventory/daily-count/new" element={<DailyCountForm />} />
-            <Route path="/inventory/daily-count/:id" element={<PlaceholderPage title="تفاصيل الجرد" />} />
-            <Route path="/inventory/chef-consumption" element={<ChefConsumption />} />
-            <Route path="/inventory/chef-consumption/new" element={<ChefConsumptionForm />} />
+              {/* Suppliers */}
+              <Route element={<ProtectedRoute allowedRoles={ACCESS.suppliers} />}>
+                <Route path="/suppliers" element={<SupplierList />} />
+                <Route path="/suppliers/new" element={<SupplierForm />} />
+                <Route path="/suppliers/:id" element={<SupplierDetail />} />
+                <Route path="/suppliers/:id/edit" element={<SupplierForm />} />
+                <Route path="/suppliers/:supplierId/supply" element={<SupplyForm />} />
+                <Route path="/supplies/new" element={<SupplyForm />} />
+                <Route path="/suppliers/:supplierId/payment" element={<PaymentForm />} />
+                <Route path="/payments/new" element={<PaymentForm />} />
+              </Route>
 
-            {/* Transfers */}
-            <Route path="/transfers" element={<TransferList />} />
-            <Route path="/transfers/new" element={<TransferForm />} />
-            <Route path="/transfers/:id" element={<TransferDetail />} />
+              {/* Inventory (the stock list is the same admin screen at /inventory and /inventory/stock) */}
+              <Route element={<ProtectedRoute allowedRoles={ACCESS.inventory} />}>
+                <Route path="/inventory" element={<StockList />} />
+                <Route path="/inventory/stock" element={<StockList />} />
+                <Route path="/inventory/items" element={<ItemList />} />
+                <Route path="/inventory/items/:id/edit" element={<ItemForm />} />
+              </Route>
+              <Route element={<ProtectedRoute allowedRoles={ACCESS.itemCreate} />}>
+                <Route path="/inventory/items/new" element={<ItemForm />} />
+              </Route>
+              <Route element={<ProtectedRoute allowedRoles={ACCESS.branchStock} />}>
+                <Route path="/inventory/branch" element={<BranchStock />} />
+                <Route path="/inventory/branch/:branchId" element={<BranchStock />} />
+              </Route>
+              <Route element={<ProtectedRoute allowedRoles={ACCESS.dailyCount} />}>
+                <Route path="/inventory/daily-count" element={<DailyCountList />} />
+                <Route path="/inventory/daily-count/new" element={<DailyCountForm />} />
+                <Route path="/inventory/daily-count/:id" element={<DailyCountDetail />} />
+              </Route>
+              <Route element={<ProtectedRoute allowedRoles={ACCESS.chefConsumption} />}>
+                <Route path="/inventory/chef-consumption" element={<ChefConsumption />} />
+                <Route path="/inventory/chef-consumption/new" element={<ChefConsumptionForm />} />
+              </Route>
 
-            {/* Damages */}
-            <Route path="/damages" element={<DamageList />} />
-            <Route path="/damages/new" element={<DamageForm />} />
-            <Route path="/damages/:id" element={<DamageDetail />} />
+              {/* Categories */}
+              <Route element={<ProtectedRoute allowedRoles={ACCESS.categories} />}>
+                <Route path="/categories" element={<CategoriesList />} />
+                <Route path="/categories/new" element={<CategoryForm />} />
+                <Route path="/categories/:id/edit" element={<CategoryForm />} />
+              </Route>
 
-            {/* Returns */}
-            <Route path="/returns" element={<ReturnsList />} />
-            <Route path="/returns/supplier/new" element={<SupplierReturnForm />} />
-            <Route path="/returns/supplier/:id" element={<SupplierReturnDetail />} />
-            <Route path="/returns/branch/new" element={<BranchReturnForm />} />
-            <Route path="/returns/branch/:id" element={<BranchReturnDetail />} />
+              {/* Transfers, damages, returns */}
+              <Route element={<ProtectedRoute allowedRoles={ACCESS.stockMovements} />}>
+                <Route path="/transfers" element={<TransferList />} />
+                <Route path="/transfers/new" element={<TransferForm />} />
+                <Route path="/transfers/:id" element={<TransferDetail />} />
 
-            {/* Recipes */}
-            <Route path="/recipes" element={<RecipeList />} />
-            <Route path="/recipes/new" element={<RecipeForm />} />
-            <Route path="/recipes/import" element={<RecipeImport />} />
-            <Route path="/recipes/produce" element={<ProduceRecipe />} />
-            <Route path="/recipes/:id" element={<RecipeDetail />} />
-            <Route path="/recipes/:id/edit" element={<RecipeForm />} />
+                <Route path="/damages" element={<DamageList />} />
+                <Route path="/damages/new" element={<DamageForm />} />
+                <Route path="/damages/:id" element={<DamageDetail />} />
 
-            {/* POS */}
-            <Route path="/pos/cashier" element={<POSCashier />} />
-            <Route path="/pos/kitchen" element={<POSKitchen />} />
-            <Route path="/pos/management" element={<POSManagement />} />
+                <Route path="/returns" element={<ReturnsList />} />
+                <Route path="/returns/supplier/new" element={<SupplierReturnForm />} />
+                <Route path="/returns/supplier/:id" element={<SupplierReturnDetail />} />
+                <Route path="/returns/branch/new" element={<BranchReturnForm />} />
+                <Route path="/returns/branch/:id" element={<BranchReturnDetail />} />
+              </Route>
 
-            {/* Orders (Admin) */}
-            <Route path="/orders" element={<OrdersList />} />
-            <Route path="/orders/:id" element={<OrderDetail />} />
-            <Route path="/orders/:id/edit" element={<OrderEdit />} />
+              {/* Recipes */}
+              <Route element={<ProtectedRoute allowedRoles={ACCESS.recipes} />}>
+                <Route path="/recipes" element={<RecipeList />} />
+                <Route path="/recipes/new" element={<RecipeForm />} />
+                <Route path="/recipes/import" element={<RecipeImport />} />
+                <Route path="/recipes/produce" element={<ProduceRecipe />} />
+                <Route path="/recipes/:id" element={<RecipeDetail />} />
+                <Route path="/recipes/:id/edit" element={<RecipeForm />} />
+              </Route>
 
-            {/* Shifts */}
-            <Route path="/shifts" element={<ShiftsList />} />
-            <Route path="/shifts/:id" element={<ShiftDetail />} />
+              {/* POS */}
+              <Route element={<ProtectedRoute allowedRoles={ACCESS.posCashier} />}>
+                <Route path="/pos/cashier" element={<POSCashier />} />
+              </Route>
+              <Route element={<ProtectedRoute allowedRoles={ACCESS.posKitchen} />}>
+                <Route path="/pos/kitchen" element={<POSKitchen />} />
+              </Route>
+              <Route element={<ProtectedRoute allowedRoles={ACCESS.posManagement} />}>
+                <Route path="/pos/management" element={<POSManagement />} />
+              </Route>
 
-            {/* Reports */}
-            <Route path="/reports" element={<ReportsIndex />} />
-            <Route path="/reports/sales" element={<SalesReport />} />
-            <Route path="/reports/inventory" element={<InventoryReport />} />
-            <Route path="/reports/suppliers" element={<SuppliersReport />} />
-            <Route path="/reports/supplier-statement" element={<SupplierStatement />} />
-            <Route path="/reports/transfers" element={<TransfersReport />} />
-            <Route path="/reports/damages" element={<DamagesReport />} />
-            <Route path="/reports/performance" element={<PerformanceReport />} />
-            <Route path="/reports/cashier" element={<CashierReport />} />
+              {/* Orders (Admin) */}
+              <Route element={<ProtectedRoute allowedRoles={ACCESS.orders} />}>
+                <Route path="/orders" element={<OrdersList />} />
+                <Route path="/orders/:id" element={<OrderDetail />} />
+                <Route path="/orders/:id/edit" element={<OrderEdit />} />
+              </Route>
 
-            {/* Purchase */}
-            <Route path="/purchase" element={<PurchaseDashboard />} />
-            <Route path="/purchase/requests" element={<PurchaseRequestList />} />
-            <Route path="/purchase/requests/new" element={<PurchaseRequestForm />} />
-            <Route path="/purchase/requests/:id" element={<PlaceholderPage title="تفاصيل طلب الشراء" />} />
-            <Route path="/purchase/orders" element={<PurchaseOrderList />} />
-            <Route path="/purchase/orders/new" element={<PurchaseOrderForm />} />
-            <Route path="/purchase/orders/:id" element={<PurchaseOrderDetail />} />
+              {/* Shifts */}
+              <Route element={<ProtectedRoute allowedRoles={ACCESS.shifts} />}>
+                <Route path="/shifts" element={<ShiftsList />} />
+                <Route path="/shifts/:id" element={<ShiftDetail />} />
+              </Route>
 
-            {/* Users */}
-            <Route path="/users" element={<UserList />} />
-            <Route path="/users/new" element={<PlaceholderPage title="مستخدم جديد" />} />
-            <Route path="/users/:id/edit" element={<PlaceholderPage title="تعديل المستخدم" />} />
+              {/* Reports */}
+              <Route element={<ProtectedRoute allowedRoles={ACCESS.reports} />}>
+                <Route path="/reports" element={<ReportsIndex />} />
+                <Route path="/reports/sales" element={<SalesReport />} />
+                <Route path="/reports/inventory" element={<InventoryReport />} />
+                <Route path="/reports/suppliers" element={<SuppliersReport />} />
+                <Route path="/reports/transfers" element={<TransfersReport />} />
+                <Route path="/reports/damages" element={<DamagesReport />} />
+                <Route path="/reports/performance" element={<PerformanceReport />} />
+                <Route path="/reports/cashier" element={<CashierReport />} />
+              </Route>
+              <Route element={<ProtectedRoute allowedRoles={ACCESS.supplierStatement} />}>
+                <Route path="/reports/supplier-statement" element={<SupplierStatement />} />
+              </Route>
 
-            {/* About */}
-            <Route path="/about" element={<About />} />
+              {/* Purchase */}
+              <Route element={<ProtectedRoute allowedRoles={ACCESS.purchase} />}>
+                <Route path="/purchase" element={<PurchaseDashboard />} />
+                <Route path="/purchase/requests" element={<PurchaseRequestList />} />
+                <Route path="/purchase/requests/new" element={<PurchaseRequestForm />} />
+                <Route path="/purchase/requests/:id" element={<PurchaseRequestDetail />} />
+                <Route path="/purchase/orders" element={<PurchaseOrderList />} />
+                <Route path="/purchase/orders/new" element={<PurchaseOrderForm />} />
+                <Route path="/purchase/orders/:id" element={<PurchaseOrderDetail />} />
+              </Route>
 
-            {/* Catch all inside protected area - redirect to dashboard */}
-            <Route path="*" element={<Navigate to="/dashboard" replace />} />
-          </Route>
+              {/* Users: /users/new and /users/:id/edit open the add / edit form on the users screen */}
+              <Route element={<ProtectedRoute allowedRoles={ACCESS.users} />}>
+                <Route path="/users" element={<UserList />} />
+                <Route path="/users/new" element={<UserList />} />
+                <Route path="/users/:id/edit" element={<UserList />} />
+              </Route>
 
-          {/* Public catch-all - redirect to login */}
-          <Route path="*" element={<Navigate to="/login" replace />} />
-        </Routes>
+              {/* Any other address (signed-out visitors are sent to the login page first) */}
+              <Route path="*" element={<NotFound />} />
+            </Route>
+          </Routes>
+        </Suspense>
       </AuthProvider>
     </BrowserRouter>
   )

@@ -1,14 +1,16 @@
-import { Navigate, useLocation } from 'react-router-dom'
+import { Link, Navigate, Outlet, useLocation } from 'react-router-dom'
 import { useAuth } from '../../contexts/AuthContext'
 import { UserRole } from '../../types/database.types'
+import { getUserRole } from './roleAccess'
 
 interface ProtectedRouteProps {
-  children: React.ReactNode
+  // Without children it guards the nested routes (used as a layout route: <Route element={<ProtectedRoute .../>}>)
+  children?: React.ReactNode
   allowedRoles?: UserRole[]
 }
 
 export default function ProtectedRoute({ children, allowedRoles }: ProtectedRouteProps) {
-  const { isAuthenticated, loading, user } = useAuth()
+  const { isAuthenticated, loading, user, signedOutByUser } = useAuth()
   const location = useLocation()
 
   // Show loading spinner while checking auth
@@ -23,19 +25,17 @@ export default function ProtectedRoute({ children, allowedRoles }: ProtectedRout
     )
   }
 
-  // Redirect to login if not authenticated
+  // Redirect to login if not authenticated. The page is remembered so the user comes back to it after signing
+  // in (deep link, expired session), but not after pressing logout: the next user starts on their own home page.
   if (!isAuthenticated) {
-    return <Navigate to="/login" state={{ from: location }} replace />
+    return <Navigate to="/login" state={signedOutByUser ? undefined : { from: location }} replace />
   }
 
-  // Check role-based access
+  // Check role-based access (role comes from the profile loaded from the database at sign-in)
   if (allowedRoles && user) {
-    // Handle role as object (from join) or string
-    const userRole = typeof user.role === 'object' && user.role !== null 
-      ? (user.role as { name: string }).name 
-      : user.role
-    
-    if (!allowedRoles.includes(userRole as UserRole)) {
+    const userRole = getUserRole(user)
+
+    if (!userRole || !allowedRoles.includes(userRole)) {
       return (
         <div className="min-h-screen flex items-center justify-center bg-gray-100">
           <div className="text-center bg-white p-8 rounded-lg shadow-lg max-w-md">
@@ -46,17 +46,17 @@ export default function ProtectedRoute({ children, allowedRoles }: ProtectedRout
             </div>
             <h2 className="text-xl font-bold text-gray-900 mb-2">غير مصرح</h2>
             <p className="text-gray-600 mb-6">ليس لديك صلاحية للوصول إلى هذه الصفحة</p>
-            <a
-              href="/"
+            <Link
+              to="/"
               className="inline-block px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
             >
               العودة للرئيسية
-            </a>
+            </Link>
           </div>
         </div>
       )
     }
   }
 
-  return <>{children}</>
+  return <>{children ?? <Outlet />}</>
 }

@@ -1,11 +1,26 @@
 import { createClient } from '@supabase/supabase-js'
 
-// Supabase configuration - reads from environment variables with fallback to production values
-const supabaseUrl = import.meta.env.VITE_SUPABASE_URL || 'https://hqjwhhqcymgkwohlofvf.supabase.co'
-const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImhxandoaHFjeW1na3dvaGxvZnZmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzU3MzU0NjIsImV4cCI6MjA5MTMxMTQ2Mn0.nXBqG9P7_6I5eqxtMxaaSKr2NM5PTdkhC6jZH0GJu08'
+// Supabase configuration comes only from the build environment (.env.local / the hosting provider's
+// environment variables). There is deliberately no fallback: a build without them must not silently talk
+// to some other project.
+const supabaseUrl = (import.meta.env.VITE_SUPABASE_URL as string | undefined)?.trim()
+const supabaseAnonKey = (import.meta.env.VITE_SUPABASE_ANON_KEY as string | undefined)?.trim()
 
-// Check if we have valid credentials
-export const hasValidCredentials = Boolean(supabaseUrl && supabaseAnonKey && supabaseUrl !== 'https://placeholder.supabase.co')
+if (!supabaseUrl || !supabaseAnonKey) {
+  const message =
+    'Missing Supabase configuration: set VITE_SUPABASE_URL and VITE_SUPABASE_ANON_KEY (see .env.example) and rebuild.'
+  if (typeof document !== 'undefined') {
+    document.body.innerHTML =
+      '<div dir="rtl" style="font-family:sans-serif;max-width:640px;margin:15vh auto;padding:24px;border:1px solid #fecaca;background:#fef2f2;border-radius:8px;color:#991b1b">' +
+      '<h1 style="font-size:20px;margin:0 0 8px">خطأ في إعدادات النظام</h1>' +
+      '<p style="margin:0 0 8px">لم يتم ضبط بيانات الاتصال بقاعدة البيانات لهذه النسخة. تواصل مع الدعم الفني.</p>' +
+      `<p dir="ltr" style="margin:0;font-size:13px;color:#7f1d1d">${message}</p></div>`
+  }
+  throw new Error(message)
+}
+
+// Where supabase-js keeps the signed-in session (its default key, spelled out so sign-out can always clear it)
+export const AUTH_STORAGE_KEY = `sb-${new URL(supabaseUrl).hostname.split('.')[0]}-auth-token`
 
 export const supabase = createClient(
   supabaseUrl,
@@ -14,6 +29,7 @@ export const supabase = createClient(
     auth: {
       persistSession: true,
       autoRefreshToken: true,
+      storageKey: AUTH_STORAGE_KEY,
     },
     realtime: {
       params: {

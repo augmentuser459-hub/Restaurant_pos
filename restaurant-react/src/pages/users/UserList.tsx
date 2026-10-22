@@ -1,11 +1,21 @@
 import { useEffect, useState } from 'react'
+import { useMatch, useNavigate, useParams } from 'react-router-dom'
 import { usersService, UserWithDetails } from '../../services/users.service'
+import { useAuth } from '../../contexts/AuthContext'
+import { toUserMessage } from '../../lib/errors'
 import { Users, Mail, Phone, Building2, Shield, CheckCircle, XCircle, Plus, Edit, Trash2 } from 'lucide-react'
 import UserFormModal from './UserFormModal'
 
 export default function UserList() {
+  const { user: currentUser, refreshProfile } = useAuth()
+  const navigate = useNavigate()
+  // /users/new and /users/:id/edit open the form directly
+  const isNewRoute = useMatch('/users/new') !== null
+  const { id: routeEditId } = useParams()
+
   const [users, setUsers] = useState<UserWithDetails[]>([])
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState('')
   const [filter, setFilter] = useState<'all' | 'active' | 'inactive'>('all')
   const [showModal, setShowModal] = useState(false)
   const [editingUser, setEditingUser] = useState<UserWithDetails | null>(null)
@@ -15,9 +25,32 @@ export default function UserList() {
     fetchUsers()
   }, [])
 
+  // Open the form requested by the URL once the list is loaded
+  useEffect(() => {
+    if (loading || loadError) return
+    if (isNewRoute) {
+      setEditingUser(null)
+      setShowModal(true)
+    } else if (routeEditId) {
+      const target = users.find(u => u.id === routeEditId)
+      if (target) {
+        setEditingUser(target)
+        setShowModal(true)
+      } else {
+        alert('المستخدم غير موجود')
+        navigate('/users', { replace: true })
+      }
+    }
+  }, [loading, loadError, isNewRoute, routeEditId])
+
   const fetchUsers = async () => {
-    const { data } = await usersService.getAll()
-    setUsers(data || [])
+    const { data, error } = await usersService.getAll()
+    if (error) {
+      setLoadError(toUserMessage(error, 'تعذر تحميل المستخدمين، حاول مرة أخرى'))
+    } else {
+      setLoadError('')
+      setUsers(data || [])
+    }
     setLoading(false)
   }
 
@@ -32,25 +65,33 @@ export default function UserList() {
   }
 
   const handleDeleteUser = async (userId: string) => {
+    if (deletingUserId) return
     if (!confirm('هل أنت متأكد من حذف هذا المستخدم؟')) return
 
     setDeletingUserId(userId)
-    const { error } = await usersService.delete(userId)
-    
-    if (error) {
-      alert('حدث خطأ أثناء حذف المستخدم')
-      console.error(error)
-    } else {
-      await fetchUsers()
+    try {
+      const { error } = await usersService.delete(userId)
+      if (error) {
+        alert(toUserMessage(error, 'حدث خطأ أثناء حذف المستخدم'))
+      } else {
+        await fetchUsers()
+      }
+    } finally {
+      setDeletingUserId(null)
     }
-    setDeletingUserId(null)
   }
 
   const handleModalClose = async (success: boolean) => {
+    const editedSelf = !!editingUser && editingUser.id === currentUser?.id
     setShowModal(false)
     setEditingUser(null)
+    if (isNewRoute || routeEditId) {
+      navigate('/users', { replace: true })
+    }
     if (success) {
       await fetchUsers()
+      // The admin edited their own account: refresh the name/branch shown in the app
+      if (editedSelf) await refreshProfile()
     }
   }
 
@@ -87,6 +128,7 @@ export default function UserList() {
           <p className="text-gray-600">إدارة مستخدمي النظام</p>
         </div>
         <button
+          type="button"
           onClick={handleAddUser}
           className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
         >
@@ -94,6 +136,22 @@ export default function UserList() {
           إضافة مستخدم
         </button>
       </div>
+
+      {loadError && (
+        <div className="p-4 bg-red-50 border border-red-200 rounded-lg flex items-center justify-between gap-3">
+          <p className="text-red-700 text-sm">{loadError}</p>
+          <button
+            type="button"
+            onClick={() => {
+              setLoading(true)
+              fetchUsers()
+            }}
+            className="px-3 py-1.5 bg-white text-red-700 border border-red-300 rounded-lg hover:bg-red-100 text-sm"
+          >
+            إعادة المحاولة
+          </button>
+        </div>
+      )}
 
       {/* Filters */}
       <div className="flex gap-2">
@@ -161,26 +219,31 @@ export default function UserList() {
                 {/* Action Buttons */}
                 <div className="mt-4 flex gap-2">
                   <button
+                    type="button"
                     onClick={() => handleEditUser(user)}
                     className="flex-1 flex items-center justify-center gap-1 px-3 py-1.5 bg-blue-50 text-blue-600 rounded-lg hover:bg-blue-100 transition-colors text-sm"
                   >
                     <Edit className="w-4 h-4" />
                     تعديل
                   </button>
-                  <button
-                    onClick={() => handleDeleteUser(user.id)}
-                    disabled={deletingUserId === user.id}
-                    className="flex-1 flex items-center justify-center gap-1 px-3 py-1.5 bg-red-50 text-red-600 rounded-lg hover:bg-red-100 transition-colors text-sm disabled:opacity-50"
-                  >
-                    {deletingUserId === user.id ? (
-                      <div className="w-4 h-4 border-2 border-red-600 border-t-transparent rounded-full animate-spin" />
-                    ) : (
-                      <>
-                        <Trash2 className="w-4 h-4" />
-                        حذف
-                      </>
-                    )}
-                  </button>
+                  {/* An admin can't delete their own account */}
+                  {user.id !== currentUser?.id && (
+                    <button
+                      type="button"
+                      onClick={() => handleDeleteUser(user.id)}
+                      disabled={deletingUserId !== null}
+                      className="flex-1 flex items-center justify-center gap-1 px-3 py-1.5 bg-red-50 text-red-600 rounded-lg hover:bg-red-100 transition-colors text-sm disabled:opacity-50"
+                    >
+                      {deletingUserId === user.id ? (
+                        <div className="w-4 h-4 border-2 border-red-600 border-t-transparent rounded-full animate-spin" />
+                      ) : (
+                        <>
+                          <Trash2 className="w-4 h-4" />
+                          حذف
+                        </>
+                      )}
+                    </button>
+                  )}
                 </div>
               </div>
             </div>
@@ -188,7 +251,7 @@ export default function UserList() {
         ))}
       </div>
 
-      {filteredUsers.length === 0 && (
+      {filteredUsers.length === 0 && !loadError && (
         <div className="text-center py-12 bg-white rounded-lg shadow-sm">
           <Users className="w-12 h-12 text-gray-400 mx-auto mb-4" />
           <h3 className="text-lg font-medium text-gray-900 mb-2">لا يوجد مستخدمين</h3>
@@ -200,6 +263,7 @@ export default function UserList() {
       {showModal && (
         <UserFormModal
           user={editingUser}
+          isSelf={!!editingUser && editingUser.id === currentUser?.id}
           onClose={handleModalClose}
         />
       )}

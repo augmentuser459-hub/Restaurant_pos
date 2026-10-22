@@ -2,10 +2,25 @@ import { useState, useEffect } from 'react'
 import { X, Eye, EyeOff } from 'lucide-react'
 import { usersService, UserWithDetails, CreateUserData, UpdateUserData } from '../../services/users.service'
 import { branchesService } from '../../services/branches.service'
+import { toUserMessage } from '../../lib/errors'
 
 interface UserFormModalProps {
   user: UserWithDetails | null
+  /** The signed-in admin is editing their own account (role and status can't be changed) */
+  isSelf?: boolean
   onClose: (success: boolean) => void
+}
+
+// Typing only the name part (e.g. "casher5") gives "casher5@restaurant.com"
+const DEFAULT_EMAIL_DOMAIN = '@restaurant.com'
+const EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+// Same limits as the database (010_auth.sql) and Supabase Auth
+const MIN_PASSWORD_LENGTH = 6
+const MAX_PASSWORD_BYTES = 72
+
+function normalizeEmail(value: string): string {
+  const email = value.trim().toLowerCase()
+  return email && !email.includes('@') ? email + DEFAULT_EMAIL_DOMAIN : email
 }
 
 interface Role {
@@ -26,14 +41,17 @@ interface Category {
   code: string
 }
 
-export default function UserFormModal({ user, onClose }: UserFormModalProps) {
+export default function UserFormModal({ user, isSelf = false, onClose }: UserFormModalProps) {
   const [loading, setLoading] = useState(false)
   const [roles, setRoles] = useState<Role[]>([])
   const [branches, setBranches] = useState<Branch[]>([])
   const [categories, setCategories] = useState<Category[]>([])
   const [selectedCategories, setSelectedCategories] = useState<string[]>([])
+  // The edited user's saved POS categories: until they are loaded the form must not overwrite them
+  const [userCategoriesState, setUserCategoriesState] = useState<'loading' | 'loaded' | 'failed'>(user ? 'loading' : 'loaded')
   const [showPassword, setShowPassword] = useState(false)
-  
+  const [loadError, setLoadError] = useState('')
+
   const [formData, setFormData] = useState({
     username: user?.username || '',
     email: user?.email || '',
@@ -60,24 +78,38 @@ export default function UserFormModal({ user, onClose }: UserFormModalProps) {
       usersService.getRoles(),
       branchesService.getActive()
     ])
-    
-    setRoles(rolesRes.data || [])
-    setBranches(branchesRes.data || [])
+
+    if (rolesRes.error || branchesRes.error) {
+      setLoadError(toUserMessage(rolesRes.error || branchesRes.error, 'تعذر تحميل الأدوار والفروع، أغلق النافذة وحاول مرة أخرى'))
+    }
+    setRoles((rolesRes.data as Role[] | null) || [])
+    const branchList = ((branchesRes.data as Branch[] | null) || []).slice()
+    // Keep the user's current branch selectable even if it is no longer active
+    if (user?.branch && !branchList.some(b => b.id === user.branch?.id)) {
+      branchList.push(user.branch)
+    }
+    setBranches(branchList)
   }
 
   const fetchCategories = async () => {
     const { data, error } = await usersService.getCategories()
-    if (!error && data) {
-      setCategories(data)
+    if (error) {
+      setLoadError(toUserMessage(error, 'تعذر تحميل المجموعات، أغلق النافذة وحاول مرة أخرى'))
+      return
     }
+    setCategories((data as Category[] | null) || [])
   }
 
   const fetchUserCategories = async () => {
     if (!user) return
     const { data, error } = await usersService.getUserCategories(user.id)
-    if (!error && data) {
-      setSelectedCategories(data.map((c: any) => c.category_id))
+    if (error) {
+      setLoadError(toUserMessage(error, 'تعذر تحميل مجموعات الكاشير، أغلق النافذة وحاول مرة أخرى'))
+      setUserCategoriesState('failed')
+      return
     }
+    setSelectedCategories(((data as { category_id: string }[] | null) || []).map(c => c.category_id))
+    setUserCategoriesState('loaded')
   }
 
   const handleCategoryToggle = (categoryId: string) => {
@@ -88,22 +120,41 @@ export default function UserFormModal({ user, onClose }: UserFormModalProps) {
     )
   }
 
+  const selectedRole = roles.find(r => r.id === formData.role_id)
+  // Only admin and purchase_manager don't need a branch
+  // Everyone else (including warehouse_manager) needs to be assigned to a branch/warehouse
+  const needsBranch = !!selectedRole && !['admin', 'purchase_manager'].includes(selectedRole.name)
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
-    
+    if (loading) return
+
+    const email = normalizeEmail(formData.email)
+    const password = formData.password
+
     // Validation
-    if (!formData.username.trim()) {
+    if (!user && !formData.username.trim()) {
       alert('يرجى إدخال اسم المستخدم')
       return
     }
 
-    if (!formData.email.includes('@restaurant.com')) {
-      alert('البريد الإلكتروني يجب أن ينتهي بـ @restaurant.com')
+    if (!EMAIL_PATTERN.test(email)) {
+      alert('يرجى إدخال بريد إلكتروني صحيح، مثل name@restaurant.com')
       return
     }
 
-    if (!user && !formData.password) {
+    if (!user && !password) {
       alert('يرجى إدخال كلمة المرور')
+      return
+    }
+
+    if (password && password.length < MIN_PASSWORD_LENGTH) {
+      alert(`كلمة المرور يجب أن تكون ${MIN_PASSWORD_LENGTH} أحرف على الأقل`)
+      return
+    }
+
+    if (password && new TextEncoder().encode(password).length > MAX_PASSWORD_BYTES) {
+      alert('كلمة المرور طويلة جداً')
       return
     }
 
@@ -112,10 +163,23 @@ export default function UserFormModal({ user, onClose }: UserFormModalProps) {
       return
     }
 
-    if (!formData.role_id) {
+    if (!formData.role_id || !selectedRole) {
       alert('يرجى اختيار الدور الوظيفي')
       return
     }
+
+    if (needsBranch && !formData.branch_id) {
+      alert(selectedRole.name === 'warehouse_manager' ? 'يرجى اختيار المستودع' : 'يرجى اختيار الفرع')
+      return
+    }
+
+    // Roles without a branch never keep an old one; blank optional fields are cleared
+    const branchId = needsBranch ? formData.branch_id : null
+    const employeeCode = formData.employee_code.trim() || null
+    const phone = formData.phone.trim() || null
+    // Cashier POS categories are saved in the same request; for other roles, or when the saved set could not be
+    // loaded, they are left untouched (an empty list would remove all of the cashier's restrictions)
+    const cashierCategoryIds = selectedRole.name === 'cashier' && userCategoriesState === 'loaded' ? selectedCategories : null
 
     setLoading(true)
 
@@ -123,59 +187,49 @@ export default function UserFormModal({ user, onClose }: UserFormModalProps) {
       if (user) {
         // Update existing user
         const updateData: UpdateUserData = {
-          email: formData.email,
-          full_name: formData.full_name,
-          full_name_ar: formData.full_name_ar,
-          employee_code: formData.employee_code || undefined,
-          phone: formData.phone || undefined,
+          email,
+          full_name: formData.full_name.trim(),
+          full_name_ar: formData.full_name_ar.trim(),
+          employee_code: employeeCode,
+          phone,
           role_id: formData.role_id,
-          branch_id: formData.branch_id || null,
-          status: formData.status as 'active' | 'inactive',
+          branch_id: branchId,
+          status: formData.status,
+          cashier_category_ids: cashierCategoryIds,
         }
 
         // Only include password if it was changed
-        if (formData.password) {
-          updateData.password = formData.password
+        if (password) {
+          updateData.password = password
         }
 
         const { error } = await usersService.update(user.id, updateData)
-        
-        if (error) {
-          alert('حدث خطأ أثناء تحديث المستخدم')
-          console.error(error)
-          return
-        }
 
-        // Update category permissions if cashier
-        if (selectedRole?.name === 'cashier') {
-          await usersService.updateUserCategories(user.id, selectedCategories)
+        if (error) {
+          alert(toUserMessage(error, 'حدث خطأ أثناء تحديث المستخدم'))
+          return
         }
       } else {
-        // Create new user
+        // Create new user (and their login account)
         const createData: CreateUserData = {
-          username: formData.username,
-          email: formData.email,
-          password: formData.password,
-          full_name: formData.full_name,
-          full_name_ar: formData.full_name_ar,
-          employee_code: formData.employee_code || undefined,
-          phone: formData.phone || undefined,
+          username: formData.username.trim(),
+          email,
+          password,
+          full_name: formData.full_name.trim(),
+          full_name_ar: formData.full_name_ar.trim(),
+          employee_code: employeeCode,
+          phone,
           role_id: formData.role_id,
-          branch_id: formData.branch_id || null,
-          status: formData.status as 'active' | 'inactive',
+          branch_id: branchId,
+          status: formData.status === 'inactive' ? 'inactive' : 'active',
+          cashier_category_ids: cashierCategoryIds,
         }
 
-        const { data: newUser, error } = await usersService.create(createData)
-        
+        const { error } = await usersService.create(createData)
+
         if (error) {
-          alert('حدث خطأ أثناء إضافة المستخدم')
-          console.error(error)
+          alert(toUserMessage(error, 'حدث خطأ أثناء إضافة المستخدم'))
           return
-        }
-
-        // Set category permissions if cashier
-        if (selectedRole?.name === 'cashier' && newUser) {
-          await usersService.updateUserCategories(newUser.id, selectedCategories)
         }
       }
 
@@ -184,11 +238,6 @@ export default function UserFormModal({ user, onClose }: UserFormModalProps) {
       setLoading(false)
     }
   }
-
-  const selectedRole = roles.find(r => r.id === formData.role_id)
-  // Only admin and purchase_manager don't need a branch
-  // Everyone else (including warehouse_manager) needs to be assigned to a branch/warehouse
-  const needsBranch = selectedRole && !['admin', 'purchase_manager'].includes(selectedRole.name)
 
   return (
     <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
@@ -199,8 +248,12 @@ export default function UserFormModal({ user, onClose }: UserFormModalProps) {
             {user ? 'تعديل مستخدم' : 'إضافة مستخدم جديد'}
           </h2>
           <button
+            type="button"
             onClick={() => onClose(false)}
-            className="text-gray-400 hover:text-gray-600"
+            disabled={loading}
+            className="text-gray-400 hover:text-gray-600 disabled:opacity-50"
+            title="إغلاق"
+            aria-label="إغلاق"
           >
             <X className="w-6 h-6" />
           </button>
@@ -208,6 +261,10 @@ export default function UserFormModal({ user, onClose }: UserFormModalProps) {
 
         {/* Form */}
         <form onSubmit={handleSubmit} className="p-6 space-y-4">
+          {loadError && (
+            <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-sm text-red-700">{loadError}</div>
+          )}
+
           {/* Username (only for new users) */}
           {!user && (
             <div>
@@ -230,19 +287,20 @@ export default function UserFormModal({ user, onClose }: UserFormModalProps) {
             <label className="block text-sm font-medium text-gray-700 mb-1">
               البريد الإلكتروني <span className="text-red-500">*</span>
             </label>
-            <div className="flex gap-2">
-              <input
-                type="text"
-                value={formData.email.replace('@restaurant.com', '')}
-                onChange={(e) => setFormData({ ...formData, email: e.target.value + '@restaurant.com' })}
-                className="flex-1 px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                placeholder="username"
-                required
-              />
-              <div className="px-3 py-2 bg-gray-100 border border-gray-300 rounded-lg text-gray-600">
-                @restaurant.com
-              </div>
-            </div>
+            <input
+              type="text"
+              inputMode="email"
+              value={formData.email}
+              onChange={(e) => setFormData({ ...formData, email: e.target.value })}
+              className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+              placeholder="name@restaurant.com"
+              autoComplete="off"
+              dir="ltr"
+              required
+            />
+            <p className="text-xs text-gray-500 mt-1">
+              يُستخدم لتسجيل الدخول. إذا كتبت الاسم فقط ستتم إضافة {DEFAULT_EMAIL_DOMAIN} تلقائياً.
+            </p>
           </div>
 
           {/* Password */}
@@ -258,16 +316,23 @@ export default function UserFormModal({ user, onClose }: UserFormModalProps) {
                 onChange={(e) => setFormData({ ...formData, password: e.target.value })}
                 className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
                 placeholder="••••••••"
+                autoComplete="new-password"
+                dir="ltr"
                 required={!user}
               />
               <button
                 type="button"
                 onClick={() => setShowPassword(!showPassword)}
                 className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600"
+                title={showPassword ? 'إخفاء كلمة المرور' : 'إظهار كلمة المرور'}
+                aria-label={showPassword ? 'إخفاء كلمة المرور' : 'إظهار كلمة المرور'}
               >
                 {showPassword ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
               </button>
             </div>
+            <p className="text-xs text-gray-500 mt-1">
+              {MIN_PASSWORD_LENGTH} أحرف على الأقل. يمكن للموظف تغييرها بعد الدخول من قائمة المستخدم.
+            </p>
             {user && (
               <p className="text-xs text-gray-500 mt-1">
                 ملاحظة: كلمات المرور مشفرة ولا يمكن عرضها. اترك الحقل فارغاً للاحتفاظ بكلمة المرور الحالية.
@@ -341,7 +406,8 @@ export default function UserFormModal({ user, onClose }: UserFormModalProps) {
             <select
               value={formData.role_id}
               onChange={(e) => setFormData({ ...formData, role_id: e.target.value, branch_id: '' })}
-              className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+              className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:bg-gray-100"
+              disabled={isSelf}
               required
             >
               <option value="">اختر الدور</option>
@@ -351,6 +417,9 @@ export default function UserFormModal({ user, onClose }: UserFormModalProps) {
                 </option>
               ))}
             </select>
+            {isSelf && (
+              <p className="text-xs text-gray-500 mt-1">لا يمكنك تغيير دورك أو تعطيل حسابك بنفسك</p>
+            )}
           </div>
 
           {/* Branch (conditional) */}
@@ -388,11 +457,14 @@ export default function UserFormModal({ user, onClose }: UserFormModalProps) {
             <select
               value={formData.status}
               onChange={(e) => setFormData({ ...formData, status: e.target.value as 'active' | 'inactive' })}
-              className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+              className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:bg-gray-100"
+              disabled={isSelf}
             >
               <option value="active">نشط</option>
               <option value="inactive">غير نشط</option>
+              {formData.status === 'suspended' && <option value="suspended">موقوف</option>}
             </select>
+            <p className="text-xs text-gray-500 mt-1">الموظف غير النشط لا يستطيع تسجيل الدخول</p>
           </div>
 
           {/* Category Permissions (only for cashiers) */}
@@ -404,8 +476,15 @@ export default function UserFormModal({ user, onClose }: UserFormModalProps) {
               <p className="text-xs text-gray-500 mb-3">
                 اختر المجموعات التي يمكن للكاشير رؤيتها. إذا لم تختر أي مجموعة، سيتمكن من رؤية جميع المجموعات.
               </p>
+              {userCategoriesState === 'failed' && (
+                <p className="text-xs text-red-600 mb-3">
+                  تعذر تحميل المجموعات المحفوظة لهذا الكاشير، لذلك لن يتم تغييرها عند الحفظ.
+                </p>
+              )}
               <div className="border border-gray-300 rounded-lg p-4 max-h-48 overflow-y-auto space-y-2">
-                {categories.length === 0 ? (
+                {userCategoriesState === 'loading' ? (
+                  <p className="text-sm text-gray-500 text-center py-2">جاري تحميل المجموعات...</p>
+                ) : categories.length === 0 ? (
                   <p className="text-sm text-gray-500 text-center py-2">لا توجد مجموعات</p>
                 ) : (
                   categories.map(category => (
@@ -417,6 +496,7 @@ export default function UserFormModal({ user, onClose }: UserFormModalProps) {
                         type="checkbox"
                         checked={selectedCategories.includes(category.id)}
                         onChange={() => handleCategoryToggle(category.id)}
+                        disabled={userCategoriesState !== 'loaded'}
                         className="w-4 h-4 text-blue-600 border-gray-300 rounded focus:ring-blue-500"
                       />
                       <span className="text-sm text-gray-900">
@@ -433,7 +513,8 @@ export default function UserFormModal({ user, onClose }: UserFormModalProps) {
           <div className="flex gap-3 pt-4">
             <button
               type="submit"
-              disabled={loading}
+              // Wait for the role list (until then the role can't be validated) and the user's saved categories
+              disabled={loading || roles.length === 0 || userCategoriesState === 'loading'}
               className="flex-1 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
             >
               {loading ? 'جاري الحفظ...' : user ? 'تحديث' : 'إضافة'}
@@ -441,7 +522,8 @@ export default function UserFormModal({ user, onClose }: UserFormModalProps) {
             <button
               type="button"
               onClick={() => onClose(false)}
-              className="flex-1 px-4 py-2 bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200 transition-colors"
+              disabled={loading}
+              className="flex-1 px-4 py-2 bg-gray-100 text-gray-700 rounded-lg hover:bg-gray-200 transition-colors disabled:opacity-50"
             >
               إلغاء
             </button>

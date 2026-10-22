@@ -1,5 +1,5 @@
 import { useState, FormEvent } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { Navigate, useLocation, useNavigate } from 'react-router-dom'
 import { useAuth } from '../../contexts/AuthContext'
 import { LogIn, Eye, EyeOff, AlertCircle } from 'lucide-react'
 
@@ -9,12 +9,19 @@ export default function Login() {
   const [showPassword, setShowPassword] = useState(false)
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
-  const { signIn } = useAuth()
+  const { signIn, isAuthenticated, loading: authLoading, authMessage, clearAuthMessage } = useAuth()
   const navigate = useNavigate()
+  const location = useLocation()
+
+  // Page the user was sent away from (ProtectedRoute passes it), so they land back there after signing in
+  const from = (location.state as { from?: { pathname?: string; search?: string } } | null)?.from
+  const target = from?.pathname && from.pathname !== '/login' ? `${from.pathname}${from.search ?? ''}` : '/'
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault()
+    if (loading) return
     setError('')
+    clearAuthMessage()
     setLoading(true)
 
     try {
@@ -22,7 +29,7 @@ export default function Login() {
       if (error) {
         setError(error.message || 'البريد الإلكتروني أو كلمة المرور غير صحيحة')
       } else {
-        navigate('/')
+        navigate(target, { replace: true })
       }
     } catch {
       setError('حدث خطأ أثناء تسجيل الدخول')
@@ -30,6 +37,13 @@ export default function Login() {
       setLoading(false)
     }
   }
+
+  // Already signed in (e.g. the login page was opened from a bookmark)
+  if (!authLoading && isAuthenticated && !loading) {
+    return <Navigate to={target} replace />
+  }
+
+  const shownError = error || authMessage
 
   return (
     <div className="min-h-screen flex items-center justify-center bg-gray-100 px-4">
@@ -45,10 +59,10 @@ export default function Login() {
           </div>
 
           {/* Error Message */}
-          {error && (
+          {shownError && (
             <div className="mb-6 p-4 bg-red-50 border border-red-200 rounded-lg flex items-center gap-3">
               <AlertCircle className="w-5 h-5 text-red-500 shrink-0" />
-              <p className="text-red-700 text-sm">{error}</p>
+              <p className="text-red-700 text-sm">{shownError}</p>
             </div>
           )}
 
@@ -64,6 +78,7 @@ export default function Login() {
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
                 required
+                autoComplete="username"
                 className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-colors"
                 placeholder="example@email.com"
                 dir="ltr"
@@ -81,6 +96,7 @@ export default function Login() {
                   value={password}
                   onChange={(e) => setPassword(e.target.value)}
                   required
+                  autoComplete="current-password"
                   className="w-full px-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-colors pl-12"
                   placeholder="••••••••"
                   dir="ltr"
@@ -89,6 +105,8 @@ export default function Login() {
                   type="button"
                   onClick={() => setShowPassword(!showPassword)}
                   className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-700"
+                  title={showPassword ? 'إخفاء كلمة المرور' : 'إظهار كلمة المرور'}
+                  aria-label={showPassword ? 'إخفاء كلمة المرور' : 'إظهار كلمة المرور'}
                 >
                   {showPassword ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
                 </button>
