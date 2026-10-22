@@ -1,9 +1,19 @@
 import { useAuth } from '../../contexts/AuthContext'
 import { Settings as SettingsIcon, User, Building2, Bell, Shield, Palette } from 'lucide-react'
+import { translations } from '../../lib/translations'
+import { APP_VERSION } from './appInfo'
 
 export default function Settings() {
   const { user } = useAuth()
 
+  // user.role is the embedded roles row; older cached sessions may hold the plain role name
+  const roleLabel = user?.role
+    ? typeof user.role === 'object'
+      ? user.role.name_ar || translations.roles[user.role.name] || user.role.name
+      : translations.roles[user.role] || user.role
+    : ''
+
+  // These sections are not available yet: they are shown as "coming soon", not as clickable cards
   const settingsSections = [
     {
       title: 'الملف الشخصي',
@@ -63,9 +73,8 @@ export default function Settings() {
             <h2 className="text-xl font-bold text-gray-900">{user?.full_name_ar || user?.full_name}</h2>
             <p className="text-gray-600">{user?.email}</p>
             <p className="text-sm text-gray-500">
-              {typeof user?.role === 'object' && user?.role !== null 
-                ? (user.role as { name_ar?: string }).name_ar 
-                : ''}
+              {roleLabel}
+              {user?.branch?.name_ar ? ` - ${user.branch.name_ar}` : ''}
             </p>
           </div>
         </div>
@@ -78,10 +87,14 @@ export default function Settings() {
           return (
             <div
               key={section.title}
-              className="bg-white rounded-lg shadow-sm border border-gray-100 p-6 hover:shadow-md transition-shadow cursor-pointer"
+              className="bg-white rounded-lg shadow-sm border border-gray-100 p-6"
+              aria-disabled="true"
             >
-              <div className={`w-12 h-12 rounded-lg ${colorClasses[section.color]} flex items-center justify-center mb-4`}>
-                <Icon className="w-6 h-6" />
+              <div className="flex items-start justify-between mb-4">
+                <div className={`w-12 h-12 rounded-lg ${colorClasses[section.color]} flex items-center justify-center`}>
+                  <Icon className="w-6 h-6" />
+                </div>
+                <span className="text-xs px-2 py-1 rounded-full bg-gray-100 text-gray-500">قريباً</span>
               </div>
               <h3 className="font-bold text-gray-900 mb-1">{section.title}</h3>
               <p className="text-sm text-gray-600">{section.description}</p>
@@ -99,11 +112,7 @@ export default function Settings() {
         <div className="grid md:grid-cols-2 gap-4 text-sm">
           <div>
             <span className="text-gray-500">إصدار النظام:</span>
-            <span className="mr-2 text-gray-900">1.0.0</span>
-          </div>
-          <div>
-            <span className="text-gray-500">آخر تحديث:</span>
-            <span className="mr-2 text-gray-900">ديسمبر 2024</span>
+            <span className="mr-2 text-gray-900">{APP_VERSION}</span>
           </div>
         </div>
       </div>

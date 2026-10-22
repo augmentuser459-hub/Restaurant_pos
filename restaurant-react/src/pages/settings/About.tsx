@@ -1,4 +1,5 @@
 import { Info, Package, Users, TrendingUp, Shield, Zap } from 'lucide-react'
+import { APP_VERSION } from './appInfo'
 
 export default function About() {
   return (
@@ -127,7 +128,7 @@ export default function About() {
           </a>
           {' '}- حلول تقنية متقدمة
         </p>
-        <p className="text-gray-500 text-xs mt-2">v2.0.1</p>
+        <p className="text-gray-500 text-xs mt-2">v{APP_VERSION}</p>
       </div>
     </div>
   )

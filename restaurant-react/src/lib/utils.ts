@@ -1,5 +1,7 @@
 // Utility functions
 
+import { translations } from './translations'
+
 /**
  * Format number to Arabic locale
  */
@@ -69,32 +71,28 @@ export function getStatusColor(status: string): string {
     ready: 'bg-green-100 text-green-800',
     delivered: 'bg-gray-100 text-gray-800',
     cancelled: 'bg-red-100 text-red-800',
+    suspended: 'bg-red-100 text-red-800',
+    maintenance: 'bg-yellow-100 text-yellow-800',
+    draft: 'bg-gray-100 text-gray-800',
+    completed: 'bg-green-100 text-green-800',
+    pending_payment: 'bg-yellow-100 text-yellow-800',
+    partial: 'bg-orange-100 text-orange-800',
+    in_transit: 'bg-indigo-100 text-indigo-800',
+    ordered: 'bg-blue-100 text-blue-800',
+    sent: 'bg-blue-100 text-blue-800',
+    partially_received: 'bg-orange-100 text-orange-800',
+    open: 'bg-green-100 text-green-800',
+    closed: 'bg-gray-100 text-gray-800',
   }
   return colors[status] || 'bg-gray-100 text-gray-800'
 }
 
 /**
- * Translate status to Arabic
+ * Translate status to Arabic (labels live in translations.status, one per database status value)
  */
 export function translateStatus(status: string): string {
-  const translations: Record<string, string> = {
-    pending: 'معلق',
-    approved: 'موافق عليه',
-    rejected: 'مرفوض',
-    received: 'مستلم',
-    active: 'نشط',
-    inactive: 'غير نشط',
-    new: 'جديد',
-    paid: 'مدفوع',
-    in_kitchen: 'في المطبخ',
-    preparing: 'قيد التحضير',
-    ready: 'جاهز',
-    delivered: 'تم التسليم',
-    cancelled: 'ملغي',
-    draft: 'مسودة',
-    completed: 'مكتمل',
-  }
-  return translations[status] || status
+  const labels: Record<string, string> = translations.status
+  return labels[status] || status
 }
 
 /**

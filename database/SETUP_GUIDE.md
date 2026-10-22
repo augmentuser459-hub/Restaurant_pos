@@ -1,145 +1,98 @@
-# Supabase Database Setup Guide
+# Database and App Setup
 
-## Prerequisites
-- A Supabase account (sign up at https://supabase.com)
-- The `schema.sql` file in this directory
+For moving the live system to the new database, see `PRODUCTION_SCHEMA_READY.md`.
+To check a database, see `SCHEMA_VERIFICATION.md`.
 
-## Step-by-Step Setup
+## 1. How a database is built
 
-### 1. Create a New Supabase Project
-1. Go to https://app.supabase.com
-2. Click "New Project"
-3. Fill in:
-   - Project name: `restaurant-management` (or your choice)
-   - Database password: (save this securely)
-   - Region: Choose closest to your location
-4. Wait for the project to be created (2-3 minutes)
+`schema.sql` alone does **not** produce the database the app needs. Run these files in this order, each one
+completely (Supabase SQL Editor or `psql`):
 
-### 2. Run the Schema SQL
-1. In your Supabase dashboard, go to **SQL Editor** (left sidebar)
-2. Click **New Query**
-3. Open the `schema.sql` file from this directory
-4. Copy ALL the content and paste it into the SQL Editor
-5. Click **Run** (or press Ctrl+Enter)
-6. Wait for completion - you should see "Success. No rows returned"
+1. `schema.sql`
+2. The original add-on files, in this order:
+   `add_cashier_category_permissions.sql`, `add_chef_category_permissions.sql`, `fix_cashier_permissions_rls.sql`,
+   `pos_views_functions.sql`, `fix_pos_in_stock.sql`, `add_inventory_deduction_trigger.sql`,
+   `fix_supplier_returns.sql`, `user_functions.sql`
+3. Every file in `migrations/`, in file-name order (`001_…`, `005_…`, `010_…` … `090_…`).
+   They are idempotent, so running them again is safe. `tools/go-live/run-migrations.js` applies them all
+   (see `migrations/README.md`). `090_security_rls.sql` is written in the integration step: until it is in the
+   folder and applied, the database has no row-level security on the original tables.
 
-### 3. Get Your Supabase Credentials
-1. Go to **Project Settings** (gear icon in sidebar)
-2. Click **API** section
-3. Copy these values:
-   - **Project URL** (looks like: `https://xxxxx.supabase.co`)
-   - **anon public** key (the long string under "Project API keys")
+Do **not** run:
+- `add_default_user.sql`: an old test seed. Its fixed-id roles clash with the roles `schema.sql` already creates,
+  so it fails, and it sets the password `1234`.
+- `Reset.sql`: DEV-ONLY, deletes all business data (it refuses to run without an explicit confirmation).
 
-### 4. Configure Your React App
-1. Navigate to `restaurant-react` folder
-2. Copy `.env.example` to `.env`:
-   ```bash
-   copy .env.example .env
-   ```
-3. Edit `.env` and add your credentials:
-   ```
-   VITE_SUPABASE_URL=https://your-project.supabase.co
-   VITE_SUPABASE_ANON_KEY=your-anon-key-here
-   ```
+Optional: `add_recipe_category.sql` adds the `CAT-RECIPE` category for recipe items.
 
-### 5. Create Your First Admin User
-1. In Supabase dashboard, go to **Authentication** > **Users**
-2. Click **Add User** > **Create new user**
-3. Fill in:
-   - Email: your admin email
-   - Password: secure password
-   - Auto Confirm User: ✓ (checked)
-4. Click **Create User**
-5. Copy the User UID (you'll need it next)
+## 2. Facts the app relies on
 
-### 6. Insert Admin User Record
-1. First, get the admin role ID:
+- **Logins use Supabase Auth.** Every row in `users` must have `users.id` = the Supabase Auth user id
+  (`auth.users.id`). The role is `users.role_id` → `roles.name` (`admin`, `warehouse_manager`, `branch_supervisor`,
+  `chef`, `cashier`, `purchase_manager`).
+- **Row-level security comes from `migrations/090_security_rls.sql`.** The tables from `schema.sql` start with RLS
+  disabled (like the old production database); 090 enables it on every table with role-based policies.
+  Tables created by migrations enable RLS themselves. Until 090 exists (integration step), only those have it.
+- **There is no `payments` table.** Supplier payments are in `supplier_payments`, purchase-order payments in
+  `purchase_order_payments`.
+- Stock changes only through `stock_adjust()` and supplier balances only through `supplier_balance_adjust()`
+  (`migrations/005_core_functions.sql`).
+
+## 3. First admin user (new, empty database only)
+
+Run this after all files of §1. Don't use the dashboard's *Authentication → Add user*: `010_auth.sql` blocks
+sign-ups, because every login must belong to a `users` row with the same id.
+
+1. In the SQL Editor (replace the email and the password, at least 6 characters):
    ```sql
-   SELECT id FROM roles WHERE name = 'admin';
-   ```
-2. Copy the role ID, then insert your admin user:
-   ```sql
-   INSERT INTO users (
-     employee_code, 
-     username, 
-     email, 
-     password_hash, 
-     full_name, 
-     full_name_ar, 
-     role_id, 
-     status
-   )
-   VALUES (
-     'EMP001',
-     'admin',
-     'your-email@example.com',
-     'temp-password-hash',  -- You'll change this through Supabase Auth
-     'Admin User',
-     'مدير النظام',
-     'paste-role-id-here',
-     'active'
-   );
-   ```
-   
-Note: For Supabase, you should create users through the Auth panel, then link them to this table.
+   INSERT INTO users (employee_code, username, email, full_name, full_name_ar, role_id, status)
+   SELECT 'EMP001', 'admin', 'admin@example.com', 'System Administrator', 'مدير النظام', r.id, 'active'
+   FROM roles r WHERE r.name = 'admin';
 
-### 7. Create a Main Warehouse Branch
-```sql
-INSERT INTO branches (code, name, name_ar, is_main_warehouse, status)
-VALUES (
-  'MAIN',
-  'Main Warehouse',
-  'المخزن الرئيسي',
-  true,
-  'active'
-);
+   -- Creates the Supabase Auth login with the same id (returns true)
+   SELECT public.auth_upsert_account(u.id, 'choose-a-strong-password')
+   FROM users u WHERE u.email = 'admin@example.com';
+   ```
+   `users.password_hash` only holds a placeholder: the password lives in Supabase Auth.
+2. Create the main warehouse:
+   ```sql
+   INSERT INTO branches (code, name, name_ar, is_main_warehouse, status)
+   VALUES ('MAIN', 'Main Warehouse', 'المخزن الرئيسي', true, 'active');
+   ```
+3. Log in as this admin and add the other staff from the Users page (المستخدمين); that creates their logins.
+
+## 4. App configuration (local)
+
+Create `restaurant-react/.env.local` (git-ignored) from `restaurant-react/.env.example`:
+
+```
+VITE_SUPABASE_URL=https://<project-ref>.supabase.co
+VITE_SUPABASE_ANON_KEY=<the project's publishable (anon) key>
 ```
 
-### 8. Test Your Connection
-1. Start your React app:
-   ```bash
-   cd restaurant-react
-   npm install
-   npm run dev
-   ```
-2. Open the app in your browser
-3. Try logging in with your admin credentials
+Vite also loads `restaurant-react/.env` and uses it for any value `.env.local` doesn't set (or for everything
+when `.env.local` is missing). So `restaurant-react/.env` must not exist, or must name the current project: an
+old copy that still names the old production project (`hqjw…`) makes the app talk to that project as soon as
+`.env.local` is removed. Both files are git-ignored and never reach Cloudflare Pages.
 
-## What Was Created
+```bash
+cd restaurant-react
+npm ci
+npm run dev          # http://localhost:5173
+npm run typecheck    # type-check only (tsc), must report 0 errors
+npm run build:check  # type-check + production build: must pass before every deploy
+```
 
-The schema includes:
-- ✅ 40+ tables for complete restaurant management
-- ✅ Custom ENUM types for type safety
-- ✅ All foreign key relationships
-- ✅ Indexes for performance
-- ✅ Automatic timestamp triggers
-- ✅ Default seed data (units, damage reasons, roles)
-- ✅ Advanced features: batch tracking, audit logs, alerts, sessions
+## 5. Deploy (Cloudflare Pages)
 
-## Troubleshooting
-
-### "relation already exists" error
-- Your database already has some tables
-- Either drop them first or use a fresh Supabase project
-
-### Can't login after setup
-- Make sure you inserted the user record in step 6
-- Check that the user ID matches the auth user ID
-- Verify your .env file has correct credentials
-
-### RLS policy errors
-- Make sure you're logged in
-- Check that your user has the correct role in the users table
-
-## Next Steps
-
-After setup, you can:
-1. Create additional branches
-2. Add categories and items
-3. Set up suppliers
-4. Configure menu items
-5. Start using the POS system
-
-## Need Help?
-
-Check the Supabase documentation: https://supabase.com/docs
+- `wrangler.toml` at the repository root names the Pages project (`restaurant-pos`) and the output folder
+  (`restaurant-react/dist`).
+- Build command (from the repository root): `cd restaurant-react && npm ci && npm run build:check`.
+  It fails while `npm run typecheck` reports any error. If a deploy can't wait for those to be fixed, set the
+  command to `cd restaurant-react && npm ci && npm run build` (production build without the type-check) and
+  switch back once `npm run typecheck` is clean.
+- Set `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` in the Pages project's environment variables. They are
+  baked in at build time, so redeploy after changing them.
+- Page routing needs no `_redirects` file: the build has no top-level `404.html`, so Pages serves `index.html` for
+  every unknown path (its single-page-app mode). Do not add a `404.html` to `public/`, and do not add a
+  `/* /index.html 200` rule (Pages ignores it as an infinite loop).

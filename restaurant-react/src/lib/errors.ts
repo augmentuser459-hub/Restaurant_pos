@@ -24,6 +24,10 @@ const CODE_MESSAGES: Record<string, string> = {
 export function toUserMessage(error: unknown, fallback = 'حدث خطأ غير متوقع، حاول مرة أخرى'): string {
   if (!error) return fallback
   const e = error as DbError
+  // A missing privilege (e.g. an expired session calling as anon) comes back as Postgres's English text
+  if (e.code === '42501' && /^permission denied/i.test(e.message ?? '')) {
+    return 'انتهت الجلسة أو ليس لديك صلاحية، سجّل الدخول مرة أخرى'
+  }
   if (e.code && MESSAGE_CODES.has(e.code) && e.message) return e.message
   if (e.code && CODE_MESSAGES[e.code]) return CODE_MESSAGES[e.code]
   const text = typeof error === 'string' ? error : e.message ?? ''

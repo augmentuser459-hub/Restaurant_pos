@@ -37,10 +37,12 @@ export const translations = {
     confirm: 'تأكيد',
   },
 
-  // Status labels
+  // Status labels (every status value stored in the database)
   status: {
     active: 'نشط',
     inactive: 'غير نشط',
+    suspended: 'موقوف',
+    maintenance: 'صيانة',
     pending: 'معلق',
     approved: 'موافق عليه',
     rejected: 'مرفوض',
@@ -48,12 +50,21 @@ export const translations = {
     cancelled: 'ملغي',
     draft: 'مسودة',
     new: 'جديد',
+    pending_payment: 'بانتظار الدفع',
     paid: 'مدفوع',
+    partial: 'مدفوع جزئياً',
     in_kitchen: 'في المطبخ',
     preparing: 'قيد التحضير',
     ready: 'جاهز',
     delivered: 'تم التسليم',
+    in_transit: 'قيد النقل',
     received: 'مستلم',
+    ordered: 'تم الطلب',
+    // purchase order sent to the supplier (same label as purchase_status_label in 050_purchasing.sql)
+    sent: 'تم الإرسال للمورد',
+    partially_received: 'مستلم جزئياً',
+    open: 'مفتوحة',
+    closed: 'مغلقة',
   },
 
   // Form labels

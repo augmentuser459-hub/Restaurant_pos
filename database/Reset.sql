@@ -1,114 +1,104 @@
 -- ============================================
--- Reset Data Script - Keep Suppliers
+-- Reset Data Script  --  DEV / TEST DATABASES ONLY
 -- ============================================
--- This script deletes:
--- - All items, inventory, and categories
--- - All purchase orders and related data
--- - All supplier transactions and debt history
--- But KEEPS the suppliers themselves
+-- !!! NEVER run this on the production database. It permanently deletes business data. !!!
+-- Take a backup first, even on a test database.
+--
+-- DELETES (every row, every branch):
+--   - Sales: orders, order lines, cashier shifts, notifications; pos_backfill_issues rows go with their
+--     orders (ON DELETE CASCADE)
+--   - Items, categories, stock (inventory, batches, stock movements), daily counts
+--   - POS / menu setup: branch POS items and prices, menu items and categories, recipes, production logs
+--   - Cashier/chef category permissions (each user's POS and kitchen category assignments; they point at
+--     the deleted categories)
+--   - Transfers, damages, branch returns, supplier returns
+--   - Purchasing: purchase requests and orders with their payments, supplies (invoices), supplier payments,
+--     supplier items, supplier debt history; every supplier balance is set to 0
+-- KEEPS: suppliers, branches, users (their accounts and roles, but not their category permissions), roles,
+--   units, damage/return reasons, settings, audit logs, document number counters.
+--
+-- GUARD: the script refuses to run unless the current session carries an explicit confirmation that
+-- includes today's date (database server date). Put this line directly above the script, in the same run:
+--     SET app.confirm_reset = 'DELETE ALL BUSINESS DATA YYYY-MM-DD';   -- today's date
+-- The confirmation is cleared again when the reset finishes.
+--
+-- Everything runs as ONE statement (one DO block): it either deletes everything or nothing. If a table that is
+-- not listed below references one of these tables without ON DELETE CASCADE, the foreign key stops the reset
+-- and nothing is deleted.
 -- ============================================
 
-BEGIN;
+DO $$
+DECLARE
+  v_expected text := 'DELETE ALL BUSINESS DATA ' || to_char(current_date, 'YYYY-MM-DD');
+  v_table text;
+  v_rows bigint;
+  -- Children before parents (foreign-key order)
+  v_tables text[] := ARRAY[
+    'order_items',
+    'orders',
+    'cashier_shifts',
+    'notification_reads',
+    'notifications',
+    'branch_pos_items',
+    'branch_menu_prices',
+    'menu_item_ingredients',
+    'menu_items',
+    'menu_categories',
+    'purchase_order_payments',
+    'purchase_order_items',
+    'purchase_orders',
+    'purchase_request_items',
+    'purchase_requests',
+    'supplier_payments',
+    'supplier_returns',
+    'supplier_items',
+    'supplier_debt_transactions',
+    'branch_return_items',
+    'branch_returns',
+    'damages',
+    'transfer_items',
+    'transfers',
+    'daily_inventory_count_items',
+    'daily_inventory_counts',
+    'recipe_ingredients',
+    'production_logs',
+    'inventory_transactions',
+    'inventory_batches',
+    'supply_items',
+    'supplies',
+    'inventory',
+    'cashier_category_permissions',
+    'chef_category_permissions',
+    'items',
+    'categories'
+  ];
+BEGIN
+  IF coalesce(current_setting('app.confirm_reset', true), '') <> v_expected THEN
+    RAISE EXCEPTION 'Reset.sql is DEV-ONLY and deletes all business data. Nothing was deleted.'
+      USING HINT = format('If this is really a test database and you have a backup, run first: SET app.confirm_reset = %L;', v_expected);
+  END IF;
 
--- 1. Delete Order Items (references items)
-DELETE FROM order_items;
+  FOREACH v_table IN ARRAY v_tables LOOP
+    IF to_regclass('public.' || v_table) IS NOT NULL THEN
+      EXECUTE format('DELETE FROM public.%I', v_table);
+      GET DIAGNOSTICS v_rows = ROW_COUNT;
+      RAISE NOTICE 'deleted % rows from %', v_rows, v_table;
+    END IF;
+  END LOOP;
 
--- 2. Delete Orders
-DELETE FROM orders;
+  -- Debt history is gone, so balances start again from zero
+  UPDATE public.suppliers SET current_balance = 0, updated_at = CURRENT_TIMESTAMP WHERE current_balance IS DISTINCT FROM 0;
+  GET DIAGNOSTICS v_rows = ROW_COUNT;
+  RAISE NOTICE 'reset the balance of % suppliers', v_rows;
 
--- 3. Delete Cashier Shifts
-DELETE FROM cashier_shifts;
-
--- 4. Delete Branch POS Items (references items)
-DELETE FROM branch_pos_items;
-
--- 5. Delete Menu Item Ingredients (references items)
-DELETE FROM menu_item_ingredients;
-
--- 6. Delete Menu Items
-DELETE FROM menu_items;
-
--- 7. Delete Menu Categories
-DELETE FROM menu_categories;
-
--- 8. Delete Purchase Order Items (references items)
-DELETE FROM purchase_order_items;
-
--- 9. Delete Purchase Order Payments
-DELETE FROM purchase_order_payments;
-
--- 10. Delete Purchase Orders
-DELETE FROM purchase_orders;
-
--- 11. Delete Purchase Request Items (references items)
-DELETE FROM purchase_request_items;
-
--- 12. Delete Purchase Requests
-DELETE FROM purchase_requests;
-
--- 13. Delete Supplier Returns (references items)
-DELETE FROM supplier_returns;
-
--- 14. Delete Supplier Items (references items)
-DELETE FROM supplier_items;
-
--- 15. Delete Branch Return Items (references items)
-DELETE FROM branch_return_items;
-
--- 16. Delete Branch Returns
-DELETE FROM branch_returns;
-
--- 17. Delete Supplier Debt Transactions
-DELETE FROM supplier_debt_transactions;
-
--- 18. Delete Supply Items (references items)
-DELETE FROM supply_items;
-
--- 19. Delete Supplies
-DELETE FROM supplies;
-
--- 20. Reset Supplier Balances to Zero
-UPDATE suppliers SET current_balance = 0, updated_at = CURRENT_TIMESTAMP;
-
--- 21. Delete Damages (references items directly)
-DELETE FROM damages;
-
--- 22. Delete Transfer Items (references items)
-DELETE FROM transfer_items;
-
--- 23. Delete Transfers
-DELETE FROM transfers;
-
--- 24. Delete Daily Inventory Count Items (references items)
-DELETE FROM daily_inventory_count_items;
-
--- 25. Delete Daily Inventory Counts
-DELETE FROM daily_inventory_counts;
-
--- 26. Delete Recipe Ingredients (references items)
-DELETE FROM recipe_ingredients;
-
--- 27. Delete Production Logs (references items)
-DELETE FROM production_logs;
-
--- 28. Delete Inventory Transactions (references items)
-DELETE FROM inventory_transactions;
-
--- 29. Delete Inventory (references items)
-DELETE FROM inventory;
-
--- 30. Finally, Delete Items (all references should be gone now)
-DELETE FROM items;
-
--- 31. Delete Categories (items are gone, safe to remove)
-DELETE FROM categories;
-
-COMMIT;
+  -- Clear the confirmation so a later run in the same session has to confirm again
+  PERFORM set_config('app.confirm_reset', '', false);
+END $$;
 
 -- ============================================
 -- Summary
 -- ============================================
-SELECT 
+SELECT
     'Data Reset Complete!' as status,
     (SELECT COUNT(*) FROM items) as remaining_items,
     (SELECT COUNT(*) FROM inventory) as remaining_inventory,

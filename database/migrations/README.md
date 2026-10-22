@@ -8,7 +8,8 @@ database as it was originally built. Every change since then lives here, as numb
 | `001_live_only_objects.sql` | Objects the original production DB had that no other SQL file defines |
 | `005_core_functions.sql` | Shared helpers: `app_*` (current user/role/branch), `stock_adjust`, `supplier_balance_adjust`, `next_document_number` |
 | `010_auth.sql` | Supabase Auth accounts for staff, user-management functions |
-| `020_pos.sql` | POS checkout, orders, shifts, kitchen, notifications |
+| `020_pos.sql` | POS checkout, orders, shifts, sale stock deduction (and the one-time back-fill of missed deductions) |
+| `025_kitchen_pos_management.sql` | Kitchen screen status changes, POS management (branch menu and prices), notification read state |
 | `030_stock.sql` | Items, stock list, categories, branches, daily counts, chef consumption |
 | `040_movements.sql` | Transfers, branch/supplier returns, damages, recipes and production |
 | `050_purchasing.sql` | Suppliers, supplies, purchase requests/orders, payments, reports |

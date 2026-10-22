@@ -1,4 +1,5 @@
 import { translations } from '../lib/translations'
+import { formatCurrency as formatMoney } from '../lib/utils'
 
 type NestedKeyOf<T> = T extends object
   ? { [K in keyof T]: K extends string
@@ -11,6 +12,11 @@ type NestedKeyOf<T> = T extends object
 
 type TranslationPath = NestedKeyOf<typeof translations>
 
+function toDate(date: Date | string): Date | null {
+  const dateObj = typeof date === 'string' ? new Date(date) : date
+  return dateObj instanceof Date && !Number.isNaN(dateObj.getTime()) ? dateObj : null
+}
+
 /**
  * Hook for accessing translations
  * Usage: const { t, formatNumber, formatCurrency, formatDate } = useTranslation()
@@ -18,22 +24,22 @@ type TranslationPath = NestedKeyOf<typeof translations>
 export function useTranslation() {
   /**
    * Get translation by dot-notation path
-   * @param path - Dot-notation path like 'nav.dashboard' or 'actions.save'
-   * @returns Translated string
+   * @param path - Dot-notation path like 'nav.dashboard' or 'status.in_transit'
+   * @returns Translated string (the last path segment when the key is missing, e.g. a new status value)
    */
   const t = (path: TranslationPath | string): string => {
     const keys = path.split('.')
     let result: unknown = translations
 
     for (const key of keys) {
-      if (result && typeof result === 'object' && key in result) {
+      if (result && typeof result === 'object' && Object.prototype.hasOwnProperty.call(result, key)) {
         result = (result as Record<string, unknown>)[key]
       } else {
-        return path // Return path if translation not found
+        return keys[keys.length - 1]
       }
     }
 
-    return typeof result === 'string' ? result : path
+    return typeof result === 'string' ? result : keys[keys.length - 1]
   }
 
   /**
@@ -46,25 +52,19 @@ export function useTranslation() {
   }
 
   /**
-   * Format currency in Egyptian Pounds
+   * Format currency in Egyptian Pounds (same format as formatCurrency in lib/utils, used everywhere else)
    * @param value - Amount to format
    */
-  const formatCurrency = (value: number): string => {
-    return new Intl.NumberFormat('ar-EG', {
-      style: 'currency',
-      currency: 'EGP',
-      minimumFractionDigits: 0,
-      maximumFractionDigits: 2,
-    }).format(value)
-  }
+  const formatCurrency = (value: number): string => formatMoney(value)
 
   /**
-   * Format date according to Arabic locale
+   * Format date according to Arabic locale ('-' for a missing or invalid date)
    * @param date - Date to format
    * @param options - Intl.DateTimeFormat options
    */
   const formatDate = (date: Date | string, options?: Intl.DateTimeFormatOptions): string => {
-    const dateObj = typeof date === 'string' ? new Date(date) : date
+    const dateObj = toDate(date)
+    if (!dateObj) return '-'
     return new Intl.DateTimeFormat('ar-EG', {
       year: 'numeric',
       month: 'long',
@@ -78,7 +78,8 @@ export function useTranslation() {
    * @param date - Date to compare
    */
   const formatRelativeTime = (date: Date | string): string => {
-    const dateObj = typeof date === 'string' ? new Date(date) : date
+    const dateObj = toDate(date)
+    if (!dateObj) return '-'
     const now = new Date()
     const diffMs = now.getTime() - dateObj.getTime()
     const diffMins = Math.floor(diffMs / 60000)

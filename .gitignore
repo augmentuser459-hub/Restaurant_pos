@@ -1,0 +1,20 @@
+# Secrets and local environment files (never commit these)
+.env
+.env.*
+!.env.example
+*.local
+
+# Dependencies and build output
+node_modules/
+dist/
+dist-ssr/
+
+# Data exports (inventory/price exports contain cost prices; keep them out of git)
+/*.xlsx
+/*.csv
+
+# Logs and OS/editor files
+*.log
+.DS_Store
+Thumbs.db
+.idea/

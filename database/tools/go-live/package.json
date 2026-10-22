@@ -1,0 +1,15 @@
+{
+  "name": "pos-go-live-tools",
+  "private": true,
+  "description": "Copies data from the old production Supabase project into the new one and applies the migrations.",
+  "scripts": {
+    "copy-data": "node copy-from-old-production.js",
+    "copy-data:dry-run": "node copy-from-old-production.js --dry-run",
+    "migrate": "node run-migrations.js",
+    "temp-passwords": "node set-temp-passwords.js",
+    "temp-passwords:dry-run": "node set-temp-passwords.js --dry-run"
+  },
+  "dependencies": {
+    "pg": "8.23.1"
+  }
+}
