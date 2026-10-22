@@ -8,7 +8,7 @@ import { formatCurrency, formatDateTime, formatNumber, parseDecimal, roundMoney,
 import { toUserMessage, isInsufficientStock } from '../../lib/errors'
 import { paymentMethodLabel } from '../orders/orderLabels'
 import { findItemsByScan } from '../inventory/stockHelpers'
-import { ShoppingCart, Plus, Minus, Trash2, CreditCard, Banknote, Smartphone, Wallet, X, Printer, Play, Square, Clock, DollarSign, Search, Package, ChefHat } from 'lucide-react'
+import { ShoppingCart, Plus, Minus, Trash2, Truck, Banknote, Smartphone, Wallet, X, Printer, Play, Square, Clock, DollarSign, Search, Package, ChefHat } from 'lucide-react'
 
 const hasHint = (error: unknown, hint: string) => (error as { hint?: string } | null)?.hint === hint
 
@@ -464,9 +464,9 @@ export default function POSCashier() {
     const title = order.duplicate
       ? `هذا الطلب مسجل بالفعل برقم ${order.order_number}${methodNote}`
       : `تم إنشاء الطلب رقم ${order.order_number} بنجاح`
-    if (confirm(`${title}${changeText}\n\nهل تريد طباعة الفاتورة؟`)) {
-      printReceipt(order)
-    }
+    // The receipt prints straight away (no question), then the sale is confirmed
+    printReceipt(order)
+    alert(`${title}${changeText}`)
   }
 
   if (loading) {
@@ -973,8 +973,8 @@ export default function POSCashier() {
                 disabled={processing || !currentShift || cashUnderpaid}
               />
               <PaymentButton
-                icon={CreditCard}
-                label="فيزا"
+                icon={Truck}
+                label="دليفري"
                 onClick={() => handlePayment('visa')}
                 disabled={processing || !currentShift}
               />

@@ -368,6 +368,7 @@ export default function StockList() {
       const branch = inv.branch as { name_ar?: string } | undefined
       return {
         item_code: displayCode(item?.code),
+        item_barcode: displayCode(item?.barcode),
         item_name: item?.name_ar || '',
         category_name: item?.category?.name_ar || '',
         branch_name: branch?.name_ar || selectedBranchName,

@@ -252,7 +252,7 @@ export default function ShiftDetail() {
             {totals.hasBreakdown && (
               <div className="mt-4 grid grid-cols-3 gap-4">
                 <div className="p-3 bg-gray-50 rounded-lg">
-                  <p className="text-sm text-gray-500">فيزا</p>
+                  <p className="text-sm text-gray-500">دليفري</p>
                   <p className="font-bold">{formatCurrency(totals.visa)}</p>
                 </div>
                 <div className="p-3 bg-gray-50 rounded-lg">

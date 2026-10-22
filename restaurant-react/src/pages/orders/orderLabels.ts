@@ -26,7 +26,7 @@ export const ORDER_STATUS_COLORS: Record<OrderStatus, string> = {
 
 export const PAYMENT_METHOD_LABELS: Record<OrderPaymentMethod, string> = {
   cash: 'كاش',
-  visa: 'فيزا',
+  visa: 'دليفري',
   instapay: 'إنستاباي',
   wallet: 'محفظة',
 }

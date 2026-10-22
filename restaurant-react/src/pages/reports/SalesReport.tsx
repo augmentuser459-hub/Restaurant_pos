@@ -66,7 +66,7 @@ export default function SalesReport() {
 
   const paymentMethodLabels: Record<string, string> = {
     cash: 'نقدي',
-    visa: 'فيزا',
+    visa: 'دليفري',
     instapay: 'انستاباي',
     wallet: 'محفظة',
     unknown: 'غير محدد',

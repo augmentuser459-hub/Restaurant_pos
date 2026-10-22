@@ -19,7 +19,7 @@ import {
 // per-method totals were recorded (shown whole, never split by guess).
 const MONEY_COLUMNS = [
   { key: 'cash_sales', label: 'كاش', className: 'text-green-600' },
-  { key: 'visa_sales', label: 'فيزا', className: 'text-purple-600' },
+  { key: 'visa_sales', label: 'دليفري', className: 'text-purple-600' },
   { key: 'instapay_sales', label: 'إنستاباي', className: 'text-purple-600' },
   { key: 'wallet_sales', label: 'محفظة', className: 'text-purple-600' },
   { key: 'unsplit_sales', label: 'غير نقدي (غير مفصّل)', className: 'text-gray-600' },
