@@ -2,6 +2,8 @@
 .env
 .env.*
 !.env.example
+# public build-time connection values (publishable key only; see the file's header)
+!restaurant-react/.env.production
 *.local
 
 # Dependencies and build output

@@ -15,7 +15,7 @@ dist-ssr
 # Environment variables
 .env
 .env.local
-.env.production
+# .env.production is committed on purpose: public build-time values only (see its header)
 
 # Editor directories and files
 .vscode/*
