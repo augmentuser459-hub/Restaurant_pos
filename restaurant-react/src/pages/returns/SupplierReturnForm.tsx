@@ -2,6 +2,10 @@ import { useState, useEffect, FormEvent } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { supabase, fixEncodingInData } from '../../lib/supabase'
 import { useAuth } from '../../contexts/AuthContext'
+import { returnsService } from '../../services/returns.service'
+import { fetchPickerItems, PickerItem } from '../../services/transfers.service'
+import { toUserMessage } from '../../lib/errors'
+import { formatCurrency, parseDecimal, roundMoney, roundQuantity } from '../../lib/utils'
 import { Save, ArrowRight, AlertCircle, Plus, Trash2, Search, X, Barcode } from 'lucide-react'
 
 interface Supplier {
@@ -10,21 +14,23 @@ interface Supplier {
   code: string
 }
 
-interface Item {
-  id: string
-  code: string
-  barcode: string | null
-  name_ar: string
-  purchase_price: number
-}
-
 interface ReturnItem {
+  key: string // stable row id (React key), so a row's search text never moves to another row
   item_id: string
   quantity: number
   unit_price: number
   reason: string
   notes: string
+  search: string
 }
+
+let rowSeq = 0
+const newRow = (): ReturnItem => ({ key: `row-${++rowSeq}`, item_id: '', quantity: 1, unit_price: 0, reason: '', notes: '', search: '' })
+
+const matchesTerm = (item: PickerItem, term: string) =>
+  item.name_ar.toLowerCase().includes(term) ||
+  item.code.toLowerCase().includes(term) ||
+  Boolean(item.barcode && item.barcode.toLowerCase().includes(term))
 
 export default function SupplierReturnForm() {
   const navigate = useNavigate()
@@ -32,7 +38,7 @@ export default function SupplierReturnForm() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [suppliers, setSuppliers] = useState<Supplier[]>([])
-  const [items, setItems] = useState<Item[]>([])
+  const [items, setItems] = useState<PickerItem[]>([])
 
   const [formData, setFormData] = useState({
     supplier_id: '',
@@ -40,11 +46,7 @@ export default function SupplierReturnForm() {
     notes: '',
   })
 
-  const [returnItems, setReturnItems] = useState<ReturnItem[]>([
-    { item_id: '', quantity: 1, unit_price: 0, reason: '', notes: '' },
-  ])
-
-  const [searchTerm, setSearchTerm] = useState<{ [key: number]: string }>({})
+  const [returnItems, setReturnItems] = useState<ReturnItem[]>(() => [newRow()])
 
   useEffect(() => {
     fetchData()
@@ -53,127 +55,99 @@ export default function SupplierReturnForm() {
   const fetchData = async () => {
     const [suppliersRes, itemsRes] = await Promise.all([
       supabase.from('suppliers').select('id, name_ar, code').eq('status', 'active').order('name_ar'),
-      supabase.from('items').select('id, code, barcode, name_ar, purchase_price').eq('status', 'active').order('name_ar'),
+      fetchPickerItems(),
     ])
+    if (suppliersRes.error || itemsRes.error) {
+      setError('تعذر تحميل البيانات: ' + toUserMessage(suppliersRes.error || itemsRes.error))
+    }
     setSuppliers((fixEncodingInData(suppliersRes.data) as Supplier[]) || [])
-    setItems((fixEncodingInData(itemsRes.data) as Item[]) || [])
-  }
-
-  const generateReturnNumber = () => {
-    const date = new Date()
-    const year = date.getFullYear()
-    const month = (date.getMonth() + 1).toString().padStart(2, '0')
-    const random = Math.floor(Math.random() * 10000).toString().padStart(4, '0')
-    return `SRT-${year}-${month}-${random}`
+    setItems(itemsRes.data.filter(i => i.status === 'active'))
   }
 
   const addItem = () => {
-    setReturnItems([...returnItems, { item_id: '', quantity: 1, unit_price: 0, reason: '', notes: '' }])
+    setReturnItems(rows => [...rows, newRow()])
   }
 
-  const filteredItems = (index: number) => {
-    const term = searchTerm[index]?.toLowerCase() || ''
+  const filteredItems = (search: string) => {
+    const term = search.toLowerCase()
     if (!term) return items
-    return items.filter(item => 
-      item.name_ar.toLowerCase().includes(term) ||
-      item.code.toLowerCase().includes(term) ||
-      (item.barcode && item.barcode.toLowerCase().includes(term))
-    )
+    return items.filter(item => matchesTerm(item, term))
   }
 
-  const removeItem = (index: number) => {
-    if (returnItems.length > 1) {
-      setReturnItems(returnItems.filter((_, i) => i !== index))
-    }
+  const removeItem = (key: string) => {
+    setReturnItems(rows => (rows.length > 1 ? rows.filter(r => r.key !== key) : rows))
   }
 
-  const updateItem = (index: number, field: keyof ReturnItem, value: string | number) => {
-    const updated = [...returnItems]
-    updated[index] = { ...updated[index], [field]: value }
-    
-    // Auto-fill unit price when item is selected
-    if (field === 'item_id' && typeof value === 'string') {
-      const item = items.find(i => i.id === value)
-      if (item?.purchase_price) {
-        updated[index].unit_price = item.purchase_price
-      }
-    }
-    
-    setReturnItems(updated)
+  // Selecting an item also fills its purchase price (0 when it has none: never keep the previous item's price)
+  const selectItem = (key: string, itemId: string, extra: Partial<ReturnItem> = {}) => {
+    const item = items.find(i => i.id === itemId)
+    setReturnItems(rows => rows.map(r => (r.key === key
+      ? { ...r, ...extra, item_id: itemId, unit_price: item?.purchase_price != null ? Number(item.purchase_price) : 0 }
+      : r)))
   }
+
+  const updateRow = (key: string, changes: Partial<ReturnItem>) => {
+    setReturnItems(rows => rows.map(r => (r.key === key ? { ...r, ...changes } : r)))
+  }
+
+  const lineTotal = (item: ReturnItem) => roundMoney(item.quantity * item.unit_price)
 
   // Calculate totals
-  const calculateTotal = () => {
-    return returnItems.reduce((sum, item) => sum + item.quantity * item.unit_price, 0)
-  }
+  const calculateTotal = () => roundMoney(returnItems.filter(i => i.item_id).reduce((sum, item) => sum + lineTotal(item), 0))
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault()
+    if (loading) return
     setError('')
-    setLoading(true)
 
     if (!formData.supplier_id) {
       setError('يرجى اختيار المورد')
-      setLoading(false)
       return
     }
 
     if (!user?.id) {
       setError('يرجى تسجيل الدخول مرة أخرى')
-      setLoading(false)
       return
     }
 
-    // Verify user exists in database
-    const { data: userExists, error: userError } = await supabase
-      .from('users')
-      .select('id')
-      .eq('id', user.id)
-      .single()
-
-    if (userError || !userExists) {
-      setError('المستخدم غير موجود في قاعدة البيانات. يرجى تسجيل الدخول مرة أخرى.')
-      setLoading(false)
-      return
-    }
-
-    const validItems = returnItems.filter(item => item.item_id && item.quantity > 0)
-    if (validItems.length === 0) {
+    const chosen = returnItems.filter(item => item.item_id)
+    if (chosen.length === 0) {
       setError('يرجى إضافة صنف واحد على الأقل')
-      setLoading(false)
+      return
+    }
+    const badQty = chosen.find(i => !(i.quantity > 0))
+    if (badQty) {
+      const itemName = items.find(i => i.id === badQty.item_id)?.name_ar || ''
+      setError(`يرجى إدخال كمية أكبر من صفر للصنف ${itemName}`)
+      return
+    }
+    if (chosen.some(i => !(i.unit_price >= 0))) {
+      setError('سعر الوحدة لا يمكن أن يكون سالباً')
       return
     }
 
-    // Create multiple supplier returns (one per item as per current schema)
-    const returnNumber = generateReturnNumber()
-    
-    for (let i = 0; i < validItems.length; i++) {
-      const item = validItems[i]
-      const itemReturnNumber = validItems.length > 1 ? `${returnNumber}-${i + 1}` : returnNumber
-      
-      const { error: insertError } = await supabase.from('supplier_returns').insert({
-        return_number: itemReturnNumber,
-        supplier_id: formData.supplier_id,
-        item_id: item.item_id,
-        quantity: item.quantity,
-        unit_price: item.unit_price,
-        total_amount: item.quantity * item.unit_price,
-        reason: item.reason || formData.return_reason,
-        description: item.notes || formData.notes,
-        status: 'pending',
-        registered_by: user.id,
-        registered_at: new Date().toISOString(),
-      })
+    // All lines are saved in one database transaction (stock is checked there; nothing is half-saved)
+    setLoading(true)
+    const { error: saveError } = await returnsService.createSupplierReturn({
+      supplier_id: formData.supplier_id,
+      reason: formData.return_reason,
+      notes: formData.notes,
+      items: chosen.map(i => ({
+        item_id: i.item_id,
+        quantity: roundQuantity(i.quantity),
+        unit_price: i.unit_price,
+        reason: i.reason,
+        notes: i.notes,
+      })),
+    })
 
-      if (insertError) {
-        setError('فشل في حفظ المرتجع: ' + insertError.message)
-        setLoading(false)
-        return
-      }
+    if (saveError) {
+      setError('فشل في حفظ المرتجع: ' + toUserMessage(saveError))
+      setLoading(false)
+      return
     }
 
     navigate('/returns')
-    setLoading(false)
   }
 
   return (
@@ -196,7 +170,7 @@ export default function SupplierReturnForm() {
       {error && (
         <div className="mb-6 p-4 bg-red-50 border border-red-200 rounded-lg flex items-center gap-3">
           <AlertCircle className="w-5 h-5 text-red-500 shrink-0" />
-          <p className="text-red-700">{error}</p>
+          <p className="text-red-700 whitespace-pre-line">{error}</p>
         </div>
       )}
 
@@ -271,13 +245,13 @@ export default function SupplierReturnForm() {
 
           {/* Items Table */}
           <div className="space-y-4">
-            {returnItems.map((item, index) => {
+            {returnItems.map((item) => {
               const selectedItem = items.find(i => i.id === item.item_id)
-              const searchResults = filteredItems(index)
-              const showResults = searchTerm[index] && searchResults.length > 0
-              
+              const searchResults = filteredItems(item.search)
+              const showResults = item.search && searchResults.length > 0
+
               return (
-                <div key={index} className="p-4 rounded-lg border bg-gray-50 border-gray-200">
+                <div key={item.key} className="p-4 rounded-lg border bg-gray-50 border-gray-200">
                   <div className="space-y-3">
                     {/* Search Input with Icon */}
                     <div className="relative">
@@ -288,29 +262,30 @@ export default function SupplierReturnForm() {
                         <input
                           type="text"
                           placeholder="امسح الباركود أو أدخل الكود أو اسم الصنف"
-                          value={searchTerm[index] || ''}
+                          value={item.search}
                           onChange={(e) => {
-                            setSearchTerm({ ...searchTerm, [index]: e.target.value })
+                            const value = e.target.value
                             // Auto-select if only one result
-                            const results = items.filter(i => 
-                              i.name_ar.toLowerCase().includes(e.target.value.toLowerCase()) ||
-                              i.code.toLowerCase().includes(e.target.value.toLowerCase()) ||
-                              (i.barcode && i.barcode.toLowerCase().includes(e.target.value.toLowerCase()))
-                            )
-                            if (results.length === 1 && e.target.value.length > 2) {
-                              updateItem(index, 'item_id', results[0].id)
+                            const results = items.filter(i => matchesTerm(i, value.toLowerCase()))
+                            if (results.length === 1 && value.length > 2) {
+                              selectItem(item.key, results[0].id, { search: value })
+                            } else {
+                              updateRow(item.key, { search: value })
                             }
                           }}
                           onKeyDown={(e) => {
-                            if (e.key === 'Enter' && searchResults.length > 0) {
-                              updateItem(index, 'item_id', searchResults[0].id)
-                              setSearchTerm({ ...searchTerm, [index]: '' })
+                            if (e.key === 'Enter') {
+                              // A scanner sends Enter after every code: pick the item, never submit the form
+                              e.preventDefault()
+                              if (searchResults.length > 0) {
+                                selectItem(item.key, searchResults[0].id, { search: '' })
+                              }
                             }
                           }}
                           className="flex-1 px-3 py-2 border-0 bg-transparent focus:outline-none text-gray-700 placeholder-gray-500"
                         />
                       </div>
-                      
+
                       {/* Search Results Dropdown */}
                       {showResults && (
                         <div className="absolute z-10 w-full bg-white border border-gray-200 rounded-lg shadow-lg max-h-60 overflow-y-auto mt-1">
@@ -318,10 +293,7 @@ export default function SupplierReturnForm() {
                             <button
                               key={i.id}
                               type="button"
-                              onClick={() => {
-                                updateItem(index, 'item_id', i.id)
-                                setSearchTerm({ ...searchTerm, [index]: '' })
-                              }}
+                              onClick={() => selectItem(item.key, i.id, { search: '' })}
                               className="w-full text-right px-4 py-3 hover:bg-blue-50 border-b border-gray-100 last:border-0 transition-colors"
                             >
                               <div className="font-medium text-gray-900">{i.name_ar}</div>
@@ -333,18 +305,18 @@ export default function SupplierReturnForm() {
                                     <span>الباركود: {i.barcode}</span>
                                   </>
                                 )}
-                                {i.purchase_price && (
+                                {i.purchase_price ? (
                                   <>
                                     <span>•</span>
                                     <span className="text-green-600">{i.purchase_price} ج.م</span>
                                   </>
-                                )}
+                                ) : null}
                               </div>
                             </button>
                           ))}
                         </div>
                       )}
-                      
+
                       {/* Selected Item Display */}
                       {selectedItem && (
                         <div className="mt-2 p-3 bg-green-50 border border-green-200 rounded-lg">
@@ -358,10 +330,7 @@ export default function SupplierReturnForm() {
                             </div>
                             <button
                               type="button"
-                              onClick={() => {
-                                updateItem(index, 'item_id', '')
-                                setSearchTerm({ ...searchTerm, [index]: '' })
-                              }}
+                              onClick={() => updateRow(item.key, { item_id: '', search: '', unit_price: 0 })}
                               className="text-red-500 hover:text-red-700"
                               title="إلغاء الاختيار"
                             >
@@ -370,9 +339,9 @@ export default function SupplierReturnForm() {
                           </div>
                         </div>
                       )}
-                      
+
                       {/* Helper Text */}
-                      {!selectedItem && !searchTerm[index] && (
+                      {!selectedItem && !item.search && (
                         <p className="text-sm text-blue-600 mt-2 flex items-center gap-2">
                           <Barcode className="w-4 h-4" />
                           استخدم قارئ الباركود أو أدخل الكود يدوياً ثم اضغط Enter
@@ -389,7 +358,10 @@ export default function SupplierReturnForm() {
                           min="0.001"
                           step="0.001"
                           value={item.quantity}
-                          onChange={(e) => updateItem(index, 'quantity', Number(e.target.value))}
+                          onChange={(e) => {
+                            const qty = parseDecimal(e.target.value)
+                            updateRow(item.key, { quantity: qty !== null && qty > 0 ? roundQuantity(qty) : 0 })
+                          }}
                           className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 text-sm"
                           placeholder="مثال: 19.200"
                           dir="ltr"
@@ -401,9 +373,12 @@ export default function SupplierReturnForm() {
                         <input
                           type="number"
                           min="0"
-                          step="0.01"
+                          step="any"
                           value={item.unit_price}
-                          onChange={(e) => updateItem(index, 'unit_price', Number(e.target.value))}
+                          onChange={(e) => {
+                            const price = parseDecimal(e.target.value)
+                            updateRow(item.key, { unit_price: price !== null && price >= 0 ? price : 0 })
+                          }}
                           className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 text-sm"
                           dir="ltr"
                           aria-label="سعر الوحدة"
@@ -412,7 +387,7 @@ export default function SupplierReturnForm() {
                       <div>
                         <label className="block text-xs font-medium text-gray-600 mb-1">الإجمالي</label>
                         <div className="px-3 py-2 bg-gray-100 rounded-lg text-sm font-medium text-gray-900">
-                          {(item.quantity * item.unit_price).toLocaleString('ar-EG')} ج.م
+                          {formatCurrency(lineTotal(item))}
                         </div>
                       </div>
                       <div>
@@ -420,7 +395,7 @@ export default function SupplierReturnForm() {
                         <input
                           type="text"
                           value={item.reason}
-                          onChange={(e) => updateItem(index, 'reason', e.target.value)}
+                          onChange={(e) => updateRow(item.key, { reason: e.target.value })}
                           className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 text-sm"
                           placeholder="السبب"
                           aria-label="السبب"
@@ -433,7 +408,7 @@ export default function SupplierReturnForm() {
                       <div className="flex justify-end">
                         <button
                           type="button"
-                          onClick={() => removeItem(index)}
+                          onClick={() => removeItem(item.key)}
                           className="flex items-center gap-1 px-3 py-1.5 text-red-600 hover:bg-red-50 rounded-lg text-sm"
                           title="حذف"
                         >
@@ -454,7 +429,7 @@ export default function SupplierReturnForm() {
               <div className="flex justify-between gap-8">
                 <span className="text-gray-600">إجمالي قيمة المرتجع:</span>
                 <span className="font-bold text-lg text-red-600">
-                  {calculateTotal().toLocaleString('ar-EG')} ج.م
+                  {formatCurrency(calculateTotal())}
                 </span>
               </div>
               <p className="text-xs text-gray-500 mt-1">

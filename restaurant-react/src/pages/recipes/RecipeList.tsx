@@ -3,7 +3,7 @@ import { Link } from 'react-router-dom'
 import { recipeService } from '../../services/recipe.service'
 import { Item } from '../../types/database.types'
 import { Plus, Search, ChefHat, Eye, Edit, Factory, DollarSign, Upload, Filter } from 'lucide-react'
-import { supabase, fixEncodingInData } from '../../lib/supabase'
+import { toUserMessage } from '../../lib/errors'
 
 interface RecipeWithCost extends Item {
   calculated_cost?: number
@@ -18,6 +18,7 @@ export default function RecipeList() {
   const [recipes, setRecipes] = useState<RecipeWithCost[]>([])
   const [categories, setCategories] = useState<Category[]>([])
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
   const [searchTerm, setSearchTerm] = useState('')
   const [selectedCategory, setSelectedCategory] = useState<string>('')
 
@@ -29,15 +30,12 @@ export default function RecipeList() {
     setLoading(true)
     const [recipesRes, categoriesRes] = await Promise.all([
       recipeService.getAllRecipesWithCost(),
-      supabase
-        .from('categories')
-        .select('id, name_ar')
-        .eq('is_active', true)
-        .order('name_ar')
+      recipeService.getCategories()
     ])
-    
+    const loadError = recipesRes.error || categoriesRes.error
+    setError(loadError ? 'تعذر تحميل الريسبيات: ' + toUserMessage(loadError) : '')
     setRecipes(recipesRes.data || [])
-    setCategories(fixEncodingInData(categoriesRes.data) as Category[] || [])
+    setCategories(categoriesRes.data as Category[])
     setLoading(false)
   }
 
@@ -90,6 +88,10 @@ export default function RecipeList() {
           </Link>
         </div>
       </div>
+
+      {error && (
+        <div className="mb-6 p-4 bg-red-50 border border-red-200 rounded-lg text-red-700">{error}</div>
+      )}
 
       {/* Search and Filter */}
       <div className="bg-white rounded-lg shadow-sm border border-gray-100 p-4 mb-6">

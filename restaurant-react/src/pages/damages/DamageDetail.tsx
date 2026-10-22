@@ -1,8 +1,9 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { damagesService, DamageWithDetails } from '../../services/damages.service'
 import { useAuth } from '../../contexts/AuthContext'
-import { formatDate, formatCurrency, getStatusColor, translateStatus } from '../../lib/utils'
+import { formatDate, formatCurrency, formatQuantity, getStatusColor, translateStatus } from '../../lib/utils'
+import { toUserMessage } from '../../lib/errors'
 import { ArrowRight, Building2, Package, AlertTriangle, Check, X, Printer } from 'lucide-react'
 
 export default function DamageDetail() {
@@ -11,14 +12,17 @@ export default function DamageDetail() {
   const { user } = useAuth()
   const [damage, setDamage] = useState<DamageWithDetails | null>(null)
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState('')
   const [actionLoading, setActionLoading] = useState(false)
+  const busy = useRef(false) // blocks a second click before the button re-renders as disabled
 
   useEffect(() => {
     if (id) fetchDamage(id)
   }, [id])
 
   const fetchDamage = async (damageId: string) => {
-    const { data } = await damagesService.getById(damageId)
+    const { data, error } = await damagesService.getById(damageId)
+    setLoadError(error && error.code !== 'PGRST116' ? toUserMessage(error) : '')
     setDamage(data)
     setLoading(false)
   }
@@ -33,31 +37,41 @@ export default function DamageDetail() {
       }
     `;
     document.head.appendChild(style);
-    
+
     window.print();
-    
+
     // Remove the style after printing
     setTimeout(() => {
       document.head.removeChild(style);
     }, 1000);
   };
 
-  const handleApprove = async () => {
-    if (!damage || !user) return
+  // Runs one status action and always reloads, so a refused action (already processed, not enough stock) shows the real state
+  const runAction = async (action: () => Promise<{ error: unknown }>, failMessage: string) => {
+    if (!damage || busy.current) return
+    busy.current = true
     setActionLoading(true)
-    await damagesService.approve(damage.id, user.id)
-    fetchDamage(damage.id)
+    try {
+      const { error } = await action()
+      if (error) alert(`${failMessage}: ${toUserMessage(error)}`)
+    } catch (err) {
+      alert(`${failMessage}: ${toUserMessage(err)}`)
+    }
+    await fetchDamage(damage.id)
     setActionLoading(false)
+    busy.current = false
   }
 
-  const handleReject = async () => {
+  const handleApprove = () => {
+    if (!damage || !user) return
+    runAction(() => damagesService.approve(damage.id), 'تعذرت الموافقة على التالف')
+  }
+
+  const handleReject = () => {
     if (!damage || !user) return
     const reason = prompt('سبب الرفض:')
     if (reason === null) return
-    setActionLoading(true)
-    await damagesService.reject(damage.id, user.id, reason)
-    fetchDamage(damage.id)
-    setActionLoading(false)
+    runAction(() => damagesService.reject(damage.id, reason), 'تعذر رفض التالف')
   }
 
   if (loading) {
@@ -65,20 +79,20 @@ export default function DamageDetail() {
   }
 
   if (!damage) {
-    return <div className="text-center py-12"><p className="text-gray-600">سجل التالف غير موجود</p></div>
+    return <div className="text-center py-12"><p className="text-gray-600">{loadError || 'سجل التالف غير موجود'}</p></div>
   }
 
   // Get user role
-  const userRole = typeof user?.role === 'object' && user?.role !== null 
-    ? (user.role as { name: string }).name 
+  const userRole = typeof user?.role === 'object' && user?.role !== null
+    ? (user.role as { name: string }).name
     : user?.role
 
   // Admin and warehouse_manager can approve any damage
   // Branch supervisor can approve damages in their branch
   const canApprove = damage.status === 'pending' && (
-    userRole === 'admin' || 
+    userRole === 'admin' ||
     userRole === 'warehouse_manager' ||
-    (userRole === 'branch_supervisor' && user?.branch_id === damage.branch_id)
+    (userRole === 'branch_supervisor' && Boolean(user?.branch_id) && user?.branch_id === damage.branch_id)
   )
 
   return (
@@ -135,11 +149,12 @@ export default function DamageDetail() {
         </h3>
         <div className="grid grid-cols-2 gap-4 text-sm print:gap-2">
           <div><span className="text-gray-500">التاريخ:</span> <span className="font-medium">{formatDate(damage.registered_at)}</span></div>
-          <div><span className="text-gray-500">الكمية:</span> <span className="font-medium">{damage.quantity}</span></div>
+          <div><span className="text-gray-500">الكمية:</span> <span className="font-medium">{formatQuantity(damage.quantity)} {damage.item?.unit?.name_ar || ''}</span></div>
           <div><span className="text-gray-500">تكلفة الوحدة:</span> <span className="font-medium">{damage.unit_cost ? formatCurrency(damage.unit_cost) : '-'}</span></div>
           <div><span className="text-gray-500">إجمالي التكلفة:</span> <span className="font-medium text-red-600">{damage.total_cost ? formatCurrency(damage.total_cost) : '-'}</span></div>
           <div><span className="text-gray-500">السبب:</span> <span className="font-medium">{damage.reason?.name_ar || '-'}</span></div>
           {damage.description && <div className="col-span-2"><span className="text-gray-500">الوصف:</span> <span className="font-medium">{damage.description}</span></div>}
+          {damage.rejection_reason && <div className="col-span-2"><span className="text-gray-500">سبب الرفض:</span> <span className="font-medium text-red-600">{damage.rejection_reason}</span></div>}
         </div>
       </div>
 

@@ -1,313 +1,218 @@
 import { supabase, fixEncodingInData } from '../lib/supabase'
-import { notificationsService } from './notifications.service'
+import { fetchAll } from '../lib/fetchAll'
+import { roundQuantity } from '../lib/utils'
+
+// Every status change of a return is one database function (status re-checked under a row lock,
+// stock and supplier balance changed in the same transaction). These wrappers only pass the input on.
 
 export interface SupplierReturn {
   id: string
   return_number: string
   supplier_id: string
   item_id: string
+  branch_id: string | null
   quantity: number
+  unit_price: number
+  total_amount: number
   reason: string
-  description: string
+  description: string | null
   status: string
+  rejection_reason: string | null
   registered_at: string
-  approved_at?: string
-  approved_by?: string
-  supplier?: { id: string; name_ar: string }
-  item?: { id: string; name_ar: string; code: string }
+  approved_at?: string | null
+  received_by_supplier_at?: string | null
+  supplier: { id: string; name_ar: string; code: string } | null
+  item: { id: string; name_ar: string; code: string; unit: { name_ar: string } | null } | null
+  branch: { id: string; name_ar: string } | null
+}
+
+export interface BranchReturnItem {
+  id: string
+  item_id: string
+  requested_quantity: number
+  approved_quantity: number | null
+  shipped_quantity: number | null
+  received_quantity: number | null
+  item_reason: string | null
+  notes: string | null
+  item: { id: string; name_ar: string; code: string; unit: { name_ar: string } | null } | null
 }
 
 export interface BranchReturn {
   id: string
   return_number: string
+  return_date: string
   from_branch_id: string
   to_branch_id: string
   status: string
   return_reason: string
   total_items: number
   total_quantity: number
-  notes: string
+  notes: string | null
+  rejection_reason: string | null
   requested_at: string
-  approved_at?: string
-  from_branch?: { id: string; name_ar: string }
-  to_branch?: { id: string; name_ar: string }
-  items?: BranchReturnItem[]
+  from_branch: { id: string; name_ar: string; code: string } | null
+  to_branch: { id: string; name_ar: string; code: string } | null
+  items: BranchReturnItem[]
 }
 
-export interface BranchReturnItem {
-  id: string
-  return_id: string
-  item_id: string
-  requested_quantity: number
-  approved_quantity?: number
-  received_quantity?: number
-  item?: { id: string; name_ar: string; code: string }
+export interface CreateSupplierReturnData {
+  supplier_id: string
+  reason?: string
+  notes?: string
+  items: { item_id: string; quantity: number; unit_price: number; reason?: string; notes?: string }[]
 }
+
+export interface CreateBranchReturnData {
+  from_branch_id: string
+  return_reason: string
+  notes?: string
+  items: { item_id: string; quantity: number; reason?: string; notes?: string }[]
+}
+
+const SUPPLIER_RETURN_SELECT = `
+  id, return_number, supplier_id, item_id, branch_id, quantity, unit_price, total_amount, reason, description,
+  status, rejection_reason, registered_at, approved_at, received_by_supplier_at,
+  supplier:suppliers(id, name_ar, code),
+  item:items(id, name_ar, code, unit:units(name_ar)),
+  branch:branches(id, name_ar)
+`
+
+const BRANCH_RETURN_SELECT = `
+  id, return_number, return_date, from_branch_id, to_branch_id, status, return_reason, total_items, total_quantity,
+  notes, rejection_reason, requested_at,
+  from_branch:branches!branch_returns_from_branch_id_fkey(id, name_ar, code),
+  to_branch:branches!branch_returns_to_branch_id_fkey(id, name_ar, code),
+  items:branch_return_items(id, item_id, requested_quantity, approved_quantity, shipped_quantity, received_quantity,
+    item_reason, notes, item:items(id, name_ar, code, unit:units(name_ar)))
+`
 
 export const returnsService = {
-  // Supplier Returns
+  // ---------- Supplier returns ----------
+
   async getSupplierReturns() {
-    const { data, error } = await supabase
-      .from('supplier_returns')
-      .select('*, supplier:suppliers(id, name_ar), item:items(id, name_ar, code)')
-      .order('registered_at', { ascending: false })
-    return { data: fixEncodingInData(data) as SupplierReturn[], error }
+    try {
+      const rows = await fetchAll<Record<string, unknown>>((from, to) =>
+        supabase
+          .from('supplier_returns')
+          .select(SUPPLIER_RETURN_SELECT)
+          .order('registered_at', { ascending: false })
+          .order('id')
+          .range(from, to))
+      return { data: fixEncodingInData(rows) as unknown as SupplierReturn[], error: null }
+    } catch (error) {
+      return { data: [] as SupplierReturn[], error }
+    }
   },
 
   async getSupplierReturnById(id: string) {
     const { data, error } = await supabase
       .from('supplier_returns')
-      .select('*, supplier:suppliers(id, name_ar), item:items(id, name_ar, code)')
+      .select(SUPPLIER_RETURN_SELECT)
       .eq('id', id)
       .single()
-    return { data: fixEncodingInData(data) as SupplierReturn, error }
+    return { data: data ? (fixEncodingInData(data) as unknown as SupplierReturn) : null, error }
   },
 
-  async approveSupplierReturn(id: string, approvedBy: string, branchId: string) {
-    // Get return details
-    const { data: returnData } = await this.getSupplierReturnById(id)
-    if (!returnData) return { error: new Error('Return not found') }
-
-    // Update status
-    const { error: updateError } = await supabase
-      .from('supplier_returns')
-      .update({
-        status: 'approved',
-        approved_by: approvedBy,
-        approved_at: new Date().toISOString(),
-      })
-      .eq('id', id)
-
-    if (updateError) return { error: updateError }
-
-    // Deduct from inventory (return to supplier means removing from our stock)
-    const { data: inventory } = await supabase
-      .from('inventory')
-      .select('id, quantity')
-      .eq('branch_id', branchId)
-      .eq('item_id', returnData.item_id)
-      .single()
-
-    if (inventory) {
-      const newQuantity = Math.max(0, Number(inventory.quantity) - returnData.quantity)
-      await supabase
-        .from('inventory')
-        .update({ quantity: newQuantity, updated_at: new Date().toISOString() })
-        .eq('id', inventory.id)
-    }
-
-    return { error: null }
+  // All lines are saved together under one number (SRT-YYYYMM-00001, -1/-2... for several items)
+  async createSupplierReturn(payload: CreateSupplierReturnData) {
+    const { data, error } = await supabase.rpc('return_supplier_create', {
+      p_supplier_id: payload.supplier_id,
+      p_items: payload.items.map(i => ({
+        item_id: i.item_id,
+        quantity: roundQuantity(i.quantity),
+        unit_price: i.unit_price,
+        reason: i.reason || null,
+        notes: i.notes || null,
+      })),
+      p_reason: payload.reason || null,
+      p_notes: payload.notes || null,
+    })
+    return { data: data as { return_number: string; ids: string[] } | null, error }
   },
 
-  async rejectSupplierReturn(id: string, rejectedBy: string, reason?: string) {
-    const { error } = await supabase
-      .from('supplier_returns')
-      .update({
-        status: 'rejected',
-        rejected_by: rejectedBy,
-        rejected_at: new Date().toISOString(),
-        rejection_reason: reason,
-      })
-      .eq('id', id)
+  // Deducts the stock and lowers the supplier balance by the return value, in one transaction
+  async approveSupplierReturn(id: string) {
+    const { error } = await supabase.rpc('return_supplier_approve', { p_return_id: id })
     return { error }
   },
 
-  // Branch Returns
-  async getBranchReturns() {
-    const { data, error } = await supabase
-      .from('branch_returns')
-      .select('*, from_branch:branches!from_branch_id(id, name_ar), to_branch:branches!to_branch_id(id, name_ar)')
-      .order('requested_at', { ascending: false })
-    return { data: fixEncodingInData(data) as BranchReturn[], error }
+  // Marks an approved return as handed over to the supplier
+  async completeSupplierReturn(id: string) {
+    const { error } = await supabase.rpc('return_supplier_complete', { p_return_id: id })
+    return { error }
+  },
+
+  async rejectSupplierReturn(id: string, reason?: string) {
+    const { error } = await supabase.rpc('return_supplier_reject', { p_return_id: id, p_reason: reason || null })
+    return { error }
+  },
+
+  // ---------- Branch returns (branch -> main warehouse) ----------
+
+  async getBranchReturns(fromBranchId?: string) {
+    try {
+      const rows = await fetchAll<Record<string, unknown>>((from, to) => {
+        let query = supabase
+          .from('branch_returns')
+          .select(BRANCH_RETURN_SELECT)
+          .order('return_date', { ascending: false })
+          .order('requested_at', { ascending: false })
+          .order('id')
+        if (fromBranchId) {
+          query = query.eq('from_branch_id', fromBranchId)
+        }
+        return query.range(from, to)
+      })
+      return { data: fixEncodingInData(rows) as unknown as BranchReturn[], error: null }
+    } catch (error) {
+      return { data: [] as BranchReturn[], error }
+    }
   },
 
   async getBranchReturnById(id: string) {
-    // Get return with branches
-    const { data: returnData, error: returnError } = await supabase
+    const { data, error } = await supabase
       .from('branch_returns')
-      .select('*, from_branch:branches!from_branch_id(id, name_ar), to_branch:branches!to_branch_id(id, name_ar)')
+      .select(BRANCH_RETURN_SELECT)
       .eq('id', id)
       .single()
-
-    if (returnError) return { data: null, error: returnError }
-
-    // Get return items
-    const { data: items } = await supabase
-      .from('branch_return_items')
-      .select('*, item:items(id, name_ar, code)')
-      .eq('return_id', id)
-
-    return { 
-      data: fixEncodingInData({ ...returnData, items: items || [] }) as BranchReturn, 
-      error: null 
-    }
+    return { data: data ? (fixEncodingInData(data) as unknown as BranchReturn) : null, error }
   },
 
-  async approveBranchReturn(id: string, approvedBy: string, approvedQuantities: { itemId: string; quantity: number }[]) {
-    // Get return details for notification
-    const { data: returnData } = await supabase
-      .from('branch_returns')
-      .select('return_number, from_branch_id, to_branch_id')
-      .eq('id', id)
-      .single()
-
-    // Update status
-    const { error: updateError } = await supabase
-      .from('branch_returns')
-      .update({
-        status: 'approved',
-        approved_by: approvedBy,
-        approved_at: new Date().toISOString(),
-      })
-      .eq('id', id)
-
-    if (updateError) return { error: updateError }
-
-    // Update approved quantities
-    for (const item of approvedQuantities) {
-      await supabase
-        .from('branch_return_items')
-        .update({ approved_quantity: item.quantity })
-        .eq('return_id', id)
-        .eq('item_id', item.itemId)
-    }
-
-    // Create notification
-    if (returnData) {
-      await notificationsService.create({
-        user_id: null,
-        branch_id: returnData.from_branch_id,
-        type: 'return',
-        title: 'تمت الموافقة على المرتجع',
-        message: `تمت الموافقة على طلب المرتجع ${returnData.return_number}`,
-        priority: 'medium',
-        reference_type: 'branch_return',
-        reference_id: id,
-        expires_at: null,
-      })
-    }
-
-    return { error: null }
+  // Header and lines in one transaction; the number and the main warehouse are set by the database
+  async createBranchReturn(payload: CreateBranchReturnData) {
+    const { data, error } = await supabase.rpc('return_branch_create', {
+      p_from_branch_id: payload.from_branch_id,
+      p_return_reason: payload.return_reason,
+      p_items: payload.items.map(i => ({
+        item_id: i.item_id,
+        quantity: roundQuantity(i.quantity),
+        reason: i.reason || null,
+        notes: i.notes || null,
+      })),
+      p_notes: payload.notes || null,
+    })
+    return { data: data as { id: string; return_number: string } | null, error }
   },
 
-  async receiveBranchReturn(id: string, receivedBy: string, receivedQuantities: { itemId: string; quantity: number }[]) {
-    // Get return details
-    const { data: returnData } = await this.getBranchReturnById(id)
-    if (!returnData) return { error: new Error('Return not found') }
-
-    // Get item names for error messages
-    const { data: itemsData } = await supabase
-      .from('items')
-      .select('id, name_ar')
-      .in('id', receivedQuantities.map(i => i.itemId))
-
-    const itemNames: Record<string, string> = {}
-    itemsData?.forEach(item => { itemNames[item.id] = item.name_ar })
-
-    // VALIDATION: Check if all quantities are available in source branch
-    const insufficientItems: string[] = []
-    for (const item of receivedQuantities) {
-      if (item.quantity <= 0) continue
-
-      const { data: sourceInv } = await supabase
-        .from('inventory')
-        .select('quantity')
-        .eq('branch_id', returnData.from_branch_id)
-        .eq('item_id', item.itemId)
-        .single()
-
-      const availableQty = sourceInv?.quantity || 0
-      if (availableQty < item.quantity) {
-        const itemName = itemNames[item.itemId] || item.itemId
-        insufficientItems.push(`${itemName}: متوفر ${availableQty} - مطلوب ${item.quantity}`)
-      }
-    }
-
-    if (insufficientItems.length > 0) {
-      return { 
-        error: new Error(`الكمية غير متوفرة في الفرع المرسل:\n${insufficientItems.join('\n')}`) 
-      }
-    }
-
-    // Update status
-    const { error: updateError } = await supabase
-      .from('branch_returns')
-      .update({
-        status: 'received',
-        received_by: receivedBy,
-        received_at: new Date().toISOString(),
-      })
-      .eq('id', id)
-
-    if (updateError) return { error: updateError }
-
-    // Update received quantities and adjust inventory
-    for (const item of receivedQuantities) {
-      if (item.quantity <= 0) continue
-
-      // Update return item
-      await supabase
-        .from('branch_return_items')
-        .update({ received_quantity: item.quantity })
-        .eq('return_id', id)
-        .eq('item_id', item.itemId)
-
-      // Deduct from source branch (the branch returning items)
-      const { data: sourceInv } = await supabase
-        .from('inventory')
-        .select('id, quantity')
-        .eq('branch_id', returnData.from_branch_id)
-        .eq('item_id', item.itemId)
-        .single()
-
-      if (sourceInv) {
-        const newSourceQty = sourceInv.quantity - item.quantity
-        await supabase
-          .from('inventory')
-          .update({ quantity: newSourceQty, updated_at: new Date().toISOString() })
-          .eq('id', sourceInv.id)
-      }
-
-      // Add to destination branch (main warehouse)
-      const { data: destInv } = await supabase
-        .from('inventory')
-        .select('id, quantity')
-        .eq('branch_id', returnData.to_branch_id)
-        .eq('item_id', item.itemId)
-        .single()
-
-      if (destInv) {
-        const newDestQty = Number(destInv.quantity) + item.quantity
-        await supabase
-          .from('inventory')
-          .update({ quantity: newDestQty, updated_at: new Date().toISOString() })
-          .eq('id', destInv.id)
-      } else {
-        // Create new inventory record
-        await supabase
-          .from('inventory')
-          .insert({
-            branch_id: returnData.to_branch_id,
-            item_id: item.itemId,
-            quantity: item.quantity,
-            min_quantity: 0,
-          })
-      }
-    }
-
-    return { error: null }
+  async approveBranchReturn(id: string) {
+    const { error } = await supabase.rpc('return_branch_approve', { p_return_id: id })
+    return { error }
   },
 
-  async rejectBranchReturn(id: string, rejectedBy: string, reason?: string) {
-    const { error } = await supabase
-      .from('branch_returns')
-      .update({
-        status: 'rejected',
-        rejected_by: rejectedBy,
-        rejected_at: new Date().toISOString(),
-        rejection_reason: reason,
-      })
-      .eq('id', id)
+  async shipBranchReturn(id: string) {
+    const { error } = await supabase.rpc('return_branch_ship', { p_return_id: id })
+    return { error }
+  },
+
+  // Moves the stock from the branch to the main warehouse; refused when the branch no longer holds it
+  async receiveBranchReturn(id: string) {
+    const { error } = await supabase.rpc('return_branch_receive', { p_return_id: id })
+    return { error }
+  },
+
+  async rejectBranchReturn(id: string, reason?: string) {
+    const { error } = await supabase.rpc('return_branch_reject', { p_return_id: id, p_reason: reason || null })
     return { error }
   },
 }

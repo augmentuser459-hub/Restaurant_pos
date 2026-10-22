@@ -1,31 +1,12 @@
 import { useState, useEffect, useRef } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { supabase, fixEncodingInData } from '../../lib/supabase'
 import { useAuth } from '../../contexts/AuthContext'
-import { formatDate, getStatusColor, translateStatus } from '../../lib/utils'
+import { returnsService, BranchReturn } from '../../services/returns.service'
+import { formatDate, formatQuantity, getStatusColor, translateStatus } from '../../lib/utils'
+import { toUserMessage } from '../../lib/errors'
 import { ArrowRight, Building2, Package, Check, X, Truck, Printer } from 'lucide-react'
 
-interface BranchReturnItem {
-  id: string
-  requested_quantity: number
-  received_quantity: number | null
-  item_reason: string
-  notes: string
-  item: { id: string; code: string; name_ar: string }
-}
-
-interface BranchReturn {
-  id: string
-  return_number: string
-  return_date: string
-  status: string
-  return_reason: string
-  total_quantity: number
-  notes: string
-  from_branch: { id: string; name_ar: string; code: string }
-  to_branch: { id: string; name_ar: string; code: string }
-  items: BranchReturnItem[]
-}
+const statusLabel = (status: string) => (status === 'in_transit' ? 'قيد الشحن' : translateStatus(status))
 
 export default function BranchReturnDetail() {
   const { id } = useParams()
@@ -33,32 +14,18 @@ export default function BranchReturnDetail() {
   const { user } = useAuth()
   const [returnData, setReturnData] = useState<BranchReturn | null>(null)
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState('')
   const [actionLoading, setActionLoading] = useState(false)
-  const isReceiving = useRef(false) // Prevent double execution
+  const busy = useRef(false) // blocks a second click before the button re-renders as disabled
 
   useEffect(() => {
     if (id) fetchReturn(id)
   }, [id])
 
   const fetchReturn = async (returnId: string) => {
-    const { data } = await supabase
-      .from('branch_returns')
-      .select(`
-        id, return_number, return_date, status, return_reason, total_quantity, notes,
-        from_branch:branches!branch_returns_from_branch_id_fkey(id, name_ar, code),
-        to_branch:branches!branch_returns_to_branch_id_fkey(id, name_ar, code)
-      `)
-      .eq('id', returnId)
-      .single()
-    
-    // Fetch items
-    const { data: items } = await supabase
-      .from('branch_return_items')
-      .select('id, requested_quantity, received_quantity, item_reason, notes, item:items(id, code, name_ar)')
-      .eq('return_id', returnId)
-    
-    const returnWithItems = { ...data, items: fixEncodingInData(items) || [] }
-    setReturnData(fixEncodingInData(returnWithItems) as unknown as BranchReturn)
+    const { data, error } = await returnsService.getBranchReturnById(returnId)
+    setLoadError(error && error.code !== 'PGRST116' ? toUserMessage(error) : '')
+    setReturnData(data)
     setLoading(false)
   }
 
@@ -72,277 +39,52 @@ export default function BranchReturnDetail() {
       }
     `;
     document.head.appendChild(style);
-    
+
     window.print();
-    
+
     // Remove the style after printing
     setTimeout(() => {
       document.head.removeChild(style);
     }, 1000);
   };
 
-  const handleApprove = async () => {
-    if (!returnData || !user) return
+  // Each action is one database function that re-checks the status under a row lock (a stale page or a
+  // double click is refused) and moves the stock all or nothing. The page always reloads afterwards.
+  const runAction = async (action: () => Promise<{ error: unknown }>, failMessage: string) => {
+    if (!returnData || busy.current) return
+    busy.current = true
     setActionLoading(true)
-    
-    console.log('=== APPROVE PROCESS START ===')
-    console.log('Return:', returnData.return_number)
-    
-    // Log inventory BEFORE approve
-    for (const item of returnData.items) {
-      const { data: sourceInv } = await supabase
-        .from('inventory')
-        .select('quantity')
-        .eq('branch_id', returnData.from_branch.id)
-        .eq('item_id', item.item.id)
-        .single()
-      console.log(`BEFORE APPROVE - ${item.item.name_ar}: Source=${sourceInv?.quantity}`)
+    try {
+      const { error } = await action()
+      if (error) alert(`${failMessage}: ${toUserMessage(error)}`)
+    } catch (err) {
+      alert(`${failMessage}: ${toUserMessage(err)}`)
     }
-    
-    await supabase
-      .from('branch_returns')
-      .update({ 
-        status: 'approved',
-        updated_at: new Date().toISOString()
-      })
-      .eq('id', returnData.id)
-    
-    // Log inventory AFTER approve
-    for (const item of returnData.items) {
-      const { data: sourceInv } = await supabase
-        .from('inventory')
-        .select('quantity')
-        .eq('branch_id', returnData.from_branch.id)
-        .eq('item_id', item.item.id)
-        .single()
-      console.log(`AFTER APPROVE - ${item.item.name_ar}: Source=${sourceInv?.quantity}`)
-    }
-    
-    console.log('=== APPROVE PROCESS COMPLETE ===')
-    fetchReturn(returnData.id)
+    await fetchReturn(returnData.id)
     setActionLoading(false)
+    busy.current = false
   }
 
-  const handleReject = async () => {
+  const handleApprove = () => {
+    if (!returnData || !user) return
+    runAction(() => returnsService.approveBranchReturn(returnData.id), 'تعذرت الموافقة على المرتجع')
+  }
+
+  const handleReject = () => {
     if (!returnData || !user) return
     const reason = prompt('سبب الرفض:')
     if (reason === null) return
-    setActionLoading(true)
-    
-    await supabase
-      .from('branch_returns')
-      .update({ 
-        status: 'rejected',
-        notes: returnData.notes ? `${returnData.notes}\nسبب الرفض: ${reason}` : `سبب الرفض: ${reason}`,
-        updated_at: new Date().toISOString()
-      })
-      .eq('id', returnData.id)
-    
-    fetchReturn(returnData.id)
-    setActionLoading(false)
+    runAction(() => returnsService.rejectBranchReturn(returnData.id, reason), 'تعذر رفض المرتجع')
   }
 
-  const handleShip = async () => {
+  const handleShip = () => {
     if (!returnData || !user) return
-    setActionLoading(true)
-    
-    console.log('=== SHIP PROCESS START ===')
-    console.log('Return:', returnData.return_number)
-    
-    // Log inventory BEFORE ship
-    for (const item of returnData.items) {
-      const { data: sourceInv } = await supabase
-        .from('inventory')
-        .select('quantity')
-        .eq('branch_id', returnData.from_branch.id)
-        .eq('item_id', item.item.id)
-        .single()
-      console.log(`BEFORE SHIP - ${item.item.name_ar}: Source=${sourceInv?.quantity}`)
-    }
-    
-    await supabase
-      .from('branch_returns')
-      .update({ 
-        status: 'in_transit',
-        updated_at: new Date().toISOString()
-      })
-      .eq('id', returnData.id)
-    
-    // Log inventory AFTER ship
-    for (const item of returnData.items) {
-      const { data: sourceInv } = await supabase
-        .from('inventory')
-        .select('quantity')
-        .eq('branch_id', returnData.from_branch.id)
-        .eq('item_id', item.item.id)
-        .single()
-      console.log(`AFTER SHIP - ${item.item.name_ar}: Source=${sourceInv?.quantity}`)
-    }
-    
-    console.log('=== SHIP PROCESS COMPLETE ===')
-    fetchReturn(returnData.id)
-    setActionLoading(false)
+    runAction(() => returnsService.shipBranchReturn(returnData.id), 'تعذر بدء الشحن')
   }
 
-  const handleReceive = async () => {
+  const handleReceive = () => {
     if (!returnData || !user) return
-    
-    // Prevent double execution using ref (survives re-renders)
-    if (isReceiving.current) {
-      console.warn('Already receiving, skipping duplicate call')
-      return
-    }
-    if (actionLoading) return
-    if (returnData.status !== 'in_transit') {
-      console.warn('Return is not in_transit status, cannot receive')
-      return
-    }
-    
-    isReceiving.current = true
-    setActionLoading(true)
-    
-    console.log('=== RECEIVE PROCESS START ===')
-    console.log('Return:', returnData.return_number)
-    
-    // STEP 1: Check current status from database (not from state)
-    const { data: currentReturn } = await supabase
-      .from('branch_returns')
-      .select('status')
-      .eq('id', returnData.id)
-      .single()
-    
-    if (!currentReturn || currentReturn.status !== 'in_transit') {
-      console.warn('Return status is not in_transit, skipping. Current status:', currentReturn?.status)
-      setActionLoading(false)
-      isReceiving.current = false
-      fetchReturn(returnData.id)
-      return
-    }
-    
-    // STEP 2: Read inventory values BEFORE changing status
-    // (because there might be a trigger that modifies inventory on status change)
-    const inventorySnapshot: { itemId: string; sourceQty: number; destQty: number; sourceInvId: string; destInvId: string | null }[] = []
-    
-    for (const item of returnData.items) {
-      const { data: sourceInv } = await supabase
-        .from('inventory')
-        .select('id, quantity')
-        .eq('branch_id', returnData.from_branch.id)
-        .eq('item_id', item.item.id)
-        .single()
-
-      const { data: destInv } = await supabase
-        .from('inventory')
-        .select('id, quantity')
-        .eq('branch_id', returnData.to_branch.id)
-        .eq('item_id', item.item.id)
-        .single()
-      
-      inventorySnapshot.push({
-        itemId: item.item.id,
-        sourceQty: Number(sourceInv?.quantity || 0),
-        destQty: Number(destInv?.quantity || 0),
-        sourceInvId: sourceInv?.id || '',
-        destInvId: destInv?.id || null
-      })
-      
-      console.log(`SNAPSHOT - ${item.item.name_ar}: Source=${sourceInv?.quantity}, Dest=${destInv?.quantity}`)
-    }
-    
-    // STEP 3: Update status to 'received'
-    const { data: updatedReturn, error: statusError } = await supabase
-      .from('branch_returns')
-      .update({ 
-        status: 'received',
-        received_by: user.id,
-        received_at: new Date().toISOString(),
-        updated_at: new Date().toISOString()
-      })
-      .eq('id', returnData.id)
-      .eq('status', 'in_transit')
-      .select('id')
-      .single()
-    
-    if (statusError || !updatedReturn) {
-      console.error('Failed to update status (may already be processed):', statusError)
-      setActionLoading(false)
-      isReceiving.current = false
-      fetchReturn(returnData.id)
-      return
-    }
-    
-    console.log('Status updated to received, now processing inventory using SNAPSHOT values...')
-    
-    // STEP 4: Process inventory updates using SNAPSHOT values (not current DB values)
-    for (let i = 0; i < returnData.items.length; i++) {
-      const item = returnData.items[i]
-      const snapshot = inventorySnapshot[i]
-      const qty = Number(item.requested_quantity)
-      
-      console.log(`Processing: ${item.item.name_ar}, qty: ${qty}`)
-      
-      // Update received quantity
-      await supabase
-        .from('branch_return_items')
-        .update({ received_quantity: qty })
-        .eq('id', item.id)
-      
-      // Deduct from source branch using SNAPSHOT value
-      if (snapshot.sourceInvId) {
-        const newSourceQty = Math.max(0, snapshot.sourceQty - qty)
-        await supabase
-          .from('inventory')
-          .update({ quantity: newSourceQty, updated_at: new Date().toISOString() })
-          .eq('id', snapshot.sourceInvId)
-        console.log(`Source: ${snapshot.sourceQty} -> ${newSourceQty}`)
-      }
-
-      // Add to destination branch using SNAPSHOT value
-      if (snapshot.destInvId) {
-        const newDestQty = snapshot.destQty + qty
-        await supabase
-          .from('inventory')
-          .update({ quantity: newDestQty, updated_at: new Date().toISOString() })
-          .eq('id', snapshot.destInvId)
-        console.log(`Dest: ${snapshot.destQty} -> ${newDestQty}`)
-      } else {
-        // Create new inventory record
-        await supabase
-          .from('inventory')
-          .insert({
-            branch_id: returnData.to_branch.id,
-            item_id: item.item.id,
-            quantity: qty,
-            min_quantity: 0,
-          })
-        console.log(`Dest: Created new record with qty ${qty}`)
-      }
-    }
-    
-    // STEP 5: Verify final inventory values
-    console.log('=== VERIFICATION ===')
-    for (const item of returnData.items) {
-      const { data: finalSource } = await supabase
-        .from('inventory')
-        .select('quantity')
-        .eq('branch_id', returnData.from_branch.id)
-        .eq('item_id', item.item.id)
-        .single()
-      
-      const { data: finalDest } = await supabase
-        .from('inventory')
-        .select('quantity')
-        .eq('branch_id', returnData.to_branch.id)
-        .eq('item_id', item.item.id)
-        .single()
-      
-      console.log(`${item.item.name_ar}: Source=${finalSource?.quantity}, Dest=${finalDest?.quantity}`)
-    }
-    
-    console.log('=== RECEIVE PROCESS COMPLETE ===')
-    fetchReturn(returnData.id)
-    setActionLoading(false)
-    isReceiving.current = false
+    runAction(() => returnsService.receiveBranchReturn(returnData.id), 'تعذر تأكيد الاستلام')
   }
 
   if (loading) {
@@ -350,32 +92,34 @@ export default function BranchReturnDetail() {
   }
 
   if (!returnData) {
-    return <div className="text-center py-12"><p className="text-gray-600">المرتجع غير موجود</p></div>
+    return <div className="text-center py-12"><p className="text-gray-600">{loadError || 'المرتجع غير موجود'}</p></div>
   }
 
   // Get user role
-  const userRole = typeof user?.role === 'object' && user?.role !== null 
-    ? (user.role as { name: string }).name 
+  const userRole = typeof user?.role === 'object' && user?.role !== null
+    ? (user.role as { name: string }).name
     : user?.role
 
-  // Branch supervisor at source can approve/ship
+  const isSourceSupervisor = userRole === 'branch_supervisor' && Boolean(user?.branch_id) && user?.branch_id === returnData.from_branch_id
+
+  // Branch supervisor at source can approve/ship (the database enforces the same rules)
   const canApprove = returnData.status === 'pending' && (
-    userRole === 'admin' || 
+    userRole === 'admin' ||
     userRole === 'warehouse_manager' ||
-    (userRole === 'branch_supervisor' && user?.branch_id === returnData.from_branch?.id)
+    isSourceSupervisor
   )
-  
+
   const canShip = returnData.status === 'approved' && (
-    userRole === 'admin' || 
+    userRole === 'admin' ||
     userRole === 'warehouse_manager' ||
-    (userRole === 'branch_supervisor' && user?.branch_id === returnData.from_branch?.id)
+    isSourceSupervisor
   )
-  
-  // Warehouse manager can receive at main warehouse
+
+  // Warehouse side receives at the main warehouse
   const canReceive = returnData.status === 'in_transit' && (
-    userRole === 'admin' || 
+    userRole === 'admin' ||
     userRole === 'warehouse_manager' ||
-    user?.branch_id === returnData.to_branch?.id
+    (userRole === 'branch_supervisor' && Boolean(user?.branch_id) && user?.branch_id === returnData.to_branch_id)
   )
 
   return (
@@ -398,7 +142,7 @@ export default function BranchReturnDetail() {
           طباعة
         </button>
         <span className={`px-3 py-1 rounded-full text-sm font-medium ${getStatusColor(returnData.status)}`}>
-          {translateStatus(returnData.status)}
+          {statusLabel(returnData.status)}
         </span>
       </div>
 
@@ -444,8 +188,8 @@ export default function BranchReturnDetail() {
               {returnData.items?.map(item => (
                 <tr key={item.id}>
                   <td className="px-4 py-3 print:border print:border-gray-300">{item.item?.name_ar} <span className="text-gray-500">({item.item?.code})</span></td>
-                  <td className="px-4 py-3 print:border print:border-gray-300">{item.requested_quantity}</td>
-                  <td className="px-4 py-3 print:border print:border-gray-300">{item.received_quantity ?? '-'}</td>
+                  <td className="px-4 py-3 print:border print:border-gray-300">{formatQuantity(item.requested_quantity)} {item.item?.unit?.name_ar || ''}</td>
+                  <td className="px-4 py-3 print:border print:border-gray-300">{item.received_quantity !== null ? `${formatQuantity(item.received_quantity)} ${item.item?.unit?.name_ar || ''}` : '-'}</td>
                   <td className="px-4 py-3 text-sm text-gray-600 print:border print:border-gray-300">{item.item_reason || '-'}</td>
                 </tr>
               ))}
@@ -458,9 +202,10 @@ export default function BranchReturnDetail() {
         <h3 className="font-semibold text-gray-900 mb-4">معلومات إضافية</h3>
         <div className="grid grid-cols-2 gap-4 text-sm print:gap-2">
           <div><span className="text-gray-500">التاريخ:</span> <span className="font-medium">{formatDate(returnData.return_date)}</span></div>
-          <div><span className="text-gray-500">إجمالي الكمية:</span> <span className="font-medium">{returnData.total_quantity}</span></div>
+          <div><span className="text-gray-500">إجمالي الكمية:</span> <span className="font-medium">{formatQuantity(returnData.total_quantity)}</span></div>
           {returnData.return_reason && <div><span className="text-gray-500">سبب الإرجاع:</span> <span className="font-medium">{returnData.return_reason}</span></div>}
           {returnData.notes && <div className="col-span-2"><span className="text-gray-500">ملاحظات:</span> <span className="font-medium">{returnData.notes}</span></div>}
+          {returnData.rejection_reason && <div className="col-span-2"><span className="text-gray-500">سبب الرفض:</span> <span className="font-medium text-red-600">{returnData.rejection_reason}</span></div>}
         </div>
       </div>
 

@@ -1,7 +1,9 @@
 import { useState, useEffect } from 'react'
 import { useParams, useNavigate, Link } from 'react-router-dom'
-import { recipeService, RecipeWithIngredients } from '../../services/recipe.service'
-import { Item, ProductionLog } from '../../types/database.types'
+import { recipeService, RecipeWithIngredients, computeRecipeCost } from '../../services/recipe.service'
+import { ProductionLog } from '../../types/database.types'
+import { toUserMessage } from '../../lib/errors'
+import { formatDate, formatQuantity } from '../../lib/utils'
 import { ArrowRight, Edit, Factory, ChefHat, Package, History } from 'lucide-react'
 
 export default function RecipeDetail() {
@@ -10,6 +12,7 @@ export default function RecipeDetail() {
   const [recipe, setRecipe] = useState<RecipeWithIngredients | null>(null)
   const [productionLogs, setProductionLogs] = useState<ProductionLog[]>([])
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
 
   useEffect(() => {
     if (id) fetchData(id)
@@ -18,22 +21,14 @@ export default function RecipeDetail() {
   const fetchData = async (recipeId: string) => {
     const [recipeRes, logsRes] = await Promise.all([
       recipeService.getRecipeWithIngredients(recipeId),
-      recipeService.getProductionLogs(undefined, 10)
+      // The latest productions of THIS recipe (filtered in the query, before the limit)
+      recipeService.getProductionLogs({ recipeId, limit: 20 })
     ])
+    const loadError = (recipeRes.error && recipeRes.error.code !== 'PGRST116' ? recipeRes.error : null) || logsRes.error
+    setError(loadError ? 'تعذر تحميل البيانات: ' + toUserMessage(loadError) : '')
     setRecipe(recipeRes.data)
-    // Filter logs for this recipe
-    setProductionLogs((logsRes.data || []).filter(log => log.recipe_item_id === recipeId))
+    setProductionLogs(logsRes.data || [])
     setLoading(false)
-  }
-
-  // Calculate recipe cost from ingredients
-  const calculateRecipeCost = () => {
-    if (!recipe?.ingredients) return 0
-    return recipe.ingredients.reduce((total, ing) => {
-      const ingredient = ing.ingredient as Item
-      const cost = (ingredient?.purchase_price || 0) * (ing.quantity || 0)
-      return total + cost
-    }, 0)
   }
 
   if (loading) {
@@ -47,10 +42,13 @@ export default function RecipeDetail() {
   if (!recipe) {
     return (
       <div className="text-center py-12">
-        <p className="text-gray-500">الريسبي غير موجود</p>
+        <p className="text-gray-500">{error || 'الريسبي غير موجود'}</p>
       </div>
     )
   }
+
+  // Cost of one recipe unit, each ingredient converted to the unit its purchase price is per
+  const recipeCost = computeRecipeCost(recipe.ingredients || [])
 
   return (
     <div className="max-w-4xl mx-auto">
@@ -85,6 +83,10 @@ export default function RecipeDetail() {
         </div>
       </div>
 
+      {error && (
+        <div className="mb-6 p-4 bg-red-50 border border-red-200 rounded-lg text-red-700">{error}</div>
+      )}
+
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Recipe Info */}
         <div className="lg:col-span-2 space-y-6">
@@ -103,7 +105,7 @@ export default function RecipeDetail() {
               <div>
                 <p className="text-sm text-gray-500">سعر التكلفة (محسوب من المكونات)</p>
                 <p className="font-medium text-orange-600 flex items-center gap-1">
-                  🧮 {calculateRecipeCost().toFixed(2)} ج.م
+                  🧮 {recipeCost.toFixed(2)} ج.م
                 </p>
               </div>
               {recipe.description && (
@@ -134,10 +136,11 @@ export default function RecipeDetail() {
                   </thead>
                   <tbody>
                     {recipe.ingredients.map((ing, index) => (
-                      <tr key={index} className="border-b border-gray-100">
-                        <td className="py-3 px-2 font-medium">{(ing.ingredient as Item)?.name_ar}</td>
-                        <td className="py-3 px-2">{ing.quantity}</td>
-                        <td className="py-3 px-2">{ing.unit?.name_ar || '-'}</td>
+                      <tr key={ing.id || index} className="border-b border-gray-100">
+                        <td className="py-3 px-2 font-medium">{ing.ingredient?.name_ar}</td>
+                        <td className="py-3 px-2">{formatQuantity(ing.quantity)}</td>
+                        {/* No unit on the line = the ingredient's own stock unit */}
+                        <td className="py-3 px-2">{ing.unit?.name_ar || ing.ingredient?.unit?.name_ar || '-'}</td>
                         <td className="py-3 px-2 text-gray-500">{ing.notes || '-'}</td>
                       </tr>
                     ))}
@@ -163,11 +166,11 @@ export default function RecipeDetail() {
                   <div key={log.id} className="p-3 bg-gray-50 rounded-lg">
                     <div className="flex justify-between items-start">
                       <div>
-                        <p className="font-medium text-green-600">+{log.quantity}</p>
-                        <p className="text-sm text-gray-500">{(log.branch as { name_ar: string })?.name_ar}</p>
+                        <p className="font-medium text-green-600">+{formatQuantity(log.quantity)}</p>
+                        <p className="text-sm text-gray-500">{(log.branch as { name_ar: string } | undefined)?.name_ar}</p>
                       </div>
                       <p className="text-xs text-gray-400">
-                        {new Date(log.produced_at).toLocaleDateString('ar-EG')}
+                        {formatDate(log.produced_at)}
                       </p>
                     </div>
                     {log.notes && <p className="text-xs text-gray-500 mt-1">{log.notes}</p>}

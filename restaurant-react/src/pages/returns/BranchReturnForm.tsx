@@ -2,6 +2,10 @@ import { useState, useEffect, FormEvent } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { supabase, fixEncodingInData } from '../../lib/supabase'
 import { useAuth } from '../../contexts/AuthContext'
+import { returnsService } from '../../services/returns.service'
+import { fetchPickerItems, PickerItem } from '../../services/transfers.service'
+import { toUserMessage } from '../../lib/errors'
+import { parseDecimal, roundQuantity } from '../../lib/utils'
 import { Save, ArrowRight, AlertCircle, Plus, Trash2, Search, X, Barcode } from 'lucide-react'
 
 interface Branch {
@@ -11,25 +15,29 @@ interface Branch {
   is_main_warehouse: boolean
 }
 
-interface Item {
-  id: string
-  code: string
-  name_ar: string
-}
-
 interface ReturnItem {
+  key: string // stable row id (React key), so a row's search text never moves to another row
   item_id: string
   quantity: number
   reason: string
   notes: string
+  search: string
 }
+
+let rowSeq = 0
+const newRow = (): ReturnItem => ({ key: `row-${++rowSeq}`, item_id: '', quantity: 1, reason: '', notes: '', search: '' })
+
+const matchesTerm = (item: PickerItem, term: string) =>
+  item.name_ar.toLowerCase().includes(term) ||
+  item.code.toLowerCase().includes(term) ||
+  Boolean(item.barcode && item.barcode.toLowerCase().includes(term))
 
 export default function BranchReturnForm() {
   const navigate = useNavigate()
   const { user } = useAuth()
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
-  const [items, setItems] = useState<Item[]>([])
+  const [items, setItems] = useState<PickerItem[]>([])
   const [branches, setBranches] = useState<Branch[]>([])
   const [mainWarehouse, setMainWarehouse] = useState<Branch | null>(null)
 
@@ -39,14 +47,12 @@ export default function BranchReturnForm() {
     notes: '',
   })
 
-  const [returnItems, setReturnItems] = useState<ReturnItem[]>([
-    { item_id: '', quantity: 1, reason: '', notes: '' },
-  ])
-  const [searchTerm, setSearchTerm] = useState<{ [key: number]: string }>({})
+  const [returnItems, setReturnItems] = useState<ReturnItem[]>(() => [newRow()])
 
   // Get user role
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const userRole = typeof user?.role === 'object' ? (user.role as any)?.name : user?.role
+  const userRole = typeof user?.role === 'object' && user?.role !== null
+    ? (user.role as { name: string }).name
+    : user?.role
   const isBranchSupervisor = userRole === 'branch_supervisor'
 
   useEffect(() => {
@@ -56,162 +62,102 @@ export default function BranchReturnForm() {
   const fetchData = async () => {
     const [branchesRes, itemsRes] = await Promise.all([
       supabase.from('branches').select('id, name_ar, code, is_main_warehouse').eq('status', 'active').order('name_ar'),
-      supabase.from('items').select('id, code, name_ar').eq('status', 'active').order('name_ar'),
+      fetchPickerItems(),
     ])
-    
-    const branchList = fixEncodingInData(branchesRes.data) as Branch[] || []
-    
+    if (branchesRes.error || itemsRes.error) {
+      setError('تعذر تحميل البيانات: ' + toUserMessage(branchesRes.error || itemsRes.error))
+    }
+
+    const branchList = (fixEncodingInData(branchesRes.data) as Branch[]) || []
+
     // Set main warehouse
     const mainWh = branchList.find(b => b.is_main_warehouse)
     if (mainWh) {
       setMainWarehouse(mainWh)
     }
-    
+
     // Filter out main warehouse from branch list (only show actual branches)
     const actualBranches = branchList.filter(b => !b.is_main_warehouse)
     setBranches(actualBranches)
-    
+
     // Auto-select branch for branch supervisor
     if (isBranchSupervisor && user?.branch_id) {
       setFormData(prev => ({ ...prev, from_branch_id: user.branch_id as string }))
     }
-    
-    setItems(fixEncodingInData(itemsRes.data) as Item[] || [])
-  }
 
-  const generateReturnNumber = () => {
-    const date = new Date()
-    const year = date.getFullYear()
-    const month = (date.getMonth() + 1).toString().padStart(2, '0')
-    const random = Math.floor(Math.random() * 10000).toString().padStart(4, '0')
-    return `BRT-${year}-${month}-${random}`
+    setItems(itemsRes.data.filter(i => i.status === 'active'))
   }
 
   const addItem = () => {
-    setReturnItems([...returnItems, { item_id: '', quantity: 1, reason: '', notes: '' }])
+    setReturnItems(rows => [...rows, newRow()])
   }
 
-  const filteredItems = (index: number) => {
-    const term = searchTerm[index]?.toLowerCase() || ''
+  const filteredItems = (search: string) => {
+    const term = search.toLowerCase()
     if (!term) return items
-    return items.filter(item => 
-      item.name_ar.toLowerCase().includes(term) ||
-      item.code.toLowerCase().includes(term) ||
-      ((item as Item & { barcode?: string }).barcode && (item as Item & { barcode?: string }).barcode!.toLowerCase().includes(term))
-    )
+    return items.filter(item => matchesTerm(item, term))
   }
 
-  const removeItem = (index: number) => {
-    if (returnItems.length > 1) {
-      setReturnItems(returnItems.filter((_, i) => i !== index))
-    }
+  const removeItem = (key: string) => {
+    setReturnItems(rows => (rows.length > 1 ? rows.filter(r => r.key !== key) : rows))
   }
 
-  const updateItem = (index: number, field: keyof ReturnItem, value: string | number) => {
-    const updated = [...returnItems]
-    updated[index] = { ...updated[index], [field]: value }
-    setReturnItems(updated)
+  const updateRow = (key: string, changes: Partial<ReturnItem>) => {
+    setReturnItems(rows => rows.map(r => (r.key === key ? { ...r, ...changes } : r)))
   }
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault()
+    if (loading) return
     setError('')
-    setLoading(true)
 
     if (!user?.id) {
       setError('يرجى تسجيل الدخول أولاً')
-      setLoading(false)
       return
     }
 
     if (!formData.from_branch_id) {
       setError('يرجى اختيار الفرع المصدر')
-      setLoading(false)
       return
     }
 
     if (!mainWarehouse) {
       setError('لم يتم تحديد المخزن الرئيسي')
-      setLoading(false)
       return
     }
 
     if (!formData.return_reason || formData.return_reason.trim() === '') {
       setError('يرجى إدخال سبب الإرجاع')
-      setLoading(false)
       return
     }
 
-    const validItems = returnItems.filter(item => item.item_id && item.quantity > 0)
-    console.log('Return items before submit:', returnItems)
-    console.log('Valid items:', validItems)
-    
-    if (validItems.length === 0) {
+    const chosen = returnItems.filter(item => item.item_id)
+    if (chosen.length === 0) {
       setError('يرجى إضافة صنف واحد على الأقل')
-      setLoading(false)
+      return
+    }
+    const badQty = chosen.find(i => !(i.quantity > 0))
+    if (badQty) {
+      const itemName = items.find(i => i.id === badQty.item_id)?.name_ar || ''
+      setError(`يرجى إدخال كمية أكبر من صفر للصنف ${itemName}`)
       return
     }
 
-    // Create branch return
-    const returnNumber = generateReturnNumber()
-    console.log('Creating branch return:', {
-      return_number: returnNumber,
+    // Header and lines are saved together; the database checks the branch stock and merges repeated items
+    setLoading(true)
+    const { error: saveError } = await returnsService.createBranchReturn({
       from_branch_id: formData.from_branch_id,
-      to_branch_id: mainWarehouse.id,
-      return_reason: formData.return_reason,
-      requested_by: user.id,
+      return_reason: formData.return_reason.trim(),
+      notes: formData.notes,
+      items: chosen.map(i => ({ item_id: i.item_id, quantity: roundQuantity(i.quantity), reason: i.reason, notes: i.notes })),
     })
 
-    const { data: returnData, error: returnError } = await supabase
-      .from('branch_returns')
-      .insert({
-        return_number: returnNumber,
-        return_date: new Date().toISOString(),
-        from_branch_id: formData.from_branch_id,
-        to_branch_id: mainWarehouse.id,
-        status: 'pending',
-        return_reason: formData.return_reason.trim(),
-        total_items: validItems.length,
-        total_quantity: validItems.reduce((sum, item) => sum + item.quantity, 0),
-        notes: formData.notes || '',
-        requested_by: user.id,
-        requested_at: new Date().toISOString(),
-      })
-      .select()
-      .single()
-
-    if (returnError) {
-      console.error('Error creating branch return:', returnError)
-      setError('فشل في حفظ المرتجع: ' + returnError.message)
+    if (saveError) {
+      setError('فشل في حفظ المرتجع: ' + toUserMessage(saveError))
       setLoading(false)
-      return
-    }
-
-    console.log('Branch return created:', returnData)
-
-    // Create return items
-    const itemsToInsert = validItems.map(item => ({
-      return_id: returnData.id,
-      item_id: item.item_id,
-      requested_quantity: item.quantity,
-      item_reason: item.reason || '',
-      notes: item.notes || '',
-    }))
-
-    console.log('Creating return items:', itemsToInsert)
-
-    const { error: itemsError } = await supabase
-      .from('branch_return_items')
-      .insert(itemsToInsert)
-
-    if (itemsError) {
-      console.error('Error creating return items:', itemsError)
-      setError('فشل في حفظ الأصناف: ' + itemsError.message)
     } else {
-      console.log('Return items created successfully')
       navigate('/returns')
     }
-    setLoading(false)
   }
 
   return (
@@ -234,7 +180,7 @@ export default function BranchReturnForm() {
       {error && (
         <div className="mb-6 p-4 bg-red-50 border border-red-200 rounded-lg flex items-center gap-3">
           <AlertCircle className="w-5 h-5 text-red-500 shrink-0" />
-          <p className="text-red-700">{error}</p>
+          <p className="text-red-700 whitespace-pre-line">{error}</p>
         </div>
       )}
 
@@ -323,13 +269,13 @@ export default function BranchReturnForm() {
           </div>
 
           <div className="space-y-4">
-            {returnItems.map((item, index) => {
+            {returnItems.map((item) => {
               const selectedItem = items.find(i => i.id === item.item_id)
-              const searchResults = filteredItems(index)
-              const showResults = searchTerm[index] && searchResults.length > 0
-              
+              const searchResults = filteredItems(item.search)
+              const showResults = item.search && searchResults.length > 0
+
               return (
-                <div key={index} className="p-4 bg-gray-50 rounded-lg border border-gray-200">
+                <div key={item.key} className="p-4 bg-gray-50 rounded-lg border border-gray-200">
                   <div className="space-y-3">
                     {/* Search Input */}
                     <div className="relative">
@@ -340,28 +286,29 @@ export default function BranchReturnForm() {
                         <input
                           type="text"
                           placeholder="امسح الباركود أو أدخل الكود أو اسم الصنف"
-                          value={searchTerm[index] || ''}
+                          value={item.search}
                           onChange={(e) => {
-                            setSearchTerm({ ...searchTerm, [index]: e.target.value })
-                            const results = items.filter(i => 
-                              i.name_ar.toLowerCase().includes(e.target.value.toLowerCase()) ||
-                              i.code.toLowerCase().includes(e.target.value.toLowerCase()) ||
-                              ((i as Item & { barcode?: string }).barcode && (i as Item & { barcode?: string }).barcode!.toLowerCase().includes(e.target.value.toLowerCase()))
-                            )
-                            if (results.length === 1 && e.target.value.length > 2) {
-                              updateItem(index, 'item_id', results[0].id)
+                            const value = e.target.value
+                            const results = items.filter(i => matchesTerm(i, value.toLowerCase()))
+                            if (results.length === 1 && value.length > 2) {
+                              updateRow(item.key, { search: value, item_id: results[0].id })
+                            } else {
+                              updateRow(item.key, { search: value })
                             }
                           }}
                           onKeyDown={(e) => {
-                            if (e.key === 'Enter' && searchResults.length > 0) {
-                              updateItem(index, 'item_id', searchResults[0].id)
-                              setSearchTerm({ ...searchTerm, [index]: '' })
+                            if (e.key === 'Enter') {
+                              // A scanner sends Enter after every code: pick the item, never submit the form
+                              e.preventDefault()
+                              if (searchResults.length > 0) {
+                                updateRow(item.key, { item_id: searchResults[0].id, search: '' })
+                              }
                             }
                           }}
                           className="flex-1 px-3 py-2 border-0 bg-transparent focus:outline-none text-gray-700 placeholder-gray-500"
                         />
                       </div>
-                      
+
                       {/* Search Results */}
                       {showResults && (
                         <div className="absolute z-10 w-full bg-white border border-gray-200 rounded-lg shadow-lg max-h-60 overflow-y-auto mt-1">
@@ -369,19 +316,16 @@ export default function BranchReturnForm() {
                             <button
                               key={i.id}
                               type="button"
-                              onClick={() => {
-                                updateItem(index, 'item_id', i.id)
-                                setSearchTerm({ ...searchTerm, [index]: '' })
-                              }}
+                              onClick={() => updateRow(item.key, { item_id: i.id, search: '' })}
                               className="w-full text-right px-4 py-3 hover:bg-purple-50 border-b border-gray-100 last:border-0"
                             >
                               <div className="font-medium text-gray-900">{i.name_ar}</div>
                               <div className="text-sm text-gray-500 flex items-center gap-2 mt-1">
                                 <span>الكود: {i.code}</span>
-                                {(i as Item & { barcode?: string }).barcode && (
+                                {i.barcode && (
                                   <>
                                     <span>•</span>
-                                    <span>الباركود: {(i as Item & { barcode?: string }).barcode}</span>
+                                    <span>الباركود: {i.barcode}</span>
                                   </>
                                 )}
                               </div>
@@ -389,7 +333,7 @@ export default function BranchReturnForm() {
                           ))}
                         </div>
                       )}
-                      
+
                       {/* Selected Item */}
                       {selectedItem && (
                         <div className="mt-2 p-3 bg-green-50 border border-green-200 rounded-lg">
@@ -398,16 +342,12 @@ export default function BranchReturnForm() {
                               <p className="font-medium text-green-900">{selectedItem.name_ar}</p>
                               <p className="text-sm text-green-700">
                                 الكود: {selectedItem.code}
-                                {(selectedItem as Item & { barcode?: string }).barcode && 
-                                  ` | الباركود: ${(selectedItem as Item & { barcode?: string }).barcode}`}
+                                {selectedItem.barcode && ` | الباركود: ${selectedItem.barcode}`}
                               </p>
                             </div>
                             <button
                               type="button"
-                              onClick={() => {
-                                updateItem(index, 'item_id', '')
-                                setSearchTerm({ ...searchTerm, [index]: '' })
-                              }}
+                              onClick={() => updateRow(item.key, { item_id: '', search: '' })}
                               className="text-red-500 hover:text-red-700"
                               title="إلغاء الاختيار"
                             >
@@ -416,8 +356,8 @@ export default function BranchReturnForm() {
                           </div>
                         </div>
                       )}
-                      
-                      {!selectedItem && !searchTerm[index] && (
+
+                      {!selectedItem && !item.search && (
                         <p className="text-sm text-purple-600 mt-2 flex items-center gap-2">
                           <Barcode className="w-4 h-4" />
                           استخدم قارئ الباركود أو أدخل الكود يدوياً ثم اضغط Enter
@@ -435,8 +375,8 @@ export default function BranchReturnForm() {
                           step="0.001"
                           value={item.quantity}
                           onChange={(e) => {
-                            const val = parseFloat(e.target.value)
-                            updateItem(index, 'quantity', isNaN(val) ? 0.001 : val)
+                            const val = parseDecimal(e.target.value)
+                            updateRow(item.key, { quantity: val !== null && val > 0 ? roundQuantity(val) : 0 })
                           }}
                           onFocus={(e) => e.target.select()}
                           className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-purple-500"
@@ -450,7 +390,7 @@ export default function BranchReturnForm() {
                         <input
                           type="text"
                           value={item.reason}
-                          onChange={(e) => updateItem(index, 'reason', e.target.value)}
+                          onChange={(e) => updateRow(item.key, { reason: e.target.value })}
                           className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-purple-500"
                           placeholder="السبب"
                           aria-label="السبب"
@@ -461,7 +401,7 @@ export default function BranchReturnForm() {
                         <input
                           type="text"
                           value={item.notes}
-                          onChange={(e) => updateItem(index, 'notes', e.target.value)}
+                          onChange={(e) => updateRow(item.key, { notes: e.target.value })}
                           className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm focus:ring-2 focus:ring-purple-500"
                           placeholder="ملاحظات"
                           aria-label="ملاحظات"
@@ -471,7 +411,7 @@ export default function BranchReturnForm() {
                         {returnItems.length > 1 && (
                           <button
                             type="button"
-                            onClick={() => removeItem(index)}
+                            onClick={() => removeItem(item.key)}
                             className="w-full p-2 text-red-500 hover:bg-red-50 rounded-lg"
                             title="حذف"
                           >

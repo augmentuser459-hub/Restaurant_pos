@@ -1,4 +1,6 @@
 import { supabase, fixEncodingInData } from '../lib/supabase'
+import { fetchAll } from '../lib/fetchAll'
+import { roundQuantity } from '../lib/utils'
 import { Damage, DamageReason } from '../types/database.types'
 import { notificationsService } from './notifications.service'
 
@@ -10,230 +12,98 @@ export interface CreateDamageData {
   reason_id: string
   description?: string
   image_url?: string
-  registered_by: string
 }
 
 export interface DamageWithDetails extends Omit<Damage, 'branch' | 'item' | 'reason'> {
-  branch: { id: string; name_ar: string; code: string }
-  item: { id: string; name_ar: string; code: string; unit: string }
-  reason: { id: string; name_ar: string }
+  branch: { id: string; name_ar: string; code: string } | null
+  // items has unit_id, not a unit column: the unit name comes from units
+  item: { id: string; name_ar: string; code: string; unit: { name_ar: string } | null } | null
+  reason: { id: string; name_ar: string } | null
 }
 
+// Related rows are embedded through the damages foreign keys (no long id lists, no extra round trips)
+const DAMAGE_SELECT = `
+  *,
+  branch:branches!damages_branch_id_fkey(id, name_ar, code),
+  item:items!damages_item_id_fkey(id, name_ar, code, unit:units(name_ar)),
+  reason:damage_reasons!damages_reason_id_fkey(id, name_ar)
+`
+
 export const damagesService = {
-  // Get all damages
+  // Get all damages (every page), newest first
   async getAll(branchId?: string) {
-    console.log('damagesService.getAll called with branchId:', branchId)
-    
-    // First get damages
-    let query = supabase
-      .from('damages')
-      .select('*')
-      .order('registered_at', { ascending: false })
-
-    if (branchId) {
-      query = query.eq('branch_id', branchId)
+    try {
+      const rows = await fetchAll<DamageWithDetails>((from, to) => {
+        let query = supabase
+          .from('damages')
+          .select(DAMAGE_SELECT)
+          .order('registered_at', { ascending: false })
+          .order('id')
+        if (branchId) {
+          query = query.eq('branch_id', branchId)
+        }
+        return query.range(from, to)
+      })
+      return { data: fixEncodingInData(rows) as DamageWithDetails[], error: null }
+    } catch (error) {
+      return { data: [] as DamageWithDetails[], error }
     }
-
-    const { data: damages, error } = await query
-    
-    if (error || !damages) {
-      console.log('damagesService.getAll error:', error)
-      return { data: [], error }
-    }
-    
-    // Get related data
-    const branchIds = [...new Set(damages.map(d => d.branch_id))]
-    const itemIds = [...new Set(damages.map(d => d.item_id))]
-    const reasonIds = [...new Set(damages.map(d => d.reason_id).filter(Boolean))]
-    
-    const [branchesRes, itemsRes, reasonsRes] = await Promise.all([
-      supabase.from('branches').select('id, name_ar, code').in('id', branchIds),
-      supabase.from('items').select('id, name_ar, code, unit').in('id', itemIds),
-      reasonIds.length > 0 
-        ? supabase.from('damage_reasons').select('id, name_ar').in('id', reasonIds)
-        : { data: [] }
-    ])
-    
-    const branchMap = new Map((branchesRes.data || []).map(b => [b.id, b]))
-    const itemMap = new Map((itemsRes.data || []).map(i => [i.id, i]))
-    const reasonMap = new Map((reasonsRes.data || []).map(r => [r.id, r]))
-    
-    const result = damages.map(d => ({
-      ...d,
-      branch: branchMap.get(d.branch_id) || null,
-      item: itemMap.get(d.item_id) || null,
-      reason: d.reason_id ? reasonMap.get(d.reason_id) || null : null
-    }))
-    
-    console.log('damagesService.getAll result:', { count: result.length })
-    return { data: fixEncodingInData(result) as DamageWithDetails[], error: null }
   },
 
   // Get damage by ID
   async getById(id: string) {
-    // Get damage
-    const { data: damage, error } = await supabase
-      .from('damages')
-      .select('*')
-      .eq('id', id)
-      .single()
-
-    if (error || !damage) {
-      return { data: null, error }
-    }
-
-    // Get related data
-    const [branchRes, itemRes, reasonRes] = await Promise.all([
-      supabase.from('branches').select('id, name_ar, code').eq('id', damage.branch_id).single(),
-      supabase.from('items').select('id, name_ar, code, unit').eq('id', damage.item_id).single(),
-      damage.reason_id 
-        ? supabase.from('damage_reasons').select('id, name_ar').eq('id', damage.reason_id).single()
-        : { data: null }
-    ])
-
-    const result = {
-      ...damage,
-      branch: branchRes.data || null,
-      item: itemRes.data || null,
-      reason: reasonRes.data || null
-    }
-
-    return { data: fixEncodingInData(result) as DamageWithDetails, error: null }
-  },
-
-  // Create damage record
-  async create(damageData: CreateDamageData) {
-    const damageNumber = `DMG-${Date.now()}`
-    const totalCost = damageData.unit_cost 
-      ? damageData.quantity * damageData.unit_cost 
-      : undefined
-
     const { data, error } = await supabase
       .from('damages')
-      .insert({
-        damage_number: damageNumber,
-        branch_id: damageData.branch_id,
-        item_id: damageData.item_id,
-        quantity: damageData.quantity,
-        unit_cost: damageData.unit_cost,
-        total_cost: totalCost,
-        reason_id: damageData.reason_id,
-        description: damageData.description,
-        image_url: damageData.image_url,
-        status: 'pending',
-        registered_by: damageData.registered_by,
-        registered_at: new Date().toISOString(),
-      })
-      .select()
+      .select(DAMAGE_SELECT)
+      .eq('id', id)
       .single()
 
-    if (data) {
-      // Get item name for notification
-      const { data: item } = await supabase
-        .from('items')
-        .select('name_ar')
-        .eq('id', damageData.item_id)
-        .single()
-
-      // Create notification for warehouse manager
-      await notificationsService.create({
-        user_id: null,
-        branch_id: damageData.branch_id,
-        type: 'damage',
-        title: 'تسجيل تالف جديد',
-        message: `تم تسجيل تالف جديد ${damageNumber} - ${item?.name_ar || 'صنف'} (${damageData.quantity})`,
-        priority: 'medium',
-        reference_type: 'damage',
-        reference_id: data.id,
-        expires_at: null,
-      })
+    if (error || !data) {
+      return { data: null, error }
     }
-
-    return { data: data as Damage, error }
+    return { data: fixEncodingInData(data) as DamageWithDetails, error: null }
   },
 
-  // Approve damage and deduct from inventory
-  async approve(id: string, approvedBy: string) {
-    console.log('=== DAMAGE APPROVE START ===')
-    
-    // Get damage details first
-    const { data: damage, error: fetchError } = await supabase
-      .from('damages')
-      .select('branch_id, item_id, quantity, status, damage_number')
-      .eq('id', id)
-      .single()
+  // Create damage record (number, cost and the stock check are done by the database)
+  async create(damageData: CreateDamageData) {
+    const { data, error } = await supabase.rpc('damage_create', {
+      p_branch_id: damageData.branch_id,
+      p_item_id: damageData.item_id,
+      p_quantity: roundQuantity(damageData.quantity),
+      p_reason_id: damageData.reason_id,
+      p_unit_cost: damageData.unit_cost ?? null,
+      p_description: damageData.description || null,
+      p_image_url: damageData.image_url || null,
+    })
+    if (error) return { data: null, error }
 
-    if (fetchError || !damage) {
-      return { error: fetchError || new Error('Damage not found') }
-    }
-    
-    console.log('Damage:', damage.damage_number, 'Qty:', damage.quantity)
-    
-    // Check if already approved
-    if (damage.status === 'approved') {
-      console.warn('Damage already approved, skipping')
-      return { error: null }
-    }
+    const created = data as { id: string; damage_number: string; item_name: string; quantity: number }
+    // Notification for the approvers; a failure here does not undo the saved damage
+    const { error: notifyError } = await notificationsService.create({
+      user_id: null,
+      branch_id: damageData.branch_id,
+      type: 'damage',
+      title: 'تسجيل تالف جديد',
+      message: `تم تسجيل تالف جديد ${created.damage_number} - ${created.item_name || 'صنف'} (${created.quantity})`,
+      priority: 'medium',
+      reference_type: 'damage',
+      reference_id: created.id,
+      expires_at: null,
+    })
+    if (notifyError) console.warn('Damage notification was not sent:', notifyError)
 
-    // STEP 1: Take SNAPSHOT of inventory BEFORE any changes
-    const { data: inventory } = await supabase
-      .from('inventory')
-      .select('id, quantity')
-      .eq('branch_id', damage.branch_id)
-      .eq('item_id', damage.item_id)
-      .single()
+    return { data: created, error: null }
+  },
 
-    const snapshotQty = Number(inventory?.quantity || 0)
-    const inventoryId = inventory?.id || ''
-    
-    console.log('SNAPSHOT - Current inventory:', snapshotQty)
-
-    if (!inventory || snapshotQty < damage.quantity) {
-      return { error: new Error(`الكمية غير متوفرة. متوفر: ${snapshotQty} - مطلوب: ${damage.quantity}`) }
-    }
-
-    // STEP 2: Update damage status FIRST
-    const { error: updateError } = await supabase
-      .from('damages')
-      .update({
-        status: 'approved',
-        approved_by: approvedBy,
-        approved_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', id)
-      .eq('status', 'pending') // Only update if still pending (optimistic locking)
-
-    if (updateError) return { error: updateError }
-    
-    console.log('Status updated to approved, now deducting from inventory using SNAPSHOT value...')
-
-    // STEP 3: Deduct from inventory using SNAPSHOT value
-    const newQuantity = Math.max(0, snapshotQty - damage.quantity)
-    const { error: invError } = await supabase
-      .from('inventory')
-      .update({ quantity: newQuantity, updated_at: new Date().toISOString() })
-      .eq('id', inventoryId)
-    
-    console.log(`Inventory: ${snapshotQty} -> ${newQuantity}`)
-    console.log('=== DAMAGE APPROVE COMPLETE ===')
-
-    return { error: invError }
+  // Approve damage and deduct it from the branch stock, in one database transaction
+  async approve(id: string) {
+    const { error } = await supabase.rpc('damage_approve', { p_damage_id: id })
+    return { error }
   },
 
   // Reject damage
-  async reject(id: string, rejectedBy: string, reason?: string) {
-    const { error } = await supabase
-      .from('damages')
-      .update({
-        status: 'rejected',
-        rejected_by: rejectedBy,
-        rejected_at: new Date().toISOString(),
-        rejection_reason: reason,
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', id)
-
+  async reject(id: string, reason?: string) {
+    const { error } = await supabase.rpc('damage_reject', { p_damage_id: id, p_reason: reason || null })
     return { error }
   },
 

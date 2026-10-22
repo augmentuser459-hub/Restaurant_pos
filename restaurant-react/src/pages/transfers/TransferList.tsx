@@ -1,15 +1,34 @@
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { transfersService, TransferWithDetails } from '../../services/transfers.service'
+import { transfersService, TransferWithDetails, TransferExportLine } from '../../services/transfers.service'
 import { useAuth } from '../../contexts/AuthContext'
 import { formatDate } from '../../lib/utils'
-import { Plus, ArrowLeftRight, Eye, Building2, Download } from 'lucide-react'
-import { exportToExcel, transferColumns, statusTranslations, formatDateForExcel } from '../../lib/excel'
+import { toLocalDate } from '../../lib/dates'
+import { toUserMessage } from '../../lib/errors'
+import { Plus, ArrowLeftRight, Eye, Building2, Download, AlertCircle } from 'lucide-react'
+import { exportToExcel, ExcelColumn, statusTranslations } from '../../lib/excel'
+
+// One row per transfer line, with every quantity of the line
+const transferExportColumns: ExcelColumn[] = [
+  { key: 'transfer_number', header: 'رقم التحويل' },
+  { key: 'transfer_date', header: 'التاريخ' },
+  { key: 'from_branch', header: 'من الفرع' },
+  { key: 'to_branch', header: 'إلى الفرع' },
+  { key: 'item_code', header: 'كود الصنف' },
+  { key: 'item_name', header: 'اسم الصنف' },
+  { key: 'unit', header: 'الوحدة' },
+  { key: 'requested_quantity', header: 'الكمية المطلوبة' },
+  { key: 'approved_quantity', header: 'الكمية الموافق عليها' },
+  { key: 'received_quantity', header: 'الكمية المستلمة' },
+  { key: 'status', header: 'الحالة' },
+]
 
 export default function TransferList() {
   const { user } = useAuth()
   const [transfers, setTransfers] = useState<TransferWithDetails[]>([])
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
+  const [exporting, setExporting] = useState(false)
   const [filter, setFilter] = useState<'all' | 'pending' | 'approved' | 'received'>('all')
 
   useEffect(() => {
@@ -18,55 +37,68 @@ export default function TransferList() {
 
   const fetchTransfers = async () => {
     // Get role name - handle both string and object formats
-    const roleName = typeof user?.role === 'object' && user?.role !== null 
-      ? (user.role as { name: string }).name 
+    const roleName = typeof user?.role === 'object' && user?.role !== null
+      ? (user.role as { name: string }).name
       : user?.role
-    
-    const branchId = roleName !== 'admin' && roleName !== 'warehouse_manager' 
-      ? user?.branch_id 
+
+    const branchId = roleName !== 'admin' && roleName !== 'warehouse_manager'
+      ? user?.branch_id
       : undefined
-    const { data } = await transfersService.getAll(branchId)
+    const { data, error } = await transfersService.getAll(branchId)
+    setError(error ? 'تعذر تحميل التحويلات: ' + toUserMessage(error) : '')
     setTransfers(data || [])
     setLoading(false)
   }
 
-  const filteredTransfers = transfers.filter(t => 
+  const filteredTransfers = transfers.filter(t =>
     filter === 'all' || t.status === filter
   )
 
-  // Export to Excel
-  const handleExport = () => {
-    // Flatten transfers with items
+  // Export to Excel: one row per item line (the list itself only loads line ids)
+  const handleExport = async () => {
+    if (exporting) return
+    setExporting(true)
+    const { data: lines, error } = await transfersService.getExportLines(filteredTransfers.map(t => t.id))
+    if (error) {
+      alert('تعذر تجهيز ملف التصدير: ' + toUserMessage(error))
+      setExporting(false)
+      return
+    }
+    const linesByTransfer = new Map<string, TransferExportLine[]>()
+    lines.forEach(line => {
+      const list = linesByTransfer.get(line.transfer_id) || []
+      list.push(line)
+      linesByTransfer.set(line.transfer_id, list)
+    })
+
     const exportData: Record<string, unknown>[] = []
     filteredTransfers.forEach(t => {
-      const items = Array.isArray(t.items) ? t.items : []
-      if (items.length === 0) {
-        exportData.push({
-          transfer_number: t.transfer_number || '',
-          transfer_date: t.transfer_date ? formatDateForExcel(t.transfer_date) : '',
-          from_branch: t.from_branch?.name_ar || '',
-          to_branch: t.to_branch?.name_ar || '',
-          item_code: '',
-          item_name: '',
-          quantity: 0,
-          status: statusTranslations[t.status] || t.status,
-        })
+      const header = {
+        transfer_number: t.transfer_number || '',
+        transfer_date: t.requested_at || t.created_at ? toLocalDate(t.requested_at || t.created_at) : '',
+        from_branch: t.from_branch?.name_ar || '',
+        to_branch: t.to_branch?.name_ar || '',
+        status: statusTranslations[t.status] || t.status,
+      }
+      const transferLines = linesByTransfer.get(t.id) || []
+      if (transferLines.length === 0) {
+        exportData.push({ ...header, item_code: '', item_name: '', unit: '', requested_quantity: '', approved_quantity: '', received_quantity: '' })
       } else {
-        items.forEach(item => {
+        transferLines.forEach(line => {
           exportData.push({
-            transfer_number: t.transfer_number || '',
-            transfer_date: t.transfer_date ? formatDateForExcel(t.transfer_date) : '',
-            from_branch: t.from_branch?.name_ar || '',
-            to_branch: t.to_branch?.name_ar || '',
-            item_code: item.item?.code || '',
-            item_name: item.item?.name_ar || '',
-            quantity: item.requested_quantity || 0,
-            status: statusTranslations[t.status] || t.status,
+            ...header,
+            item_code: line.item?.code || '',
+            item_name: line.item?.name_ar || '',
+            unit: line.item?.unit?.name_ar || '',
+            requested_quantity: Number(line.requested_quantity),
+            approved_quantity: line.approved_quantity !== null ? Number(line.approved_quantity) : '',
+            received_quantity: line.received_quantity !== null ? Number(line.received_quantity) : '',
           })
         })
       }
     })
-    exportToExcel(exportData, transferColumns, 'التحويلات')
+    exportToExcel(exportData, transferExportColumns, 'التحويلات')
+    setExporting(false)
   }
 
   const getStatusBadge = (status: string) => {
@@ -111,11 +143,12 @@ export default function TransferList() {
           <button
             type="button"
             onClick={handleExport}
-            className="flex items-center gap-2 px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700"
+            disabled={exporting}
+            className="flex items-center gap-2 px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-50"
             title="تصدير إلى Excel"
           >
             <Download className="w-5 h-5" />
-            تصدير
+            {exporting ? 'جاري التصدير...' : 'تصدير'}
           </button>
           <Link
             to="/transfers/new"
@@ -126,6 +159,13 @@ export default function TransferList() {
           </Link>
         </div>
       </div>
+
+      {error && (
+        <div className="p-4 bg-red-50 border border-red-200 rounded-lg flex items-center gap-3">
+          <AlertCircle className="w-5 h-5 text-red-500 shrink-0" />
+          <p className="text-red-700">{error}</p>
+        </div>
+      )}
 
       {/* Filters */}
       <div className="flex gap-2">
@@ -140,7 +180,7 @@ export default function TransferList() {
                 : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
             }`}
           >
-            {status === 'all' ? 'الكل' : 
+            {status === 'all' ? 'الكل' :
              status === 'pending' ? 'معلق' :
              status === 'approved' ? 'موافق عليه' : 'مستلم'}
           </button>

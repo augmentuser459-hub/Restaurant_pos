@@ -1,8 +1,9 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { transfersService, TransferWithDetails } from '../../services/transfers.service'
 import { useAuth } from '../../contexts/AuthContext'
-import { formatDate, translateStatus, getStatusColor } from '../../lib/utils'
+import { formatDate, formatQuantity, translateStatus, getStatusColor } from '../../lib/utils'
+import { toUserMessage } from '../../lib/errors'
 import { ArrowRight, Building2, Package, Check, X, Truck, Printer } from 'lucide-react'
 
 export default function TransferDetail() {
@@ -11,60 +12,53 @@ export default function TransferDetail() {
   const { user } = useAuth()
   const [transfer, setTransfer] = useState<TransferWithDetails | null>(null)
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState('')
   const [actionLoading, setActionLoading] = useState(false)
+  const busy = useRef(false) // blocks a second click before the button re-renders as disabled
 
   useEffect(() => {
     if (id) fetchTransfer(id)
   }, [id])
 
   const fetchTransfer = async (transferId: string) => {
-    const { data } = await transfersService.getById(transferId)
+    const { data, error } = await transfersService.getById(transferId)
+    setLoadError(error && error.code !== 'PGRST116' ? toUserMessage(error) : '')
     setTransfer(data)
     setLoading(false)
   }
 
-  const handleApprove = async () => {
-    if (!transfer || !user) return
+  // Runs one status action; the database refuses it when the transfer was already processed elsewhere,
+  // so the page is always reloaded afterwards to show the real status.
+  const runAction = async (action: () => Promise<{ error: unknown }>, failMessage: string) => {
+    if (!transfer || busy.current) return
+    busy.current = true
     setActionLoading(true)
-    const quantities = transfer.items.map(item => ({
-      itemId: item.item_id,
-      quantity: item.requested_quantity,
-    }))
-    await transfersService.approve(transfer.id, user.id, quantities)
-    fetchTransfer(transfer.id)
+    try {
+      const { error } = await action()
+      if (error) alert(`${failMessage}: ${toUserMessage(error)}`)
+    } catch (err) {
+      alert(`${failMessage}: ${toUserMessage(err)}`)
+    }
+    await fetchTransfer(transfer.id)
     setActionLoading(false)
+    busy.current = false
   }
 
-  const handleReject = async () => {
+  const handleApprove = () => {
+    if (!transfer || !user) return
+    runAction(() => transfersService.approve(transfer.id), 'تعذرت الموافقة على التحويل')
+  }
+
+  const handleReject = () => {
     if (!transfer || !user) return
     const reason = prompt('سبب الرفض:')
     if (reason === null) return
-    setActionLoading(true)
-    await transfersService.reject(transfer.id, user.id, reason)
-    fetchTransfer(transfer.id)
-    setActionLoading(false)
+    runAction(() => transfersService.reject(transfer.id, reason), 'تعذر رفض التحويل')
   }
 
-  const handleReceive = async () => {
+  const handleReceive = () => {
     if (!transfer || !user) return
-    setActionLoading(true)
-    try {
-      const quantities = transfer.items.map(item => ({
-        itemId: item.item_id,
-        quantity: item.approved_quantity || item.requested_quantity,
-      }))
-      const { error } = await transfersService.receive(transfer.id, user.id, quantities)
-      if (error) {
-        console.error('Receive error:', error)
-        alert('حدث خطأ أثناء تأكيد الاستلام: ' + error.message)
-      } else {
-        fetchTransfer(transfer.id)
-      }
-    } catch (err) {
-      console.error('Receive exception:', err)
-      alert('حدث خطأ غير متوقع')
-    }
-    setActionLoading(false)
+    runAction(() => transfersService.receive(transfer.id), 'حدث خطأ أثناء تأكيد الاستلام')
   }
 
   const handlePrint = () => {
@@ -77,9 +71,9 @@ export default function TransferDetail() {
       }
     `;
     document.head.appendChild(style);
-    
+
     window.print();
-    
+
     // Remove the style after printing
     setTimeout(() => {
       document.head.removeChild(style);
@@ -91,45 +85,32 @@ export default function TransferDetail() {
   }
 
   if (!transfer) {
-    return <div className="text-center py-12"><p className="text-gray-600">التحويل غير موجود</p></div>
+    return <div className="text-center py-12"><p className="text-gray-600">{loadError || 'التحويل غير موجود'}</p></div>
   }
 
   // Get user role name (handle both string and object)
-  const userRole = typeof user?.role === 'object' && user?.role !== null 
-    ? (user.role as { name: string }).name 
+  const userRole = typeof user?.role === 'object' && user?.role !== null
+    ? (user.role as { name: string }).name
     : user?.role
 
   // Get branch IDs from the transfer object
   const toBranchId = (transfer as unknown as { to_branch_id?: string }).to_branch_id || transfer.to_branch?.id
   const fromBranchId = (transfer as unknown as { from_branch_id?: string }).from_branch_id || transfer.from_branch?.id
 
-  // Admin and warehouse_manager can approve any transfer
-  // Branch supervisor can approve transfers TO their branch
+  // Approval belongs to the SOURCE side: admin, warehouse manager, or the source branch's supervisor
+  // when somebody else made the request (the database enforces the same rule)
   const canApprove = transfer.status === 'pending' && (
-    userRole === 'admin' || 
+    userRole === 'admin' ||
     userRole === 'warehouse_manager' ||
-    (userRole === 'branch_supervisor' && user?.branch_id === toBranchId)
+    (userRole === 'branch_supervisor' && Boolean(user?.branch_id) && user?.branch_id === fromBranchId && transfer.requested_by !== user?.id)
   )
-  
-  // User can receive if transfer is approved
-  // Admin and warehouse_manager can receive any transfer
-  // Branch users can receive transfers TO their branch
+
+  // Receipt belongs to the DESTINATION side: admin, warehouse manager, or the destination branch's supervisor
   const canReceive = transfer.status === 'approved' && (
-    userRole === 'admin' || 
+    userRole === 'admin' ||
     userRole === 'warehouse_manager' ||
-    user?.branch_id === toBranchId
+    (userRole === 'branch_supervisor' && Boolean(user?.branch_id) && user?.branch_id === toBranchId)
   )
-  
-  console.log('Transfer Debug:', { 
-    status: transfer.status, 
-    userRole, 
-    userBranchId: user?.branch_id, 
-    toBranchId,
-    fromBranchId,
-    canApprove, 
-    canReceive,
-    items: transfer.items
-  })
 
   return (
     <div className="max-w-4xl mx-auto space-y-6">
@@ -202,12 +183,14 @@ export default function TransferDetail() {
                   const unitName = typeof item.item?.unit === 'object' && item.item?.unit !== null
                     ? (item.item.unit as { name_ar?: string }).name_ar || ''
                     : item.item?.unit || ''
+                  const hasApproved = item.approved_quantity !== null && item.approved_quantity !== undefined
+                  const hasReceived = item.received_quantity !== null && item.received_quantity !== undefined
                   return (
                     <tr key={item.id}>
                       <td className="px-4 py-3 print:border print:border-gray-300">{item.item?.name_ar || 'غير معروف'} <span className="text-gray-500">({item.item?.code || '-'})</span></td>
-                      <td className="px-4 py-3 print:border print:border-gray-300">{item.requested_quantity} {unitName}</td>
-                      <td className="px-4 py-3 print:border print:border-gray-300">{item.approved_quantity ?? '-'} {item.approved_quantity ? unitName : ''}</td>
-                      <td className="px-4 py-3 print:border print:border-gray-300">{item.received_quantity ?? '-'} {item.received_quantity ? unitName : ''}</td>
+                      <td className="px-4 py-3 print:border print:border-gray-300">{formatQuantity(item.requested_quantity)} {unitName}</td>
+                      <td className="px-4 py-3 print:border print:border-gray-300">{hasApproved ? `${formatQuantity(item.approved_quantity)} ${unitName}` : '-'}</td>
+                      <td className="px-4 py-3 print:border print:border-gray-300">{hasReceived ? `${formatQuantity(item.received_quantity)} ${unitName}` : '-'}</td>
                     </tr>
                   )
                 })}
@@ -224,6 +207,7 @@ export default function TransferDetail() {
           <div><span className="text-gray-500">عدد الأصناف:</span> <span className="font-medium">{transfer.items?.length || 0}</span></div>
           <div><span className="text-gray-500">الحالة:</span> <span className="font-medium">{translateStatus(transfer.status)}</span></div>
           {transfer.notes && <div className="col-span-2"><span className="text-gray-500">ملاحظات:</span> <span className="font-medium">{transfer.notes}</span></div>}
+          {transfer.rejection_reason && <div className="col-span-2"><span className="text-gray-500">سبب الرفض:</span> <span className="font-medium text-red-600">{transfer.rejection_reason}</span></div>}
         </div>
       </div>
 

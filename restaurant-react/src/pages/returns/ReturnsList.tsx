@@ -1,57 +1,30 @@
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { supabase, fixEncodingInData } from '../../lib/supabase'
 import { useAuth } from '../../contexts/AuthContext'
-import { Package, Search, Filter, Plus, Eye, Download } from 'lucide-react'
-import { formatNumber } from '../../lib/utils'
-import { exportToExcel, returnColumns, statusTranslations, formatDateForExcel } from '../../lib/excel'
+import { returnsService, SupplierReturn, BranchReturn } from '../../services/returns.service'
+import { Package, Search, Filter, Plus, Eye, Download, AlertCircle } from 'lucide-react'
+import { formatQuantity, translateStatus } from '../../lib/utils'
+import { toLocalDate } from '../../lib/dates'
+import { toUserMessage } from '../../lib/errors'
+import { exportToExcel, returnColumns, statusTranslations } from '../../lib/excel'
 
 type ReturnType = 'supplier' | 'branch'
 
-interface SupplierReturn {
-  id: string
-  return_number: string
-  registered_at: string
-  quantity: number
-  reason: string
-  description: string
-  status: string
-  item: { code: string; name_ar: string }
-  supplier: { name_ar: string }
-}
-
-interface BranchReturn {
-  id: string
-  return_number: string
-  return_date: string
-  status: string
-  return_reason: string
-  total_quantity: number
-  notes: string
-  from_branch: { name_ar: string }
-  to_branch: { name_ar: string }
-  items: BranchReturnItem[]
-}
-
-interface BranchReturnItem {
-  id: string
-  requested_quantity: number
-  item_reason: string
-  notes: string
-  item: { code: string; name_ar: string }
-}
+const statusLabel = (status: string) => (status === 'in_transit' ? 'قيد الشحن' : translateStatus(status))
 
 export default function ReturnsList() {
   const { user } = useAuth()
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const userRole = typeof user?.role === 'object' ? (user.role as any)?.name : user?.role
+  const userRole = typeof user?.role === 'object' && user?.role !== null
+    ? (user.role as { name: string }).name
+    : user?.role
   const isBranchSupervisor = userRole === 'branch_supervisor'
-  
+
   // Branch supervisors can only see branch returns
   const [returnType, setReturnType] = useState<ReturnType>(isBranchSupervisor ? 'branch' : 'supplier')
   const [supplierReturns, setSupplierReturns] = useState<SupplierReturn[]>([])
   const [branchReturns, setBranchReturns] = useState<BranchReturn[]>([])
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
   const [search, setSearch] = useState('')
 
   useEffect(() => {
@@ -60,62 +33,26 @@ export default function ReturnsList() {
 
   const fetchReturns = async () => {
     setLoading(true)
-    
+
     if (returnType === 'supplier') {
-      const { data } = await supabase
-        .from('supplier_returns')
-        .select(`
-          id, return_number, registered_at, quantity, reason, description, status,
-          item:items(code, name_ar),
-          supplier:suppliers(name_ar)
-        `)
-        .order('registered_at', { ascending: false })
-      
-      setSupplierReturns(fixEncodingInData(data) as unknown as SupplierReturn[] || [])
+      const { data, error } = await returnsService.getSupplierReturns()
+      setError(error ? 'تعذر تحميل المرتجعات: ' + toUserMessage(error) : '')
+      setSupplierReturns(data)
     } else {
-      // Build query
-      let query = supabase
-        .from('branch_returns')
-        .select(`
-          id, return_number, return_date, status, return_reason, total_quantity, notes,
-          from_branch:branches!branch_returns_from_branch_id_fkey(name_ar),
-          to_branch:branches!branch_returns_to_branch_id_fkey(name_ar)
-        `)
-      
-      // Filter by branch for branch supervisors
-      if (isBranchSupervisor && user?.branch_id) {
-        query = query.eq('from_branch_id', user.branch_id)
-      }
-      
-      const { data, error } = await query.order('return_date', { ascending: false })
-      
-      if (error) {
-        console.error('Error fetching branch returns:', error)
-      }
-      
-      console.log('Branch returns fetched:', data?.length || 0, 'records')
-      
-      // Fetch items for each return
-      const returnsWithItems = await Promise.all(
-        (data || []).map(async (ret) => {
-          const { data: items } = await supabase
-            .from('branch_return_items')
-            .select('id, requested_quantity, item_reason, notes, item:items(code, name_ar)')
-            .eq('return_id', ret.id)
-          
-          return { ...ret, items: fixEncodingInData(items) || [] }
-        })
-      )
-      
-      setBranchReturns(fixEncodingInData(returnsWithItems) as unknown as BranchReturn[] || [])
+      // Filter by branch for branch supervisors; the lines come embedded in the same request
+      const { data, error } = await returnsService.getBranchReturns(isBranchSupervisor && user?.branch_id ? user.branch_id : undefined)
+      setError(error ? 'تعذر تحميل المرتجعات: ' + toUserMessage(error) : '')
+      setBranchReturns(data)
     }
-    
+
     setLoading(false)
   }
 
+  // DATE values (YYYY-MM-DD) are shown as they are; timestamps as their Cairo date
   const formatDate = (date: string) => {
-    const d = new Date(date)
-    return `${d.getDate()}/${d.getMonth() + 1}/${d.getFullYear()}`
+    if (!date) return '-'
+    const [y, m, d] = (date.length === 10 ? date : toLocalDate(date)).split('-')
+    return `${Number(d)}/${Number(m)}/${y}`
   }
 
   // Export to Excel
@@ -123,27 +60,27 @@ export default function ReturnsList() {
     if (returnType === 'supplier') {
       const exportData = filteredSupplierReturns.map(ret => ({
         return_number: ret.return_number || '',
-        return_date: ret.registered_at ? formatDateForExcel(ret.registered_at) : '',
-        from_branch: 'المخزن الرئيسي',
+        return_date: ret.registered_at ? toLocalDate(ret.registered_at) : '',
+        from_branch: ret.branch?.name_ar || 'المخزن الرئيسي',
         to_branch: ret.supplier?.name_ar || '',
         item_code: ret.item?.code || '',
         item_name: ret.item?.name_ar || '',
-        quantity: ret.quantity || 0,
+        quantity: Number(ret.quantity) || 0,
         reason: ret.reason || '',
-        status: statusTranslations[ret.status] || ret.status,
+        status: statusTranslations[ret.status] || statusLabel(ret.status),
       }))
       exportToExcel(exportData, returnColumns, 'مرتجعات_الموردين')
     } else {
       const exportData = flattenedBranchReturns.map(ret => ({
         return_number: ret.return_number || '',
-        return_date: ret.return_date ? formatDateForExcel(ret.return_date) : '',
+        return_date: ret.return_date || '',
         from_branch: ret.from_branch?.name_ar || '',
         to_branch: ret.to_branch?.name_ar || '',
         item_code: ret.itemData?.item?.code || '',
         item_name: ret.itemData?.item?.name_ar || '',
-        quantity: ret.itemData?.requested_quantity || 0,
+        quantity: Number(ret.itemData?.requested_quantity) || 0,
         reason: ret.itemData?.item_reason || ret.return_reason || '',
-        status: statusTranslations[ret.status] || ret.status,
+        status: statusTranslations[ret.status] || statusLabel(ret.status),
       }))
       exportToExcel(exportData, returnColumns, 'مرتجعات_الفروع')
     }
@@ -151,7 +88,7 @@ export default function ReturnsList() {
 
   // Filter supplier returns
   const filteredSupplierReturns = supplierReturns.filter((ret) => {
-    const item = ret.item as { code?: string; name_ar?: string }
+    const item = ret.item
     return (
       item?.name_ar?.includes(search) ||
       item?.code?.toLowerCase().includes(search.toLowerCase()) ||
@@ -167,7 +104,7 @@ export default function ReturnsList() {
       itemData: item,
     }))
   }).filter((ret) => {
-    const item = ret.itemData?.item as { code?: string; name_ar?: string }
+    const item = ret.itemData?.item
     return (
       item?.name_ar?.includes(search) ||
       item?.code?.toLowerCase().includes(search.toLowerCase()) ||
@@ -239,6 +176,13 @@ export default function ReturnsList() {
         </button>
       </div>
 
+      {error && (
+        <div className="p-4 bg-red-50 border border-red-200 rounded-lg flex items-center gap-3">
+          <AlertCircle className="w-5 h-5 text-red-500 shrink-0" />
+          <p className="text-red-700">{error}</p>
+        </div>
+      )}
+
       {/* Filters */}
       <div className="bg-white rounded-lg shadow-sm border border-gray-100 p-4">
         <div className="flex items-center gap-2 mb-3">
@@ -279,13 +223,14 @@ export default function ReturnsList() {
                     <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">اسم الصنف</th>
                     <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">بيان</th>
                     <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">الكمية</th>
+                    <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">الحالة</th>
                     <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">ملاحظات</th>
                     <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">إجراءات</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-100">
                   {filteredSupplierReturns.map((ret, index) => {
-                    const item = ret.item as { code?: string; name_ar?: string }
+                    const item = ret.item
                     return (
                       <tr key={ret.id} className={index % 2 === 0 ? 'bg-white' : 'bg-gray-50'}>
                         <td className="px-4 py-3 text-gray-900">{index + 1}</td>
@@ -294,7 +239,8 @@ export default function ReturnsList() {
                         <td className="px-4 py-3 text-gray-900 font-mono">{item?.code || '-'}</td>
                         <td className="px-4 py-3 text-gray-900">{item?.name_ar || '-'}</td>
                         <td className="px-4 py-3 text-gray-600">{ret.reason || '-'}</td>
-                        <td className="px-4 py-3 text-gray-900 font-medium">{formatNumber(ret.quantity)}</td>
+                        <td className="px-4 py-3 text-gray-900 font-medium">{formatQuantity(ret.quantity)}</td>
+                        <td className="px-4 py-3 text-gray-600">{statusLabel(ret.status)}</td>
                         <td className="px-4 py-3 text-gray-500 text-sm">{ret.description || '-'}</td>
                         <td className="px-4 py-3">
                           <Link to={`/returns/supplier/${ret.id}`} className="flex items-center gap-1 px-3 py-1.5 text-sm text-blue-600 hover:bg-blue-50 rounded-lg">
@@ -326,13 +272,14 @@ export default function ReturnsList() {
                     <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">كود الصنف</th>
                     <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">اسم الصنف</th>
                     <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">الكمية</th>
+                    <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">الحالة</th>
                     <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">ملاحظات</th>
                     <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">إجراءات</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-100">
                   {flattenedBranchReturns.map((ret, index) => {
-                    const item = ret.itemData?.item as { code?: string; name_ar?: string }
+                    const item = ret.itemData?.item
                     return (
                       <tr key={`${ret.id}-${ret.itemIndex}`} className={index % 2 === 0 ? 'bg-white' : 'bg-gray-50'}>
                         <td className="px-4 py-3 text-gray-900">{index + 1}</td>
@@ -340,7 +287,8 @@ export default function ReturnsList() {
                         <td className="px-4 py-3 text-gray-900 font-mono">{ret.return_number}</td>
                         <td className="px-4 py-3 text-gray-900 font-mono">{item?.code || '-'}</td>
                         <td className="px-4 py-3 text-gray-900">{item?.name_ar || '-'}</td>
-                        <td className="px-4 py-3 text-gray-900 font-medium">{formatNumber(ret.itemData?.requested_quantity || 0)}</td>
+                        <td className="px-4 py-3 text-gray-900 font-medium">{formatQuantity(ret.itemData?.requested_quantity || 0)}</td>
+                        <td className="px-4 py-3 text-gray-600">{statusLabel(ret.status)}</td>
                         <td className="px-4 py-3 text-gray-500 text-sm">{ret.itemData?.notes || ret.notes || '-'}</td>
                         <td className="px-4 py-3">
                           <Link to={`/returns/branch/${ret.id}`} className="flex items-center gap-1 px-3 py-1.5 text-sm text-blue-600 hover:bg-blue-50 rounded-lg">

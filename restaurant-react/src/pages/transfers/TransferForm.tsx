@@ -1,19 +1,29 @@
 import { useState, useEffect, FormEvent } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { transfersService } from '../../services/transfers.service'
+import { transfersService, fetchPickerItems, PickerItem } from '../../services/transfers.service'
 import { branchesService } from '../../services/branches.service'
-import { inventoryService, InventoryWithDetails } from '../../services/inventory.service'
 import { useAuth } from '../../contexts/AuthContext'
-import { Branch, Item } from '../../types/database.types'
+import { Branch } from '../../types/database.types'
+import { toUserMessage } from '../../lib/errors'
+import { formatQuantity, parseDecimal, roundQuantity } from '../../lib/utils'
 import { Save, ArrowRight, AlertCircle, Plus, Trash2, Barcode, Search, X } from 'lucide-react'
 
 
 interface TransferItem {
+  key: string // stable row id (React key), so a row's search text never moves to another row
   item_id: string
   requested_quantity: number
+  search: string
   notes?: string
-  availableQty?: number // Track available quantity
 }
+
+let rowSeq = 0
+const newRow = (): TransferItem => ({ key: `row-${++rowSeq}`, item_id: '', requested_quantity: 1, search: '' })
+
+const matchesTerm = (item: PickerItem, term: string) =>
+  item.name_ar.toLowerCase().includes(term) ||
+  item.code.toLowerCase().includes(term) ||
+  Boolean(item.barcode && item.barcode.toLowerCase().includes(term))
 
 export default function TransferForm() {
   const navigate = useNavigate()
@@ -21,78 +31,77 @@ export default function TransferForm() {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [branches, setBranches] = useState<Branch[]>([])
-  const [items, setItems] = useState<Item[]>([])
+  const [items, setItems] = useState<PickerItem[]>([])
 
   const [fromBranch, setFromBranch] = useState('')
   const [toBranch, setToBranch] = useState('')
   const [notes, setNotes] = useState('')
-  const [transferItems, setTransferItems] = useState<TransferItem[]>([{ item_id: '', requested_quantity: 1 }])
-  const [sourceInventory, setSourceInventory] = useState<InventoryWithDetails[]>([])
-  const [searchTerm, setSearchTerm] = useState<{ [key: number]: string }>({})
+  const [transferItems, setTransferItems] = useState<TransferItem[]>(() => [newRow()])
+  const [sourceStock, setSourceStock] = useState<Record<string, number>>({})
+
+  const userRole = typeof user?.role === 'object' && user?.role !== null
+    ? (user.role as { name: string }).name
+    : user?.role
 
   useEffect(() => {
     fetchData()
   }, [])
 
-  // Fetch source branch inventory when fromBranch changes
+  // Fetch source branch stock when fromBranch changes
   useEffect(() => {
     if (fromBranch) {
-      fetchSourceInventory(fromBranch)
+      fetchSourceStock(fromBranch)
     } else {
-      setSourceInventory([])
+      setSourceStock({})
     }
   }, [fromBranch])
 
-  const fetchSourceInventory = async (branchId: string) => {
-    const { data } = await inventoryService.getStockByBranch(branchId)
-    setSourceInventory(data || [])
+  const fetchSourceStock = async (branchId: string) => {
+    const { data, error } = await transfersService.getBranchStock(branchId)
+    if (error) setError('تعذر تحميل رصيد الفرع المرسل: ' + toUserMessage(error))
+    setSourceStock(data)
   }
 
   // Get available quantity for an item in source branch
-  const getAvailableQty = (itemId: string): number => {
-    const inv = sourceInventory.find(i => i.item_id === itemId)
-    return inv?.quantity || 0
-  }
+  const getAvailableQty = (itemId: string): number => sourceStock[itemId] || 0
 
   const fetchData = async () => {
     const [branchesRes, itemsRes] = await Promise.all([
       branchesService.getActive(),
-      inventoryService.getAllItems(),
+      fetchPickerItems(),
     ])
+    if (branchesRes.error || itemsRes.error) {
+      setError('تعذر تحميل البيانات: ' + toUserMessage(branchesRes.error || itemsRes.error))
+    }
     setBranches(branchesRes.data || [])
-    setItems(itemsRes.data || [])
+    setItems(itemsRes.data.filter(i => i.status === 'active'))
   }
 
-  const filteredItems = (index: number) => {
-    const term = searchTerm[index]?.toLowerCase() || ''
+  const filteredItems = (search: string) => {
+    const term = search.toLowerCase()
     if (!term) return items
-    return items.filter(item => 
-      item.name_ar.toLowerCase().includes(term) ||
-      item.code.toLowerCase().includes(term) ||
-      ((item as Item & { barcode?: string }).barcode && (item as Item & { barcode?: string }).barcode!.toLowerCase().includes(term))
-    )
+    return items.filter(item => matchesTerm(item, term))
   }
+
+  // Total requested per item over all rows (the same item may be on two rows)
+  const requestedTotal = (itemId: string) =>
+    roundQuantity(transferItems.filter(i => i.item_id === itemId).reduce((sum, i) => sum + (i.requested_quantity || 0), 0))
 
   const handleAddItem = () => {
-    setTransferItems([...transferItems, { item_id: '', requested_quantity: 1 }])
+    setTransferItems(rows => [...rows, newRow()])
   }
 
-  const handleRemoveItem = (index: number) => {
-    setTransferItems(transferItems.filter((_, i) => i !== index))
+  const handleRemoveItem = (key: string) => {
+    setTransferItems(rows => rows.filter(r => r.key !== key))
   }
 
-  const handleItemChange = (index: number, field: keyof TransferItem, value: string | number) => {
-    const updated = [...transferItems]
-    updated[index] = { ...updated[index], [field]: value }
-    // Update available quantity when item changes
-    if (field === 'item_id' && typeof value === 'string') {
-      updated[index].availableQty = getAvailableQty(value)
-    }
-    setTransferItems(updated)
+  const updateRow = (key: string, changes: Partial<TransferItem>) => {
+    setTransferItems(rows => rows.map(r => (r.key === key ? { ...r, ...changes } : r)))
   }
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault()
+    if (loading) return
     setError('')
 
     if (!fromBranch || !toBranch) {
@@ -103,21 +112,33 @@ export default function TransferForm() {
       setError('لا يمكن التحويل لنفس الفرع')
       return
     }
-    const validItems = transferItems.filter(i => i.item_id && i.requested_quantity > 0)
-    if (validItems.length === 0) {
+    if (userRole === 'branch_supervisor' && user?.branch_id !== fromBranch && user?.branch_id !== toBranch) {
+      setError('يمكنك إنشاء تحويلات من فرعك أو إليه فقط')
+      return
+    }
+    const chosen = transferItems.filter(i => i.item_id)
+    if (chosen.length === 0) {
       setError('يرجى إضافة صنف واحد على الأقل')
       return
     }
-
-    // Check if all quantities are available
-    const insufficientItems: string[] = []
-    for (const item of validItems) {
-      const availableQty = getAvailableQty(item.item_id)
-      if (item.requested_quantity > availableQty) {
-        const itemName = items.find(i => i.id === item.item_id)?.name_ar || ''
-        insufficientItems.push(`${itemName}: متوفر ${availableQty} - مطلوب ${item.requested_quantity}`)
-      }
+    const badQty = chosen.find(i => !(i.requested_quantity > 0))
+    if (badQty) {
+      const itemName = items.find(i => i.id === badQty.item_id)?.name_ar || ''
+      setError(`يرجى إدخال كمية أكبر من صفر للصنف ${itemName}`)
+      return
     }
+
+    // Merge rows of the same item, then check the summed quantity against the source stock
+    const merged = new Map<string, number>()
+    chosen.forEach(i => merged.set(i.item_id, roundQuantity((merged.get(i.item_id) || 0) + i.requested_quantity)))
+    const insufficientItems: string[] = []
+    merged.forEach((qty, itemId) => {
+      const availableQty = getAvailableQty(itemId)
+      if (qty > availableQty) {
+        const itemName = items.find(i => i.id === itemId)?.name_ar || ''
+        insufficientItems.push(`${itemName}: متوفر ${formatQuantity(availableQty)} - مطلوب ${formatQuantity(qty)}`)
+      }
+    })
     if (insufficientItems.length > 0) {
       setError(`الكمية غير متوفرة في المخزن المصدر:\n${insufficientItems.join('\n')}`)
       return
@@ -128,22 +149,21 @@ export default function TransferForm() {
       from_branch_id: fromBranch,
       to_branch_id: toBranch,
       notes,
-      requested_by: user?.id || '',
-      items: validItems,
+      items: [...merged.entries()].map(([item_id, requested_quantity]) => ({ item_id, requested_quantity })),
     })
 
     if (error) {
-      setError('فشل في إنشاء التحويل')
+      setError('فشل في إنشاء التحويل: ' + toUserMessage(error))
+      setLoading(false)
     } else {
       navigate('/transfers')
     }
-    setLoading(false)
   }
 
   return (
     <div className="max-w-3xl mx-auto">
       <div className="flex items-center gap-4 mb-6">
-        <button onClick={() => navigate('/transfers')} className="p-2 hover:bg-gray-100 rounded-lg" title="رجوع">
+        <button type="button" onClick={() => navigate('/transfers')} className="p-2 hover:bg-gray-100 rounded-lg" title="رجوع">
           <ArrowRight className="w-5 h-5" />
         </button>
         <div>
@@ -155,7 +175,7 @@ export default function TransferForm() {
       {error && (
         <div className="mb-6 p-4 bg-red-50 border border-red-200 rounded-lg flex items-center gap-3">
           <AlertCircle className="w-5 h-5 text-red-500 shrink-0" />
-          <p className="text-red-700">{error}</p>
+          <p className="text-red-700 whitespace-pre-line">{error}</p>
         </div>
       )}
 
@@ -190,15 +210,16 @@ export default function TransferForm() {
           </div>
 
           <div className="space-y-4">
-            {transferItems.map((item, index) => {
+            {transferItems.map((item) => {
               const selectedItem = items.find(i => i.id === item.item_id)
-              const searchResults = filteredItems(index)
-              const showResults = searchTerm[index] && searchResults.length > 0
+              const searchResults = filteredItems(item.search)
+              const showResults = item.search && searchResults.length > 0
               const availableQty = item.item_id ? getAvailableQty(item.item_id) : 0
-              const isInsufficient = item.item_id && item.requested_quantity > availableQty
-              
+              const isInsufficient = Boolean(item.item_id) && requestedTotal(item.item_id) > availableQty
+              const isDuplicate = Boolean(item.item_id) && transferItems.filter(r => r.item_id === item.item_id).length > 1
+
               return (
-                <div key={index} className={`p-4 rounded-lg border ${isInsufficient ? 'bg-red-50 border-red-200' : 'bg-gray-50 border-gray-200'}`}>
+                <div key={item.key} className={`p-4 rounded-lg border ${isInsufficient ? 'bg-red-50 border-red-200' : 'bg-gray-50 border-gray-200'}`}>
                   <div className="space-y-3">
                     {/* Search Input with Icon */}
                     <div className="relative">
@@ -209,29 +230,30 @@ export default function TransferForm() {
                         <input
                           type="text"
                           placeholder="امسح الباركود أو أدخل الكود أو اسم الصنف"
-                          value={searchTerm[index] || ''}
+                          value={item.search}
                           onChange={(e) => {
-                            setSearchTerm({ ...searchTerm, [index]: e.target.value })
+                            const value = e.target.value
                             // Auto-select if only one result
-                            const results = items.filter(i => 
-                              i.name_ar.toLowerCase().includes(e.target.value.toLowerCase()) ||
-                              i.code.toLowerCase().includes(e.target.value.toLowerCase()) ||
-                              ((i as Item & { barcode?: string }).barcode && (i as Item & { barcode?: string }).barcode!.toLowerCase().includes(e.target.value.toLowerCase()))
-                            )
-                            if (results.length === 1 && e.target.value.length > 2) {
-                              handleItemChange(index, 'item_id', results[0].id)
+                            const results = items.filter(i => matchesTerm(i, value.toLowerCase()))
+                            if (results.length === 1 && value.length > 2) {
+                              updateRow(item.key, { search: value, item_id: results[0].id })
+                            } else {
+                              updateRow(item.key, { search: value })
                             }
                           }}
                           onKeyDown={(e) => {
-                            if (e.key === 'Enter' && searchResults.length > 0) {
-                              handleItemChange(index, 'item_id', searchResults[0].id)
-                              setSearchTerm({ ...searchTerm, [index]: '' })
+                            if (e.key === 'Enter') {
+                              // A scanner sends Enter after every code: pick the item, never submit the form
+                              e.preventDefault()
+                              if (searchResults.length > 0) {
+                                updateRow(item.key, { item_id: searchResults[0].id, search: '' })
+                              }
                             }
                           }}
                           className="flex-1 px-3 py-2 border-0 bg-transparent focus:outline-none text-gray-700 placeholder-gray-500"
                         />
                       </div>
-                      
+
                       {/* Search Results Dropdown */}
                       {showResults && (
                         <div className="absolute z-10 w-full bg-white border border-gray-200 rounded-lg shadow-lg max-h-60 overflow-y-auto mt-1">
@@ -239,19 +261,16 @@ export default function TransferForm() {
                             <button
                               key={i.id}
                               type="button"
-                              onClick={() => {
-                                handleItemChange(index, 'item_id', i.id)
-                                setSearchTerm({ ...searchTerm, [index]: '' })
-                              }}
+                              onClick={() => updateRow(item.key, { item_id: i.id, search: '' })}
                               className="w-full text-right px-4 py-3 hover:bg-blue-50 border-b border-gray-100 last:border-0 transition-colors"
                             >
                               <div className="font-medium text-gray-900">{i.name_ar}</div>
                               <div className="text-sm text-gray-500 flex items-center gap-2 mt-1">
                                 <span>الكود: {i.code}</span>
-                                {(i as Item & { barcode?: string }).barcode && (
+                                {i.barcode && (
                                   <>
                                     <span>•</span>
-                                    <span>الباركود: {(i as Item & { barcode?: string }).barcode}</span>
+                                    <span>الباركود: {i.barcode}</span>
                                   </>
                                 )}
                               </div>
@@ -259,7 +278,7 @@ export default function TransferForm() {
                           ))}
                         </div>
                       )}
-                      
+
                       {/* Selected Item Display */}
                       {selectedItem && (
                         <div className="mt-2 p-3 bg-green-50 border border-green-200 rounded-lg">
@@ -268,15 +287,15 @@ export default function TransferForm() {
                               <p className="font-medium text-green-900">{selectedItem.name_ar}</p>
                               <p className="text-sm text-green-700">
                                 الكود: {selectedItem.code}
-                                {(selectedItem as Item & { barcode?: string }).barcode && ` | الباركود: ${(selectedItem as Item & { barcode?: string }).barcode}`}
+                                {selectedItem.barcode && ` | الباركود: ${selectedItem.barcode}`}
                               </p>
+                              {isDuplicate && (
+                                <p className="text-xs text-orange-600 mt-1">هذا الصنف مكرر في أكثر من سطر وسيتم جمع الكميات</p>
+                              )}
                             </div>
                             <button
                               type="button"
-                              onClick={() => {
-                                handleItemChange(index, 'item_id', '')
-                                setSearchTerm({ ...searchTerm, [index]: '' })
-                              }}
+                              onClick={() => updateRow(item.key, { item_id: '', search: '' })}
                               className="text-red-500 hover:text-red-700"
                               title="إلغاء الاختيار"
                             >
@@ -285,9 +304,9 @@ export default function TransferForm() {
                           </div>
                         </div>
                       )}
-                      
+
                       {/* Helper Text */}
-                      {!selectedItem && !searchTerm[index] && (
+                      {!selectedItem && !item.search && (
                         <p className="text-sm text-blue-600 mt-2 flex items-center gap-2">
                           <Barcode className="w-4 h-4" />
                           استخدم قارئ الباركود أو أدخل الكود يدوياً ثم اضغط Enter
@@ -299,31 +318,34 @@ export default function TransferForm() {
                     <div className="flex items-center gap-3">
                       <div className="flex-1">
                         <label className="block text-xs font-medium text-gray-600 mb-1">الكمية المطلوبة</label>
-                        <input 
-                          type="number" 
+                        <input
+                          type="number"
                           min="0.001"
                           step="0.001"
                           value={item.requested_quantity}
-                          onChange={(e) => handleItemChange(index, 'requested_quantity', Number(e.target.value))}
+                          onChange={(e) => {
+                            const qty = parseDecimal(e.target.value)
+                            updateRow(item.key, { requested_quantity: qty !== null && qty > 0 ? roundQuantity(qty) : 0 })
+                          }}
                           aria-label="الكمية"
-                          className={`w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 text-sm ${isInsufficient ? 'border-red-400 bg-red-50' : 'border-gray-300'}`} 
-                          placeholder="مثال: 19.200" 
+                          className={`w-full px-3 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 text-sm ${isInsufficient ? 'border-red-400 bg-red-50' : 'border-gray-300'}`}
+                          placeholder="مثال: 19.200"
                         />
                       </div>
                       {item.item_id && fromBranch && (
                         <div className="flex-1">
                           <label className="block text-xs font-medium text-gray-600 mb-1">المتوفر في المخزن</label>
                           <div className={`px-3 py-2 rounded-lg text-sm font-medium ${isInsufficient ? 'bg-red-100 text-red-700' : 'bg-gray-100 text-gray-700'}`}>
-                            {availableQty} {isInsufficient && '⚠️ غير كافي'}
+                            {formatQuantity(availableQty)} {isInsufficient && '⚠️ غير كافي'}
                           </div>
                         </div>
                       )}
                       {transferItems.length > 1 && (
                         <div className="pt-5">
-                          <button 
-                            type="button" 
-                            onClick={() => handleRemoveItem(index)} 
-                            className="p-2 text-red-500 hover:bg-red-50 rounded-lg" 
+                          <button
+                            type="button"
+                            onClick={() => handleRemoveItem(item.key)}
+                            className="p-2 text-red-500 hover:bg-red-50 rounded-lg"
                             title="حذف"
                           >
                             <Trash2 className="w-4 h-4" />

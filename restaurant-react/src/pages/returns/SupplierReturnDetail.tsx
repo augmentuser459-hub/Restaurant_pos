@@ -1,21 +1,10 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { supabase, fixEncodingInData } from '../../lib/supabase'
 import { useAuth } from '../../contexts/AuthContext'
-import { formatDate, getStatusColor, translateStatus } from '../../lib/utils'
+import { returnsService, SupplierReturn } from '../../services/returns.service'
+import { formatCurrency, formatDate, formatQuantity, getStatusColor, translateStatus } from '../../lib/utils'
+import { toUserMessage } from '../../lib/errors'
 import { ArrowRight, Package, Truck, Check, X, Printer } from 'lucide-react'
-
-interface SupplierReturn {
-  id: string
-  return_number: string
-  registered_at: string
-  quantity: number
-  reason: string
-  description: string
-  status: string
-  item: { id: string; code: string; name_ar: string }
-  supplier: { id: string; name_ar: string; code: string }
-}
 
 export default function SupplierReturnDetail() {
   const { id } = useParams()
@@ -23,24 +12,18 @@ export default function SupplierReturnDetail() {
   const { user } = useAuth()
   const [returnData, setReturnData] = useState<SupplierReturn | null>(null)
   const [loading, setLoading] = useState(true)
+  const [loadError, setLoadError] = useState('')
   const [actionLoading, setActionLoading] = useState(false)
+  const busy = useRef(false) // blocks a second click before the button re-renders as disabled
 
   useEffect(() => {
     if (id) fetchReturn(id)
   }, [id])
 
   const fetchReturn = async (returnId: string) => {
-    const { data } = await supabase
-      .from('supplier_returns')
-      .select(`
-        id, return_number, registered_at, quantity, reason, description, status,
-        item:items(id, code, name_ar),
-        supplier:suppliers(id, name_ar, code)
-      `)
-      .eq('id', returnId)
-      .single()
-    
-    setReturnData(fixEncodingInData(data) as unknown as SupplierReturn)
+    const { data, error } = await returnsService.getSupplierReturnById(returnId)
+    setLoadError(error && error.code !== 'PGRST116' ? toUserMessage(error) : '')
+    setReturnData(data)
     setLoading(false)
   }
 
@@ -54,85 +37,48 @@ export default function SupplierReturnDetail() {
       }
     `;
     document.head.appendChild(style);
-    
+
     window.print();
-    
+
     // Remove the style after printing
     setTimeout(() => {
       document.head.removeChild(style);
     }, 1000);
   };
 
-  const handleApprove = async () => {
-    if (!returnData || !user) return
+  // Each action is one database function that re-checks the status under a row lock; the page always reloads afterwards
+  const runAction = async (action: () => Promise<{ error: unknown }>, failMessage: string) => {
+    if (!returnData || busy.current) return
+    busy.current = true
     setActionLoading(true)
-    
-    // Update status to approved
-    // Note: Inventory deduction is handled by database trigger (trg_update_inventory_on_return)
-    const { error } = await supabase
-      .from('supplier_returns')
-      .update({ 
-        status: 'approved',
-        approved_by: user.id,
-        approved_at: new Date().toISOString(),
-        updated_at: new Date().toISOString()
-      })
-      .eq('id', returnData.id)
-    
-    if (error) {
-      console.error('Approve error:', error)
-      alert('حدث خطأ: ' + error.message)
-    } else {
-      fetchReturn(returnData.id)
+    try {
+      const { error } = await action()
+      if (error) alert(`${failMessage}: ${toUserMessage(error)}`)
+    } catch (err) {
+      alert(`${failMessage}: ${toUserMessage(err)}`)
     }
+    await fetchReturn(returnData.id)
     setActionLoading(false)
+    busy.current = false
   }
 
-  const handleReject = async () => {
+  // Approval deducts the stock and lowers the supplier balance by the return value, together
+  const handleApprove = () => {
+    if (!returnData || !user) return
+    runAction(() => returnsService.approveSupplierReturn(returnData.id), 'تعذرت الموافقة على المرتجع')
+  }
+
+  const handleReject = () => {
     if (!returnData || !user) return
     const reason = prompt('سبب الرفض:')
     if (reason === null) return
-    setActionLoading(true)
-    
-    await supabase
-      .from('supplier_returns')
-      .update({ 
-        status: 'rejected',
-        rejected_by: user.id,
-        rejected_at: new Date().toISOString(),
-        description: returnData.description ? `${returnData.description}\nسبب الرفض: ${reason}` : `سبب الرفض: ${reason}`,
-        updated_at: new Date().toISOString()
-      })
-      .eq('id', returnData.id)
-    
-    fetchReturn(returnData.id)
-    setActionLoading(false)
+    runAction(() => returnsService.rejectSupplierReturn(returnData.id, reason), 'تعذر رفض المرتجع')
   }
 
-  const handleComplete = async () => {
+  // Marks the approved return as handed over to the supplier (stock and balance already changed on approval)
+  const handleComplete = () => {
     if (!returnData || !user) return
-    setActionLoading(true)
-    
-    // Note: Inventory deduction was already handled by database trigger (trg_update_inventory_on_return)
-    // when status changed to 'approved'. This function marks it as 'received' (shipped to supplier).
-    
-    // Update status to received (enum values: pending, approved, rejected, received)
-    const { error } = await supabase
-      .from('supplier_returns')
-      .update({ 
-        status: 'received',
-        received_by_supplier_at: new Date().toISOString(),
-        updated_at: new Date().toISOString()
-      })
-      .eq('id', returnData.id)
-    
-    if (error) {
-      console.error('Complete error:', error)
-      alert('حدث خطأ: ' + error.message)
-    } else {
-      fetchReturn(returnData.id)
-    }
-    setActionLoading(false)
+    runAction(() => returnsService.completeSupplierReturn(returnData.id), 'تعذر تأكيد الإرجاع للمورد')
   }
 
   if (loading) {
@@ -140,12 +86,12 @@ export default function SupplierReturnDetail() {
   }
 
   if (!returnData) {
-    return <div className="text-center py-12"><p className="text-gray-600">المرتجع غير موجود</p></div>
+    return <div className="text-center py-12"><p className="text-gray-600">{loadError || 'المرتجع غير موجود'}</p></div>
   }
 
   // Get user role
-  const userRole = typeof user?.role === 'object' && user?.role !== null 
-    ? (user.role as { name: string }).name 
+  const userRole = typeof user?.role === 'object' && user?.role !== null
+    ? (user.role as { name: string }).name
     : user?.role
 
   const canApprove = returnData.status === 'pending' && (userRole === 'admin' || userRole === 'warehouse_manager')
@@ -203,9 +149,13 @@ export default function SupplierReturnDetail() {
         <h3 className="font-semibold text-gray-900 mb-4">تفاصيل المرتجع</h3>
         <div className="grid grid-cols-2 gap-4 text-sm print:gap-2">
           <div><span className="text-gray-500">التاريخ:</span> <span className="font-medium">{formatDate(returnData.registered_at)}</span></div>
-          <div><span className="text-gray-500">الكمية:</span> <span className="font-medium">{returnData.quantity}</span></div>
+          <div><span className="text-gray-500">الكمية:</span> <span className="font-medium">{formatQuantity(returnData.quantity)} {returnData.item?.unit?.name_ar || ''}</span></div>
+          <div><span className="text-gray-500">سعر الوحدة:</span> <span className="font-medium">{formatCurrency(Number(returnData.unit_price) || 0)}</span></div>
+          <div><span className="text-gray-500">قيمة المرتجع:</span> <span className="font-medium text-red-600">{formatCurrency(Number(returnData.total_amount) || 0)}</span></div>
+          <div><span className="text-gray-500">من:</span> <span className="font-medium">{returnData.branch?.name_ar || 'المخزن الرئيسي'}</span></div>
           <div><span className="text-gray-500">السبب:</span> <span className="font-medium">{returnData.reason || '-'}</span></div>
           {returnData.description && <div className="col-span-2"><span className="text-gray-500">ملاحظات:</span> <span className="font-medium">{returnData.description}</span></div>}
+          {returnData.rejection_reason && <div className="col-span-2"><span className="text-gray-500">سبب الرفض:</span> <span className="font-medium text-red-600">{returnData.rejection_reason}</span></div>}
         </div>
       </div>
 

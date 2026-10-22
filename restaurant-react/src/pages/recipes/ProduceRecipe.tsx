@@ -1,15 +1,15 @@
-import { useState, useEffect, FormEvent } from 'react'
+import { useState, useEffect, useRef, FormEvent } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
-import { recipeService, RecipeWithIngredients } from '../../services/recipe.service'
+import { recipeService, RecipeWithIngredients, AvailabilityDetail, ingredientStockQuantity, newRequestId } from '../../services/recipe.service'
 import { branchesService } from '../../services/branches.service'
-import { useAuth } from '../../contexts/AuthContext'
 import { Branch, Item } from '../../types/database.types'
+import { toUserMessage } from '../../lib/errors'
+import { formatQuantity, parseDecimal, roundQuantity } from '../../lib/utils'
 import { Factory, ArrowRight, AlertCircle, CheckCircle, Package } from 'lucide-react'
 
 export default function ProduceRecipe() {
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
-  const { user } = useAuth()
 
   const [loading, setLoading] = useState(false)
   const [fetchLoading, setFetchLoading] = useState(true)
@@ -26,17 +26,30 @@ export default function ProduceRecipe() {
     quantity: 1,
     notes: ''
   })
+  // One id per intended production: a retry after a lost response is recognised by the database and not produced
+  // twice. A new id is taken after a success and whenever the recipe, branch or quantity changes.
+  const [requestId, setRequestId] = useState(() => newRequestId())
 
   const [availability, setAvailability] = useState<{
     available: boolean
-    details: { name: string; required: number; available: number; sufficient: boolean }[]
+    details: AvailabilityDetail[]
   } | null>(null)
+  // Bumped after a production so availability is re-read from the database with the current form values
+  const [stockVersion, setStockVersion] = useState(0)
+  // Only the latest request may set the recipe / availability (an older, slower response is ignored)
+  const recipeRequest = useRef('')
+  const availabilitySeq = useRef(0)
 
   useEffect(() => {
     fetchData()
   }, [])
 
   useEffect(() => {
+    setRequestId(newRequestId())
+  }, [formData.recipe_item_id, formData.branch_id, formData.quantity])
+
+  useEffect(() => {
+    recipeRequest.current = formData.recipe_item_id
     if (formData.recipe_item_id) {
       loadRecipeDetails(formData.recipe_item_id)
     } else {
@@ -46,43 +59,50 @@ export default function ProduceRecipe() {
   }, [formData.recipe_item_id])
 
   useEffect(() => {
-    if (formData.recipe_item_id && formData.branch_id && formData.quantity > 0) {
-      checkAvailability()
+    if (selectedRecipe && selectedRecipe.id === formData.recipe_item_id && formData.branch_id && formData.quantity > 0) {
+      checkAvailability(selectedRecipe, formData.branch_id, formData.quantity)
     } else {
+      availabilitySeq.current++ // drop any check still running
       setAvailability(null)
     }
-  }, [formData.recipe_item_id, formData.branch_id, formData.quantity])
+  }, [selectedRecipe, formData.recipe_item_id, formData.branch_id, formData.quantity, stockVersion])
 
   const fetchData = async () => {
     const [recipesRes, branchesRes] = await Promise.all([
       recipeService.getAllRecipes(),
       branchesService.getActive()
     ])
+    if (recipesRes.error || branchesRes.error) {
+      setError('تعذر تحميل البيانات: ' + toUserMessage(recipesRes.error || branchesRes.error))
+    }
     setRecipes(recipesRes.data || [])
     setBranches(branchesRes.data || [])
     setFetchLoading(false)
   }
 
   const loadRecipeDetails = async (recipeId: string) => {
-    const { data } = await recipeService.getRecipeWithIngredients(recipeId)
+    const { data, error } = await recipeService.getRecipeWithIngredients(recipeId)
+    if (recipeRequest.current !== recipeId) return // another recipe was chosen meanwhile
+    if (error) setError('تعذر تحميل مكونات الريسبي: ' + toUserMessage(error))
     setSelectedRecipe(data)
   }
 
-  const checkAvailability = async () => {
-    const result = await recipeService.checkIngredientAvailability(
-      formData.recipe_item_id,
-      formData.branch_id,
-      formData.quantity
-    )
-    setAvailability(result)
+  // Takes the branch and quantity explicitly (not the render's formData), so a result always matches its inputs
+  const checkAvailability = async (recipe: RecipeWithIngredients, branchId: string, quantity: number) => {
+    const seq = ++availabilitySeq.current
+    const result = await recipeService.checkIngredientAvailability(recipe.ingredients, branchId, quantity)
+    if (seq !== availabilitySeq.current) return // a newer check (other recipe, branch or quantity) is running
+    if (result.error) setError('تعذر التحقق من المخزون: ' + toUserMessage(result.error))
+    setAvailability({ available: result.available, details: result.details })
   }
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault()
+    if (loading) return
     setError('')
     setSuccess('')
 
-    if (!formData.recipe_item_id || !formData.branch_id || formData.quantity <= 0) {
+    if (!formData.recipe_item_id || !formData.branch_id || !(formData.quantity > 0)) {
       setError('يرجى ملء جميع الحقول المطلوبة')
       return
     }
@@ -97,18 +117,20 @@ export default function ProduceRecipe() {
     const { error: produceError } = await recipeService.produceRecipe({
       recipe_item_id: formData.recipe_item_id,
       branch_id: formData.branch_id,
-      quantity: formData.quantity,
+      quantity: roundQuantity(formData.quantity),
       notes: formData.notes,
-      produced_by: user?.id || ''
+      request_id: requestId,
     })
 
     if (produceError) {
-      setError(produceError.message || 'فشل في إضافة الريسبي للمخزون')
+      setError('فشل في إضافة الريسبي للمخزون: ' + toUserMessage(produceError))
+      setStockVersion(v => v + 1) // stock may have changed since the last check (e.g. a shortage): show it again
     } else {
-      setSuccess(`تم إضافة ${formData.quantity} ${selectedRecipe?.name_ar} للمخزون بنجاح`)
-      // Reset form
-      setFormData({ ...formData, quantity: 1, notes: '' })
-      checkAvailability()
+      setSuccess(`تم إضافة ${formatQuantity(formData.quantity)} ${selectedRecipe?.name_ar || ''} للمخزون بنجاح`)
+      // Reset form with a new request id; the availability effect then re-reads stock for the reset quantity
+      setFormData(prev => ({ ...prev, quantity: 1, notes: '' }))
+      setRequestId(newRequestId())
+      setStockVersion(v => v + 1)
     }
 
     setLoading(false)
@@ -140,7 +162,7 @@ export default function ProduceRecipe() {
       {error && (
         <div className="mb-6 p-4 bg-red-50 border border-red-200 rounded-lg flex items-center gap-3">
           <AlertCircle className="w-5 h-5 text-red-500 shrink-0" />
-          <p className="text-red-700">{error}</p>
+          <p className="text-red-700 whitespace-pre-line">{error}</p>
         </div>
       )}
 
@@ -189,7 +211,10 @@ export default function ProduceRecipe() {
                 min="0.001"
                 step="0.001"
                 value={formData.quantity}
-                onChange={(e) => setFormData({ ...formData, quantity: Number(e.target.value) })}
+                onChange={(e) => {
+                  const qty = parseDecimal(e.target.value)
+                  setFormData({ ...formData, quantity: qty !== null && qty > 0 ? roundQuantity(qty) : 0 })
+                }}
                 required
                 aria-label="الكمية"
                 placeholder="مثال: 19.200"
@@ -230,15 +255,18 @@ export default function ProduceRecipe() {
                 </thead>
                 <tbody>
                   {selectedRecipe.ingredients.map((ing, index) => {
-                    const detail = availability?.details.find(d => d.name === (ing.ingredient as Item)?.name_ar)
-                    const required = ing.quantity * formData.quantity
+                    const ingredientName = ing.ingredient?.name_ar || ''
+                    const detail = availability?.details.find(d => d.item_id === ing.ingredient_item_id)
+                    // Required amount in the ingredient's stock unit (e.g. 200 g per unit of a kg item = 0.2 kg)
+                    const stockUnit = ing.ingredient?.unit?.name_ar || ''
+                    const required = roundQuantity(ingredientStockQuantity(ing) * formData.quantity)
                     return (
-                      <tr key={index} className="border-b border-gray-100">
-                        <td className="py-3 px-2 font-medium">{(ing.ingredient as Item)?.name_ar}</td>
-                        <td className="py-3 px-2 text-gray-600">{ing.quantity}</td>
-                        <td className="py-3 px-2 font-medium text-blue-600">{required}</td>
+                      <tr key={ing.id || index} className="border-b border-gray-100">
+                        <td className="py-3 px-2 font-medium">{ingredientName}</td>
+                        <td className="py-3 px-2 text-gray-600">{formatQuantity(ing.quantity)} {ing.unit?.name_ar || stockUnit}</td>
+                        <td className="py-3 px-2 font-medium text-blue-600">{formatQuantity(required)} {stockUnit}</td>
                         <td className="py-3 px-2">
-                          {detail ? detail.available : '-'}
+                          {detail ? `${formatQuantity(detail.available)} ${stockUnit}` : '-'}
                         </td>
                         <td className="py-3 px-2">
                           {detail ? (
@@ -282,6 +310,12 @@ export default function ProduceRecipe() {
                 </div>
               </div>
             )}
+          </div>
+        )}
+
+        {selectedRecipe && selectedRecipe.ingredients?.length === 0 && (
+          <div className="p-4 bg-yellow-50 border border-yellow-200 rounded-lg text-yellow-800 text-sm">
+            لا توجد مكونات لهذا الريسبي
           </div>
         )}
 

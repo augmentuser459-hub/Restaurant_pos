@@ -1,23 +1,23 @@
 import { useState, useEffect, FormEvent } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { recipeService, CreateRecipeData } from '../../services/recipe.service'
-import { inventoryService } from '../../services/inventory.service'
-import { Item } from '../../types/database.types'
-import { supabase, fixEncodingInData } from '../../lib/supabase'
+import { recipeService, RecipeUnit, unitFactor } from '../../services/recipe.service'
+import { fetchPickerItems, PickerItem } from '../../services/transfers.service'
+import { toUserMessage } from '../../lib/errors'
+import { parseDecimal, roundQuantity } from '../../lib/utils'
 import { Save, ArrowRight, AlertCircle, Plus, Trash2, ChefHat } from 'lucide-react'
 import BarcodeItemSelector from '../../components/ui/BarcodeItemSelector'
-
-interface Unit {
-  id: string
-  code: string
-  name_ar: string
-}
 
 interface IngredientRow {
   ingredient_item_id: string
   quantity: number
   unit_id: string
   notes: string
+}
+
+interface Category {
+  id: string
+  code: string
+  name_ar: string
 }
 
 export default function RecipeForm() {
@@ -28,9 +28,9 @@ export default function RecipeForm() {
   const [loading, setLoading] = useState(false)
   const [fetchLoading, setFetchLoading] = useState(true)
   const [error, setError] = useState('')
-  const [items, setItems] = useState<Item[]>([])
-  const [units, setUnits] = useState<Unit[]>([])
-  const [recipeCategoryId, setRecipeCategoryId] = useState<string>('')
+  const [allItems, setAllItems] = useState<PickerItem[]>([])
+  const [units, setUnits] = useState<RecipeUnit[]>([])
+  const [categories, setCategories] = useState<Category[]>([])
 
   const [formData, setFormData] = useState({
     code: '',
@@ -38,6 +38,7 @@ export default function RecipeForm() {
     name_ar: '',
     description: '',
     unit_id: '',
+    category_id: '',
     min_stock_level: 0,
   })
 
@@ -50,26 +51,24 @@ export default function RecipeForm() {
   }, [id])
 
   const fetchData = async () => {
-    // Get items (non-recipe items only for ingredients)
-    const { data: itemsData } = await inventoryService.getAllItems()
-    const nonRecipeItems = (itemsData || []).filter(i => !i.is_recipe && i.status === 'active')
-    setItems(nonRecipeItems)
-
-    // Get units
-    const { data: unitsData } = await supabase
-      .from('units')
-      .select('id, code, name_ar')
-      .eq('is_active', true)
-      .order('name_ar')
-    setUnits(fixEncodingInData(unitsData) as Unit[] || [])
-
-    // Get recipe category ID
-    const categoryId = await recipeService.getRecipeCategoryId()
-    setRecipeCategoryId(categoryId || '')
+    const [itemsRes, unitsRes, categoriesRes, recipeCategoryId] = await Promise.all([
+      fetchPickerItems(),
+      recipeService.getUnits(),
+      recipeService.getCategories(),
+      recipeService.getRecipeCategoryId(),
+    ])
+    const loadError = itemsRes.error || unitsRes.error || categoriesRes.error
+    if (loadError) setError('تعذر تحميل البيانات: ' + toUserMessage(loadError))
+    setAllItems(itemsRes.data)
+    setUnits(unitsRes.data)
+    setCategories(categoriesRes.data)
+    // New recipes default to the recipe category when it exists
+    setFormData(prev => ({ ...prev, category_id: prev.category_id || recipeCategoryId || '' }))
 
     // If editing, load recipe data
     if (id) {
-      const { data: recipe } = await recipeService.getRecipeWithIngredients(id)
+      const { data: recipe, error: recipeError } = await recipeService.getRecipeWithIngredients(id)
+      if (recipeError) setError('تعذر تحميل الريسبي: ' + toUserMessage(recipeError))
       if (recipe) {
         setFormData({
           code: recipe.code,
@@ -77,12 +76,13 @@ export default function RecipeForm() {
           name_ar: recipe.name_ar,
           description: recipe.description || '',
           unit_id: recipe.unit_id || '',
-          min_stock_level: recipe.min_stock_level || 0,
+          category_id: recipe.category_id || recipeCategoryId || '',
+          min_stock_level: Number(recipe.min_stock_level) || 0,
         })
         if (recipe.ingredients?.length > 0) {
           setIngredients(recipe.ingredients.map(ing => ({
             ingredient_item_id: ing.ingredient_item_id,
-            quantity: ing.quantity,
+            quantity: Number(ing.quantity),
             unit_id: ing.unit_id || '',
             notes: ing.notes || ''
           })))
@@ -91,6 +91,21 @@ export default function RecipeForm() {
     }
 
     setFetchLoading(false)
+  }
+
+  // Ingredients are active, non-recipe items other than this recipe; lines already saved stay selectable
+  const savedIngredientIds = new Set(ingredients.map(i => i.ingredient_item_id))
+  const items = allItems.filter(i =>
+    i.id !== id && ((!i.is_recipe && i.status === 'active') || savedIngredientIds.has(i.id)))
+
+  const unitById = (unitId: string | null | undefined) => units.find(u => u.id === unitId)
+
+  // Units an ingredient line can use: its stock unit and the units convertible to it (g <-> kg, ml <-> L ...)
+  const unitOptionsFor = (itemId: string) => {
+    const item = allItems.find(i => i.id === itemId)
+    const stockUnit = unitById(item?.unit_id)
+    if (!stockUnit) return units
+    return units.filter(u => unitFactor(u, stockUnit) !== null)
   }
 
   const handleAddIngredient = () => {
@@ -106,36 +121,44 @@ export default function RecipeForm() {
   const handleIngredientChange = (index: number, field: keyof IngredientRow, value: string | number) => {
     const updated = [...ingredients]
     updated[index] = { ...updated[index], [field]: value }
-    
-    // Auto-fill unit when item is selected
+
+    // A new ingredient starts in its own stock unit
     if (field === 'ingredient_item_id' && typeof value === 'string') {
-      const item = items.find(i => i.id === value)
-      if (item?.unit_id) {
-        updated[index].unit_id = item.unit_id
-      }
+      const item = allItems.find(i => i.id === value)
+      updated[index].unit_id = item?.unit_id || ''
     }
-    
+
     setIngredients(updated)
   }
 
   // Handle item selection from BarcodeItemSelector
-  const handleItemSelect = (item: Item) => {
-    const existingIndex = ingredients.findIndex(ing => ing.ingredient_item_id === item.id)
-    
+  const handleItemSelect = (selected: { id: string; unit?: { id: string } | null }) => {
+    const item = allItems.find(i => i.id === selected.id)
+    if (selected.id === id) {
+      setError('لا يمكن أن يكون الريسبي مكوناً لنفسه')
+      return
+    }
+    if (item?.is_recipe) {
+      setError(`الصنف "${item.name_ar}" ريسبي ولا يمكن استخدامه كمكون`)
+      return
+    }
+    setError('')
+    const existingIndex = ingredients.findIndex(ing => ing.ingredient_item_id === selected.id)
+
     if (existingIndex >= 0) {
       // Item exists, increase quantity
       const updated = [...ingredients]
-      updated[existingIndex].quantity += 1
+      updated[existingIndex] = { ...updated[existingIndex], quantity: roundQuantity(updated[existingIndex].quantity + 1) }
       setIngredients(updated)
     } else {
-      // Add new item
+      // Add new item in its stock unit
       const newIng: IngredientRow = {
-        ingredient_item_id: item.id,
+        ingredient_item_id: selected.id,
         quantity: 1,
-        unit_id: item.unit_id || '',
+        unit_id: item?.unit_id || selected.unit?.id || '',
         notes: ''
       }
-      
+
       // Find first empty row or add new row
       const emptyIndex = ingredients.findIndex(ing => !ing.ingredient_item_id)
       if (emptyIndex >= 0) {
@@ -150,16 +173,29 @@ export default function RecipeForm() {
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault()
+    if (loading) return
     setError('')
 
-    if (!recipeCategoryId) {
-      setError('لم يتم العثور على تصنيف الريسبي. يرجى تشغيل ملف recipe_system.sql أولاً')
+    if (!formData.category_id) {
+      setError('يرجى اختيار مجموعة الريسبي')
       return
     }
 
-    const validIngredients = ingredients.filter(ing => ing.ingredient_item_id && ing.quantity > 0)
-    if (validIngredients.length === 0) {
+    const chosen = ingredients.filter(ing => ing.ingredient_item_id)
+    if (chosen.length === 0) {
       setError('يجب إضافة مكون واحد على الأقل')
+      return
+    }
+    const itemName = (itemId: string) => allItems.find(i => i.id === itemId)?.name_ar || ''
+    const badQty = chosen.find(ing => !(ing.quantity > 0))
+    if (badQty) {
+      setError(`يرجى إدخال كمية أكبر من صفر للمكون ${itemName(badQty.ingredient_item_id)}`)
+      return
+    }
+    const seen = new Set<string>()
+    const duplicate = chosen.find(ing => (seen.has(ing.ingredient_item_id) ? true : (seen.add(ing.ingredient_item_id), false)))
+    if (duplicate) {
+      setError(`المكون ${itemName(duplicate.ingredient_item_id)} مكرر، اجمع كميته في سطر واحد`)
       return
     }
 
@@ -168,69 +204,38 @@ export default function RecipeForm() {
       setError('يرجى اختيار وحدة القياس للريسبي')
       return
     }
+    if (!(formData.min_stock_level >= 0)) {
+      setError('الحد الأدنى للمخزون لا يمكن أن يكون سالباً')
+      return
+    }
 
     setLoading(true)
 
-    if (isEdit && id) {
-      // Update item
-      const { error: updateError } = await supabase
-        .from('items')
-        .update({
-          code: formData.code,
-          name: formData.name,
-          name_ar: formData.name_ar,
-          description: formData.description,
-          unit_id: formData.unit_id,
-          min_stock_level: formData.min_stock_level,
-          updated_at: new Date().toISOString()
-        })
-        .eq('id', id)
-
-      if (updateError) {
-        setError('فشل في تحديث الريسبي: ' + updateError.message)
-        setLoading(false)
-        return
-      }
-
-      // Update ingredients - filter out empty unit_ids
-      const ingredientsToUpdate = validIngredients.map(ing => ({
+    // The recipe item and all its ingredients are saved in one database transaction
+    // (an edit replaces the ingredient list completely or not at all)
+    const { error: saveError } = await recipeService.saveRecipe(isEdit && id ? id : null, {
+      code: formData.code.trim(),
+      name: formData.name.trim(),
+      name_ar: formData.name_ar.trim(),
+      description: formData.description,
+      unit_id: formData.unit_id,
+      category_id: formData.category_id,
+      min_stock_level: formData.min_stock_level,
+      ingredients: chosen.map(ing => ({
         ingredient_item_id: ing.ingredient_item_id,
-        quantity: ing.quantity,
+        quantity: roundQuantity(ing.quantity),
         unit_id: ing.unit_id || null,
         notes: ing.notes
-      }))
+      })),
+    })
 
-      const { error: ingError } = await recipeService.updateRecipeIngredients(id, ingredientsToUpdate)
-      if (ingError) {
-        setError('فشل في تحديث المكونات: ' + ingError.message)
-        setLoading(false)
-        return
-      }
-    } else {
-      // Create new recipe - filter out empty unit_ids
-      const ingredientsToCreate = validIngredients.map(ing => ({
-        ingredient_item_id: ing.ingredient_item_id,
-        quantity: ing.quantity,
-        unit_id: ing.unit_id || null,
-        notes: ing.notes
-      }))
-
-      const recipeData: CreateRecipeData = {
-        ...formData,
-        category_id: recipeCategoryId,
-        ingredients: ingredientsToCreate
-      }
-
-      const { error: createError } = await recipeService.createRecipe(recipeData)
-      if (createError) {
-        setError('فشل في إنشاء الريسبي: ' + createError.message)
-        setLoading(false)
-        return
-      }
+    if (saveError) {
+      setError((isEdit ? 'فشل في تحديث الريسبي: ' : 'فشل في إنشاء الريسبي: ') + toUserMessage(saveError))
+      setLoading(false)
+      return
     }
 
     navigate('/recipes')
-    setLoading(false)
   }
 
   if (fetchLoading) {
@@ -316,6 +321,35 @@ export default function RecipeForm() {
                 placeholder="ساندوتش زنجر"
               />
             </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-2">المجموعة <span className="text-red-500">*</span></label>
+              <select
+                value={formData.category_id}
+                onChange={(e) => setFormData({ ...formData, category_id: e.target.value })}
+                required
+                aria-label="المجموعة"
+                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-500"
+              >
+                <option value="">اختر المجموعة</option>
+                {categories.map(c => <option key={c.id} value={c.id}>{c.name_ar}</option>)}
+              </select>
+            </div>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-2">الحد الأدنى للمخزون</label>
+              <input
+                type="number"
+                min="0"
+                step="0.001"
+                value={formData.min_stock_level}
+                onChange={(e) => {
+                  const value = parseDecimal(e.target.value)
+                  setFormData({ ...formData, min_stock_level: value !== null && value >= 0 ? roundQuantity(value) : 0 })
+                }}
+                aria-label="الحد الأدنى للمخزون"
+                className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-500"
+                dir="ltr"
+              />
+            </div>
             <div className="md:col-span-2">
               <label className="block text-sm font-medium text-gray-700 mb-2">الوصف</label>
               <textarea
@@ -348,6 +382,7 @@ export default function RecipeForm() {
           <div className="mb-4">
             <BarcodeItemSelector
               onItemSelect={handleItemSelect}
+              excludeRecipes
               className="w-full"
             />
           </div>
@@ -384,7 +419,10 @@ export default function RecipeForm() {
                         min="0.001"
                         step="0.001"
                         value={ing.quantity}
-                        onChange={(e) => handleIngredientChange(index, 'quantity', Number(e.target.value))}
+                        onChange={(e) => {
+                          const qty = parseDecimal(e.target.value)
+                          handleIngredientChange(index, 'quantity', qty !== null && qty > 0 ? roundQuantity(qty) : 0)
+                        }}
                         className="w-24 px-3 py-2 border border-gray-300 rounded-lg text-sm"
                         dir="ltr"
                         aria-label="الكمية"
@@ -398,7 +436,7 @@ export default function RecipeForm() {
                         aria-label="الوحدة"
                       >
                         <option value="">الوحدة</option>
-                        {units.map(u => <option key={u.id} value={u.id}>{u.name_ar}</option>)}
+                        {(ing.ingredient_item_id ? unitOptionsFor(ing.ingredient_item_id) : units).map(u => <option key={u.id} value={u.id}>{u.name_ar}</option>)}
                       </select>
                     </td>
                     <td className="py-3 px-2">

@@ -2,14 +2,17 @@ import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { damagesService, DamageWithDetails } from '../../services/damages.service'
 import { useAuth } from '../../contexts/AuthContext'
-import { formatCurrency } from '../../lib/utils'
-import { Plus, AlertTriangle, Eye, Package, Building2, Download } from 'lucide-react'
-import { exportToExcel, damageColumns, statusTranslations, formatDateForExcel } from '../../lib/excel'
+import { formatCurrency, formatQuantity } from '../../lib/utils'
+import { toLocalDate } from '../../lib/dates'
+import { toUserMessage } from '../../lib/errors'
+import { Plus, AlertTriangle, Eye, Package, Building2, Download, AlertCircle } from 'lucide-react'
+import { exportToExcel, damageColumns, statusTranslations } from '../../lib/excel'
 
 export default function DamageList() {
   const { user } = useAuth()
   const [damages, setDamages] = useState<DamageWithDetails[]>([])
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
   const [filter, setFilter] = useState<'all' | 'pending' | 'approved' | 'rejected'>('all')
 
   useEffect(() => {
@@ -18,30 +21,25 @@ export default function DamageList() {
 
   const fetchDamages = async () => {
     // Get role name - handle both string and object formats
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const userObj = user as any
-    const roleName = typeof userObj?.role === 'object' && userObj?.role !== null 
-      ? userObj.role.name 
+    const userObj = user as unknown as { role?: string | { name?: string }; branch_id?: string; branch?: { id?: string } } | null
+    const roleName = typeof userObj?.role === 'object' && userObj?.role !== null
+      ? userObj.role.name
       : userObj?.role
-    
+
     // Get branch_id - handle both direct and nested formats
     const userBranchId = userObj?.branch_id || userObj?.branch?.id
-    
-    console.log('DamageList Debug:', { roleName, userBranchId, user: userObj })
-    
-    const branchId = roleName !== 'admin' && roleName !== 'warehouse_manager' 
-      ? userBranchId 
+
+    const branchId = roleName !== 'admin' && roleName !== 'warehouse_manager'
+      ? userBranchId
       : undefined
-    
-    console.log('Fetching damages with branchId:', branchId)
-    
+
     const { data, error } = await damagesService.getAll(branchId)
-    console.log('Damages result:', { data, error })
+    setError(error ? 'تعذر تحميل سجلات التالف: ' + toUserMessage(error) : '')
     setDamages(data || [])
     setLoading(false)
   }
 
-  const filteredDamages = damages.filter(d => 
+  const filteredDamages = damages.filter(d =>
     filter === 'all' || d.status === filter
   )
 
@@ -49,13 +47,13 @@ export default function DamageList() {
   const handleExport = () => {
     const exportData = filteredDamages.map(d => ({
       damage_number: d.damage_number || '',
-      date: d.registered_at ? formatDateForExcel(d.registered_at) : '',
+      date: d.registered_at ? toLocalDate(d.registered_at) : '',
       branch_name: d.branch?.name_ar || '',
       item_code: d.item?.code || '',
       item_name: d.item?.name_ar || '',
-      quantity: d.quantity || 0,
+      quantity: Number(d.quantity) || 0,
       reason: d.reason?.name_ar || '',
-      total_cost: d.total_cost || 0,
+      total_cost: Number(d.total_cost) || 0,
       status: statusTranslations[d.status] || d.status,
     }))
     exportToExcel(exportData, damageColumns, 'سجل_التالف')
@@ -115,6 +113,13 @@ export default function DamageList() {
         </div>
       </div>
 
+      {error && (
+        <div className="p-4 bg-red-50 border border-red-200 rounded-lg flex items-center gap-3">
+          <AlertCircle className="w-5 h-5 text-red-500 shrink-0" />
+          <p className="text-red-700">{error}</p>
+        </div>
+      )}
+
       {/* Filters */}
       <div className="flex gap-2">
         {(['all', 'pending', 'approved', 'rejected'] as const).map((status) => (
@@ -128,7 +133,7 @@ export default function DamageList() {
                 : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
             }`}
           >
-            {status === 'all' ? 'الكل' : 
+            {status === 'all' ? 'الكل' :
              status === 'pending' ? 'معلق' :
              status === 'approved' ? 'موافق عليه' : 'مرفوض'}
           </button>
@@ -174,7 +179,7 @@ export default function DamageList() {
                       <span>{damage.branch?.name_ar}</span>
                     </div>
                   </td>
-                  <td className="px-6 py-4 text-gray-600">{damage.quantity}</td>
+                  <td className="px-6 py-4 text-gray-600">{formatQuantity(damage.quantity)} {damage.item?.unit?.name_ar || ''}</td>
                   <td className="px-6 py-4 text-gray-600">
                     {damage.total_cost ? formatCurrency(damage.total_cost) : '-'}
                   </td>
