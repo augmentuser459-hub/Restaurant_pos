@@ -32,6 +32,7 @@ export default function POSCashier() {
   const cart = useCart()
   const [menuItems, setMenuItems] = useState<PosSellableItem[]>([])
   const [categories, setCategories] = useState<CashierCategory[]>([])
+  const [categoriesRestricted, setCategoriesRestricted] = useState(true)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null)
   const [searchTerm, setSearchTerm] = useState('')
@@ -104,6 +105,7 @@ export default function POSCashier() {
     }
     setMenuItems(itemsRes.data)
     setCategories(categoriesRes.data.categories)
+    setCategoriesRestricted(categoriesRes.data.restricted)
     setLoadError(null)
     setLoading(false)
     return itemsRes.data
@@ -217,7 +219,9 @@ export default function POSCashier() {
   // until the search text changes, and the cashier picks one. Nothing is picked silently.
   const activeScanChoices = scanChoices && scanChoices.term === searchTerm ? scanChoices.ids : null
 
-  // The list only holds items this cashier may sell, so search and browsing respect category limits.
+  // The list holds every item the branch sells. Searching or scanning finds any of them (branches sell their
+  // retail stock by barcode); the cashier's category permissions only limit what browsing shows.
+  const allowedCategoryIds = new Set(categories.map(c => c.id))
   const filteredItems = activeScanChoices
     ? menuItems.filter(item => activeScanChoices.includes(item.item_id))
     : menuItems.filter(item => {
@@ -228,6 +232,9 @@ export default function POSCashier() {
         // Filter by search term (including barcode)
         const term = searchTerm.trim().toLowerCase()
         if (term) return matchesSearch(item, term)
+
+        // Browsing: only the cashier's own categories
+        if (categoriesRestricted && !(item.category_id && allowedCategoryIds.has(item.category_id))) return false
 
         // Filter by category if selected; "الكل" shows every item, including ones without a category
         if (selectedCategory) {

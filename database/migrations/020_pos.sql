@@ -438,7 +438,10 @@ CREATE TRIGGER cashier_shifts_guard
 
 -- ---------- 5. API functions ----------
 
--- Items the caller may sell in a branch (default: own branch), at server prices, cashier restrictions applied.
+-- Items the caller may sell in a branch (default: own branch), at server prices. Cashier category permissions
+-- do NOT filter this list: they only shape the category grid on the cashier screen (pos_cashier_categories).
+-- A scanned or searched item outside those categories can still be sold, which is how branches sell their
+-- retail stock by barcode.
 CREATE OR REPLACE FUNCTION public.pos_sellable_items(p_branch_id uuid DEFAULT NULL)
 RETURNS TABLE (
   item_id uuid, code text, barcode text, name text, name_ar text, category_id uuid, is_recipe boolean,
@@ -450,7 +453,6 @@ LANGUAGE plpgsql STABLE SECURITY DEFINER SET search_path = public AS $$
 DECLARE
   v_uid uuid := public.app_require_role('cashier', 'admin', 'branch_supervisor');
   v_branch uuid := COALESCE(p_branch_id, public.app_user_branch());
-  v_allowed uuid[];
 BEGIN
   IF v_branch IS NULL THEN
     RAISE EXCEPTION 'لا يوجد فرع مرتبط بحسابك' USING ERRCODE = 'P0001';
@@ -458,10 +460,8 @@ BEGIN
   IF NOT public.app_can_access_branch(v_branch) THEN
     RAISE EXCEPTION 'لا يمكنك عرض أصناف هذا الفرع' USING ERRCODE = '42501';
   END IF;
-  v_allowed := public.pos_allowed_category_ids(v_uid);
   RETURN QUERY
-    SELECT c.* FROM public.pos_item_catalog(v_branch) c
-    WHERE v_allowed IS NULL OR c.category_id = ANY (v_allowed);
+    SELECT c.* FROM public.pos_item_catalog(v_branch) c;
 END $$;
 
 -- Categories for the cashier screen: { restricted, categories: [...] }.
@@ -497,7 +497,6 @@ DECLARE
   v_uid uuid := public.app_require_role('cashier', 'admin');
   v_shift cashier_shifts%ROWTYPE;
   v_existing orders%ROWTYPE;
-  v_allowed uuid[];
   v_el jsonb;
   v_item_id uuid;
   v_qty numeric;
@@ -548,7 +547,6 @@ BEGIN
     RAISE EXCEPTION 'لا يمكنك البيع في هذا الفرع' USING ERRCODE = '42501';
   END IF;
 
-  v_allowed := pos_allowed_category_ids(v_uid);
 
   FOR v_el IN SELECT value FROM jsonb_array_elements(p_items) LOOP
     BEGIN
@@ -572,9 +570,6 @@ BEGIN
     IF NOT FOUND THEN
       RAISE EXCEPTION 'الصنف "%" غير متاح للبيع في هذا الفرع',
         COALESCE((SELECT name_ar FROM items WHERE id = v_item_id), v_item_id::text) USING ERRCODE = 'P0001';
-    END IF;
-    IF v_allowed IS NOT NULL AND (v_info.category_id IS NULL OR NOT (v_info.category_id = ANY (v_allowed))) THEN
-      RAISE EXCEPTION 'غير مسموح لك ببيع الصنف "%"', v_info.name_ar USING ERRCODE = 'P0001';
     END IF;
     -- the catalog never lists an item without a price; checked again so no line is ever sold for 0 EGP
     IF v_info.price IS NULL OR NOT (v_info.price > 0) THEN
