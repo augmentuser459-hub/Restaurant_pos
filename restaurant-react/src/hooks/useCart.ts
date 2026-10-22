@@ -1,9 +1,11 @@
 import { useState, useCallback } from 'react'
-import { MenuItem } from '../types/database.types'
+import type { PosSellableItem } from '../services/orders.service'
+import { roundMoney } from '../lib/utils'
 
+// Quantities are whole units (order_items.quantity is an integer); the server re-prices every line at checkout.
 export interface CartItem {
   id: string
-  item: MenuItem
+  item: PosSellableItem
   quantity: number
   notes?: string
 }
@@ -21,12 +23,12 @@ export interface CartState {
 export function useCart() {
   const [items, setItems] = useState<CartItem[]>([])
 
-  const addItem = useCallback((item: MenuItem) => {
+  const addItem = useCallback((item: PosSellableItem) => {
     setItems(prev => {
-      const existing = prev.find(i => i.item.id === item.id)
+      const existing = prev.find(i => i.item.item_id === item.item_id)
       if (existing) {
         return prev.map(i =>
-          i.item.id === item.id
+          i.item.item_id === item.item_id
             ? { ...i, quantity: i.quantity + 1 }
             : i
         )
@@ -40,12 +42,13 @@ export function useCart() {
   }, [])
 
   const updateQuantity = useCallback((itemId: string, quantity: number) => {
-    if (quantity <= 0) {
+    const whole = Math.floor(quantity)
+    if (whole <= 0) {
       setItems(prev => prev.filter(i => i.id !== itemId))
     } else {
       setItems(prev =>
         prev.map(i =>
-          i.id === itemId ? { ...i, quantity } : i
+          i.id === itemId ? { ...i, quantity: whole } : i
         )
       )
     }
@@ -63,10 +66,23 @@ export function useCart() {
     setItems([])
   }, [])
 
-  const subtotal = items.reduce(
-    (sum, item) => sum + item.item.price * item.quantity,
+  // Replaces each line's item with its latest version (new price/stock); drops lines no longer sellable.
+  // Returns the names of the dropped lines.
+  const refreshItems = useCallback((latest: PosSellableItem[]): string[] => {
+    const byId = new Map(latest.map(i => [i.item_id, i]))
+    const removed = items.filter(i => !byId.has(i.item.item_id)).map(i => i.item.name_ar)
+    setItems(prev =>
+      prev
+        .filter(i => byId.has(i.item.item_id))
+        .map(i => ({ ...i, item: byId.get(i.item.item_id)! }))
+    )
+    return removed
+  }, [items])
+
+  const subtotal = roundMoney(items.reduce(
+    (sum, item) => sum + roundMoney(item.item.price * item.quantity),
     0
-  )
+  ))
   const tax = 0 // No tax
   const total = subtotal // Total = subtotal (no tax)
 
@@ -81,5 +97,6 @@ export function useCart() {
     updateQuantity,
     updateNotes,
     clearCart,
+    refreshItems,
   }
 }

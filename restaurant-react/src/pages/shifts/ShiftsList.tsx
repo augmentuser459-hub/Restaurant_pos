@@ -1,8 +1,11 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Link } from 'react-router-dom';
-import { shiftsService, CashierShift } from '../../services/shifts.service';
+import { shiftsService, CashierShift, cashierName } from '../../services/shifts.service';
 import { branchesService } from '../../services/branches.service';
 import { Branch } from '../../types/database.types';
+import { APP_TIME_ZONE } from '../../lib/dates';
+import { toUserMessage } from '../../lib/errors';
+import { formatNumber } from '../../lib/utils';
 import {
   Clock,
   DollarSign,
@@ -18,41 +21,51 @@ export default function ShiftsList() {
   const [shifts, setShifts] = useState<CashierShift[]>([]);
   const [branches, setBranches] = useState<Branch[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  // Kept apart from `error`, so loading the shifts does not hide a failed branch list
+  const [branchesError, setBranchesError] = useState('');
   const [filters, setFilters] = useState({
     branchId: '',
     status: '',
     dateFrom: '',
     dateTo: '',
   });
+  // Only the newest request may update the table
+  const requestId = useRef(0);
 
   useEffect(() => {
-    fetchData();
+    fetchBranches();
   }, []);
 
   useEffect(() => {
     fetchShifts();
   }, [filters]);
 
-  const fetchData = async () => {
-    const { data: branchesData } = await branchesService.getAll();
+  const fetchBranches = async () => {
+    const { data: branchesData, error: branchesError } = await branchesService.getAll();
+    setBranchesError(branchesError ? toUserMessage(branchesError, 'تعذر تحميل الفروع') : '');
     setBranches(branchesData || []);
-    await fetchShifts();
   };
 
   const fetchShifts = async () => {
+    const current = ++requestId.current;
     setLoading(true);
-    const { data } = await shiftsService.getAllShifts({
+    // Dates are Cairo calendar days; the "to" day is included
+    const { data, error: shiftsError } = await shiftsService.getAllShifts({
       branchId: filters.branchId || undefined,
       status: filters.status || undefined,
       dateFrom: filters.dateFrom || undefined,
       dateTo: filters.dateTo || undefined,
     });
+    if (current !== requestId.current) return;
+    setError(shiftsError ? toUserMessage(shiftsError, 'تعذر تحميل الشيفتات') : '');
     setShifts(data || []);
     setLoading(false);
   };
 
   const formatDate = (date: string) => {
     return new Date(date).toLocaleDateString('ar-EG', {
+      timeZone: APP_TIME_ZONE,
       year: 'numeric',
       month: 'short',
       day: 'numeric',
@@ -61,8 +74,8 @@ export default function ShiftsList() {
     });
   };
 
-  const formatCurrency = (amount: number) => {
-    return amount?.toLocaleString('ar-EG') + ' ج.م';
+  const formatCurrency = (amount: number | null | undefined) => {
+    return (Number(amount) || 0).toLocaleString('ar-EG') + ' ج.م';
   };
 
   return (
@@ -122,6 +135,14 @@ export default function ShiftsList() {
         </div>
       </div>
 
+      {branchesError && (
+        <div className="p-4 bg-red-50 border border-red-200 rounded-lg text-red-700">{branchesError}</div>
+      )}
+
+      {error && (
+        <div className="p-4 bg-red-50 border border-red-200 rounded-lg text-red-700">{error}</div>
+      )}
+
       {/* Shifts Table */}
       <div className="bg-white rounded-lg shadow-sm border border-gray-100 overflow-hidden">
         {loading ? (
@@ -157,7 +178,7 @@ export default function ShiftsList() {
                     <td className="py-3 px-4">
                       <div className="flex items-center gap-2">
                         <User className="w-4 h-4 text-gray-400" />
-                        {shift.cashier?.full_name || '-'}
+                        {cashierName(shift.cashier)}
                       </div>
                     </td>
                     <td className="py-3 px-4">
@@ -169,16 +190,19 @@ export default function ShiftsList() {
                     <td className="py-3 px-4 text-sm">{formatDate(shift.start_time)}</td>
                     <td className="py-3 px-4 text-sm">{shift.end_time ? formatDate(shift.end_time) : '-'}</td>
                     <td className="py-3 px-4">
-                      <div className="flex items-center gap-1 text-green-600 font-medium">
-                        <DollarSign className="w-4 h-4" />
-                        {formatCurrency(shift.total_sales)}
-                      </div>
+                      {/* totals are computed when the shift is closed */}
+                      {shift.status === 'closed' ? (
+                        <div className="flex items-center gap-1 text-green-600 font-medium">
+                          <DollarSign className="w-4 h-4" />
+                          {formatCurrency(shift.total_sales)}
+                        </div>
+                      ) : '-'}
                     </td>
-                    <td className="py-3 px-4 text-center">{shift.orders_count}</td>
+                    <td className="py-3 px-4 text-center">{shift.status === 'closed' ? formatNumber(shift.orders_count || 0) : '-'}</td>
                     <td className="py-3 px-4">
-                      {shift.status === 'closed' && (
-                        <span className={`font-medium ${(shift.difference || 0) >= 0 ? 'text-green-600' : 'text-red-600'}`}>
-                          {(shift.difference || 0) >= 0 ? '+' : ''}{formatCurrency(shift.difference || 0)}
+                      {shift.status === 'closed' && shift.difference != null && (
+                        <span className={`font-medium ${(Number(shift.difference) || 0) >= 0 ? 'text-green-600' : 'text-red-600'}`}>
+                          {(Number(shift.difference) || 0) >= 0 ? '+' : ''}{formatCurrency(shift.difference)}
                         </span>
                       )}
                     </td>

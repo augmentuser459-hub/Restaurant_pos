@@ -1,405 +1,287 @@
 import { supabase, fixEncodingInData } from '../lib/supabase'
-import { Order, OrderItem, OrderStatus, OrderPaymentMethod, MenuItem } from '../types/database.types'
+import { fetchAll } from '../lib/fetchAll'
+import { localDayStartISO, localDayEndExclusiveISO } from '../lib/dates'
+import { Order, OrderItem, OrderStatus, OrderPaymentMethod } from '../types/database.types'
 
-export interface CreateOrderData {
-  branch_id: string
-  cashier_id: string
-  items: {
-    item_id: string
-    quantity: number
-    unit_price: number
-    notes?: string
-  }[]
+// Sales are written only through database functions (020_pos.sql): pos_checkout for the till, order_* for
+// admin edits. They keep stock, totals and shift totals consistent in one transaction.
+
+/** An item the cashier may sell, at the server price (pos_sellable_items). */
+export interface PosSellableItem {
+  item_id: string
+  code: string
+  barcode: string | null
+  name: string
+  name_ar: string
+  category_id: string | null
+  is_recipe: boolean
+  image_url: string | null
+  unit_cost: number | null
+  price: number
+  /** false = the branch has no stock row for it: sold without stock tracking */
+  has_stock_row: boolean
+  stock_quantity: number
+  in_stock: boolean
+  display_order: number
+  is_managed: boolean
+}
+
+export interface CashierCategory {
+  id: string
+  code: string
+  name: string
+  name_ar: string
+  sort_order: number
+}
+
+export interface CashierCategories {
+  /** true = the cashier may only sell from `categories` */
+  restricted: boolean
+  categories: CashierCategory[]
+}
+
+export interface CheckoutLine {
+  item_id: string
+  quantity: number
   notes?: string
 }
 
-export interface OrderItemWithMenu extends OrderItem {
-  menu_item?: { id: string; name_ar: string; code: string }
+export interface CheckoutInput {
+  shiftId: string
+  items: CheckoutLine[]
+  paymentMethod: OrderPaymentMethod
+  /** cash only: what the customer handed over (default: the exact total) */
+  paidAmount?: number | null
+  /** same key for retries of the same checkout, so it is never sold twice */
+  clientRequestId: string
+  /** the total the cashier's screen showed; the server refuses if its prices differ */
+  expectedTotal: number
+  notes?: string
 }
 
-export interface OrderWithDetails extends Omit<Order, 'branch' | 'cashier' | 'items'> {
+/** The saved order as returned by pos_checkout / order_* functions. */
+export interface OrderSummary {
+  id: string
+  order_number: string
+  status: OrderStatus
+  branch_id: string
+  shift_id: string | null
+  subtotal: number
+  discount_amount: number
+  total_amount: number
+  payment_method: OrderPaymentMethod | null
+  paid_amount: number | null
+  change_amount: number | null
+  created_at: string
+  paid_at: string | null
+  /** true = this checkout had already been saved (a retry); no second sale was made */
+  duplicate: boolean
+  items: {
+    id: string
+    item_id: string | null
+    name_ar: string | null
+    quantity: number
+    unit_price: number
+    total_price: number
+    notes: string | null
+  }[]
+}
+
+export interface OrderItemWithMenu extends Omit<OrderItem, 'item' | 'notes'> {
+  notes?: string | null
+  stock_deducted_qty?: number | null
+  item?: { id: string; name_ar: string; code: string } | null
+  menu_item?: { id: string; name_ar: string; code: string } | null
+}
+
+export interface OrderWithDetails extends Omit<Order,
+  'branch' | 'cashier' | 'items' | 'notes' | 'kitchen_notes' | 'discount_reason' | 'cancellation_reason' | 'payment_method' | 'paid_at'> {
   branch?: { id: string; name_ar: string; code: string } | null
   cashier?: { id: string; full_name_ar: string } | null
   items?: OrderItemWithMenu[]
+  payment_method?: OrderPaymentMethod | null
+  paid_at?: string | null
+  notes?: string | null
+  kitchen_notes?: string | null
+  discount_reason?: string | null
+  cancellation_reason?: string | null
+  paid_amount?: number | null
+  change_amount?: number | null
+  stock_deducted_at?: string | null
+}
+
+export interface OrderListFilters {
+  branchId?: string
+  status?: OrderStatus
+  paymentMethod?: OrderPaymentMethod
+  /** Cairo calendar dates, YYYY-MM-DD, inclusive */
+  startDate?: string
+  endDate?: string
+}
+
+export interface OrderUpdateInput {
+  /** null = keep the current status (so a kitchen move made meanwhile is not undone) */
+  status: OrderStatus | null
+  /** null = keep the current method; unpaid orders must send null (they never get a payment method) */
+  payment_method: OrderPaymentMethod | null
+  discount_amount: number
+  discount_reason?: string
+  notes?: string
+  kitchen_notes?: string
+  cancellation_reason?: string
+}
+
+/** A paid order holds money and stock; 'new' / 'pending_payment' orders were never paid. */
+export function isPaidOrder(order: { paid_at?: string | null; status: OrderStatus }): boolean {
+  return !!order.paid_at && order.status !== 'new' && order.status !== 'pending_payment' && order.status !== 'cancelled'
+}
+
+const ORDER_DETAIL_SELECT = `
+  *,
+  branch:branches!orders_branch_id_fkey(id, name_ar, code),
+  cashier:users!orders_cashier_id_fkey(id, full_name_ar),
+  items:order_items(*, item:items(id, name_ar, code), menu_item:menu_items(id, name_ar, code))
+`
+
+function sortLines(order: OrderWithDetails | null) {
+  order?.items?.sort((a, b) => (a.created_at < b.created_at ? -1 : a.created_at > b.created_at ? 1 : a.id < b.id ? -1 : 1))
+  return order
 }
 
 export const ordersService = {
-  // Get all orders
-  async getAll(branchId?: string, status?: OrderStatus) {
+  // One page of orders, newest first, filtered in the database (Cairo dates). `count` is the total match count.
+  async getPage(filters: OrderListFilters, page: number, pageSize: number) {
     let query = supabase
       .from('orders')
       .select(`
-        *,
-        branch:branches!orders_branch_id_fkey(id, name_ar, code),
-        cashier:users!orders_cashier_id_fkey(id, full_name_ar),
-        items:order_items(*, menu_item:menu_items(id, name_ar, code))
-      `)
+        id, order_number, branch_id, created_at, paid_at, total_amount, payment_method, status,
+        branch:branches!orders_branch_id_fkey(id, name_ar, code)
+      `, { count: 'exact' })
       .order('created_at', { ascending: false })
+      .order('id', { ascending: false })
 
-    if (branchId) {
-      query = query.eq('branch_id', branchId)
-    }
-    if (status) {
-      query = query.eq('status', status)
-    }
+    if (filters.branchId) query = query.eq('branch_id', filters.branchId)
+    if (filters.status) query = query.eq('status', filters.status)
+    if (filters.paymentMethod) query = query.eq('payment_method', filters.paymentMethod)
+    if (filters.startDate) query = query.gte('created_at', localDayStartISO(filters.startDate))
+    if (filters.endDate) query = query.lt('created_at', localDayEndExclusiveISO(filters.endDate))
 
-    const { data, error } = await query
-    return { data: fixEncodingInData(data) as OrderWithDetails[], error }
+    const from = page * pageSize
+    const { data, error, count } = await query.range(from, from + pageSize - 1)
+    return { data: (fixEncodingInData(data ?? []) as unknown as OrderWithDetails[]), count: count ?? 0, error }
   },
 
-  // Get order by ID
+  // Get order by ID (with its lines, in the order they were rung up)
   async getById(id: string) {
     const { data, error } = await supabase
       .from('orders')
-      .select(`
-        *,
-        branch:branches!orders_branch_id_fkey(id, name_ar, code),
-        cashier:users!orders_cashier_id_fkey(id, full_name_ar),
-        items:order_items(*, menu_item:menu_items(id, name_ar, code))
-      `)
+      .select(ORDER_DETAIL_SELECT)
       .eq('id', id)
-      .single()
+      .maybeSingle()
 
-    return { data: fixEncodingInData(data) as OrderWithDetails, error }
+    return { data: sortLines(fixEncodingInData(data) as OrderWithDetails | null), error }
   },
 
-  // Create new order
-  async create(orderData: CreateOrderData) {
-    const orderNumber = `ORD-${Date.now()}`
-    
-    // Calculate totals (no tax)
-    const subtotal = orderData.items.reduce(
-      (sum, item) => sum + item.quantity * item.unit_price, 0
-    )
-    const totalAmount = subtotal
-
-    // Insert order
-    const { data: order, error: orderError } = await supabase
-      .from('orders')
-      .insert({
-        order_number: orderNumber,
-        branch_id: orderData.branch_id,
-        cashier_id: orderData.cashier_id,
-        subtotal,
-        tax_amount: 0,
-        discount_amount: 0,
-        total_amount: totalAmount,
-        status: 'new',
-        notes: orderData.notes,
-      })
-      .select()
-      .single()
-
-    if (orderError) return { data: null, error: orderError }
-
-    // Insert order items
-    const orderItems = orderData.items.map(item => ({
-      order_id: order.id,
-      menu_item_id: item.item_id,
-      quantity: item.quantity,
-      unit_price: item.unit_price,
-      total_price: item.quantity * item.unit_price,
-      notes: item.notes,
-    }))
-
-    const { error: itemsError } = await supabase
-      .from('order_items')
-      .insert(orderItems)
-
-    if (itemsError) return { data: null, error: itemsError }
-
-    return { data: order as Order, error: null }
+  // The whole sale in one database transaction: order, lines, stock, order number.
+  async checkout(input: CheckoutInput) {
+    const { data, error } = await supabase.rpc('pos_checkout', {
+      p_shift_id: input.shiftId,
+      p_items: input.items,
+      p_payment_method: input.paymentMethod,
+      p_paid_amount: input.paidAmount ?? null,
+      p_client_request_id: input.clientRequestId,
+      p_expected_total: input.expectedTotal,
+      p_notes: input.notes ?? null,
+    })
+    return { data: error ? null : (fixEncodingInData(data) as OrderSummary), error }
   },
 
-  // Update order status
-  async updateStatus(id: string, status: OrderStatus) {
-    const updates: Record<string, unknown> = {
-      status,
-      updated_at: new Date().toISOString(),
+  // Items the logged-in user may sell in a branch, with server prices (cashier category limits applied).
+  async getSellableItems(branchId: string) {
+    try {
+      const rows = await fetchAll<PosSellableItem>((from, to) =>
+        supabase
+          .rpc('pos_sellable_items', { p_branch_id: branchId })
+          .order('display_order')
+          .order('item_id')
+          .range(from, to))
+      const items = (fixEncodingInData(rows) as PosSellableItem[]).map(r => ({
+        ...r,
+        price: Number(r.price) || 0,
+        stock_quantity: Number(r.stock_quantity) || 0,
+        unit_cost: r.unit_cost === null ? null : Number(r.unit_cost),
+      }))
+      return { data: items, error: null }
+    } catch (error) {
+      return { data: [] as PosSellableItem[], error }
     }
-
-    if (status === 'paid') {
-      updates.paid_at = new Date().toISOString()
-    } else if (status === 'delivered') {
-      updates.delivered_at = new Date().toISOString()
-    }
-
-    const { data, error } = await supabase
-      .from('orders')
-      .update(updates)
-      .eq('id', id)
-      .select()
-      .single()
-
-    return { data: data as Order, error }
   },
 
-  // Process payment
-  async processPayment(id: string, paymentMethod: OrderPaymentMethod) {
-    const { data, error } = await supabase
-      .from('orders')
-      .update({
-        payment_method: paymentMethod,
-        status: 'preparing',  // Go directly to preparing instead of paid
-        paid_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', id)
-      .select()
-      .single()
-
-    return { data: data as Order, error }
+  // Categories the logged-in cashier may browse
+  async getCashierCategories() {
+    const { data, error } = await supabase.rpc('pos_cashier_categories')
+    const value = (fixEncodingInData(data) as CashierCategories | null) ?? { restricted: true, categories: [] }
+    return { data: value, error }
   },
 
-  // Cancel order
-  async cancel(id: string) {
-    const { data, error } = await supabase
-      .from('orders')
-      .update({
-        status: 'cancelled',
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', id)
-      .select()
-      .single()
-
-    return { data: data as Order, error }
-  },
-
-  // Get kitchen orders (for kitchen display)
-  async getKitchenOrders(branchId: string) {
-    // Only get orders from the last 7 days to avoid loading thousands of old orders
-    const sevenDaysAgo = new Date()
-    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 7)
-    const cutoffDate = sevenDaysAgo.toISOString()
-
-    console.log('🔍 Fetching kitchen orders from:', cutoffDate)
-
-    const BATCH_SIZE = 1000
-    const MAX_ORDERS = 2000 // Safety limit
-    let allOrders: any[] = []
-    let start = 0
-    let hasMore = true
-
-    while (hasMore && allOrders.length < MAX_ORDERS) {
-      const { data, error } = await supabase
-        .from('orders')
-        .select(`
-          *,
-          items:order_items(
-            *,
-            menu_item:menu_items(id, name_ar, code, category_id),
-            item:items(id, name_ar, code, category_id)
-          )
-        `)
-        .eq('branch_id', branchId)
-        .in('status', ['paid', 'in_kitchen', 'preparing'])  // Include all statuses
-        .gte('created_at', cutoffDate) // Only last 7 days
-        .order('created_at', { ascending: false })
-        .range(start, start + BATCH_SIZE - 1)
-
-      if (error) {
-        console.error('❌ Error fetching orders:', error)
-        // Return what we have so far
-        return { data: fixEncodingInData(allOrders) as OrderWithDetails[], error }
-      }
-
-      if (!data || data.length === 0) {
-        hasMore = false
-      } else {
-        allOrders = [...allOrders, ...data]
-        hasMore = data.length === BATCH_SIZE
-        start += BATCH_SIZE
-        console.log(`📦 Loaded ${allOrders.length} orders so far...`)
-      }
-    }
-
-    console.log(`✅ Total kitchen orders loaded: ${allOrders.length}`)
-    return { data: fixEncodingInData(allOrders) as OrderWithDetails[], error: null }
-  },
-
-  // Get menu items for POS
-  async getMenuItems() {
-    const { data, error } = await supabase
-      .from('menu_items')
-      .select('*, category:menu_categories(id, name_ar)')
-      .eq('is_available', true)
-      .order('sort_order')
-
-    return { data: fixEncodingInData(data) as MenuItem[], error }
-  },
-
-  // Get menu categories
-  async getMenuCategories() {
-    const { data, error } = await supabase
-      .from('menu_categories')
-      .select('*')
-      .eq('is_active', true)
-      .order('sort_order')
-
-    return { data: fixEncodingInData(data), error }
-  },
-
-  // Get today's orders count
-  async getTodayOrdersCount(branchId?: string) {
-    const today = new Date().toISOString().split('T')[0]
-    
-    let query = supabase
-      .from('orders')
-      .select('id', { count: 'exact', head: true })
-      .gte('created_at', today)
-
-    if (branchId) {
-      query = query.eq('branch_id', branchId)
-    }
-
-    const { count, error } = await query
-    return { count, error }
-  },
-
-  // Get orders by shift
+  // All orders of a shift (no row cap), newest first
   async getByShift(shiftId: string) {
-    const { data, error } = await supabase
-      .from('orders')
-      .select(`
-        *,
-        branch:branches!orders_branch_id_fkey(id, name_ar, code),
-        cashier:users!orders_cashier_id_fkey(id, full_name_ar),
-        items:order_items(*, menu_item:menu_items(id, name_ar, code))
-      `)
-      .eq('shift_id', shiftId)
-      .order('created_at', { ascending: false })
-
-    return { data: fixEncodingInData(data) as OrderWithDetails[], error }
+    try {
+      const rows = await fetchAll((from, to) =>
+        supabase
+          .from('orders')
+          .select('id, order_number, created_at, paid_at, total_amount, payment_method, status, shift_id')
+          .eq('shift_id', shiftId)
+          .order('created_at', { ascending: false })
+          .order('id', { ascending: false })
+          .range(from, to))
+      return { data: fixEncodingInData(rows) as unknown as OrderWithDetails[], error: null }
+    } catch (error) {
+      return { data: [] as OrderWithDetails[], error }
+    }
   },
 
-  // Update order (for admin)
-  async updateOrder(id: string, updates: {
-    status?: OrderStatus
-    payment_method?: OrderPaymentMethod
-    discount_amount?: number
-    discount_reason?: string
-    notes?: string
-    kitchen_notes?: string
-  }) {
-    const { data, error } = await supabase
-      .from('orders')
-      .update({
-        ...updates,
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', id)
-      .select()
-      .single()
-
-    return { data: data as Order, error }
+  // Admin: status, payment method, discount and notes. Cancelling gives the stock back.
+  async updateOrder(id: string, updates: OrderUpdateInput) {
+    const { data, error } = await supabase.rpc('order_update', {
+      p_order_id: id,
+      p_status: updates.status,
+      p_payment_method: updates.payment_method,
+      p_discount_amount: updates.discount_amount,
+      p_discount_reason: updates.discount_reason ?? null,
+      p_notes: updates.notes ?? null,
+      p_kitchen_notes: updates.kitchen_notes ?? null,
+      p_cancellation_reason: updates.cancellation_reason ?? null,
+    })
+    return { data: error ? null : (data as OrderSummary), error }
   },
 
-  // Update order item
-  async updateOrderItem(itemId: string, updates: { quantity?: number; unit_price?: number; notes?: string }) {
-    const totalPrice = (updates.quantity || 1) * (updates.unit_price || 0)
-    const { data, error } = await supabase
-      .from('order_items')
-      .update({ ...updates, total_price: totalPrice })
-      .eq('id', itemId)
-      .select()
-      .single()
-    return { data, error }
+  // Admin: change a line's quantity (whole units), price or note
+  async updateOrderItem(itemId: string, updates: { quantity: number; unit_price: number; notes?: string | null }) {
+    const { data, error } = await supabase.rpc('order_update_item', {
+      p_order_item_id: itemId,
+      p_quantity: updates.quantity,
+      p_unit_price: updates.unit_price,
+      p_notes: updates.notes ?? null,
+    })
+    return { data: error ? null : (data as OrderSummary), error }
   },
 
-  // Delete order item
+  // Admin: remove a line (not the last one)
   async deleteOrderItem(itemId: string) {
-    const { error } = await supabase
-      .from('order_items')
-      .delete()
-      .eq('id', itemId)
-    return { error }
+    const { data, error } = await supabase.rpc('order_remove_item', { p_order_item_id: itemId })
+    return { data: error ? null : (data as OrderSummary), error }
   },
 
-  // Add order item
-  async addOrderItem(orderId: string, item: { menu_item_id: string; quantity: number; unit_price: number; notes?: string }) {
-    const { data, error } = await supabase
-      .from('order_items')
-      .insert({
-        order_id: orderId,
-        menu_item_id: item.menu_item_id,
-        quantity: item.quantity,
-        unit_price: item.unit_price,
-        total_price: item.quantity * item.unit_price,
-        notes: item.notes,
-      })
-      .select('*, menu_item:menu_items(id, name_ar, code)')
-      .single()
-    return { data, error }
-  },
-
-  // Recalculate order totals (no tax)
-  async recalculateOrderTotals(orderId: string) {
-    // Get all items for this order
-    const { data: items } = await supabase
-      .from('order_items')
-      .select('total_price')
-      .eq('order_id', orderId)
-    
-    if (!items) return { error: new Error('Failed to get items') }
-    
-    const subtotal = items.reduce((sum, item) => sum + Number(item.total_price || 0), 0)
-    const totalAmount = subtotal
-
-    const { data, error } = await supabase
-      .from('orders')
-      .update({ subtotal, tax_amount: 0, total_amount: totalAmount, updated_at: new Date().toISOString() })
-      .eq('id', orderId)
-      .select()
-      .single()
-    
-    return { data, error }
-  },
-
-  // Create order with shift (no tax)
-  async createWithShift(orderData: CreateOrderData & { shift_id?: string }) {
-    const orderNumber = `ORD-${Date.now()}`
-    
-    const subtotal = orderData.items.reduce(
-      (sum, item) => sum + item.quantity * item.unit_price, 0
-    )
-    const totalAmount = subtotal
-
-    const { data: order, error: orderError } = await supabase
-      .from('orders')
-      .insert({
-        order_number: orderNumber,
-        branch_id: orderData.branch_id,
-        cashier_id: orderData.cashier_id,
-        shift_id: orderData.shift_id,
-        subtotal,
-        tax_amount: 0,
-        discount_amount: 0,
-        total_amount: totalAmount,
-        status: 'new',
-        notes: orderData.notes,
-      })
-      .select()
-      .single()
-
-    if (orderError) return { data: null, error: orderError }
-
-    // Insert order items with item_id (for inventory deduction)
-    const orderItems = orderData.items.map(item => ({
-      order_id: order.id,
-      item_id: item.item_id, // This will trigger inventory deduction
-      quantity: item.quantity,
-      unit_price: item.unit_price,
-      total_price: item.quantity * item.unit_price,
-      notes: item.notes,
-    }))
-
-    const { error: itemsError } = await supabase
-      .from('order_items')
-      .insert(orderItems)
-
-    if (itemsError) return { data: null, error: itemsError }
-
-    return { data: order as Order, error: null }
+  // Admin: add a line; the price defaults to the branch price
+  async addOrderItem(orderId: string, item: { item_id: string; quantity: number; unit_price?: number | null; notes?: string }) {
+    const { data, error } = await supabase.rpc('order_add_item', {
+      p_order_id: orderId,
+      p_item_id: item.item_id,
+      p_quantity: item.quantity,
+      p_notes: item.notes ?? null,
+      p_unit_price: item.unit_price ?? null,
+    })
+    return { data: error ? null : (data as OrderSummary), error }
   },
 }

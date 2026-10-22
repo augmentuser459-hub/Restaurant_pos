@@ -1,8 +1,19 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Link } from 'react-router-dom';
 import { ordersService, OrderWithDetails } from '../../services/orders.service';
 import { branchesService } from '../../services/branches.service';
-import { Branch, OrderStatus } from '../../types/database.types';
+import { Branch, OrderStatus, OrderPaymentMethod } from '../../types/database.types';
+import { APP_TIME_ZONE } from '../../lib/dates';
+import { toUserMessage } from '../../lib/errors';
+import {
+  ORDER_STATUS_LABELS,
+  PAYMENT_METHODS,
+  PAYMENT_METHOD_LABELS,
+  orderStatusColor,
+  orderStatusLabel,
+  paymentMethodColor,
+  paymentMethodLabel,
+} from './orderLabels';
 import {
   ShoppingCart,
   Filter,
@@ -13,39 +24,26 @@ import {
   Clock,
 } from 'lucide-react';
 
-const STATUS_LABELS: Record<string, string> = {
-  new: 'جديد',
-  paid: 'مدفوع',
-  in_kitchen: 'في المطبخ',
-  preparing: 'قيد التحضير',
-  ready: 'جاهز',
-  delivered: 'تم التسليم',
-  completed: 'مكتمل',
-  cancelled: 'ملغي',
-};
-
-const STATUS_COLORS: Record<string, string> = {
-  new: 'bg-blue-100 text-blue-700',
-  paid: 'bg-green-100 text-green-700',
-  in_kitchen: 'bg-yellow-100 text-yellow-700',
-  preparing: 'bg-orange-100 text-orange-700',
-  ready: 'bg-purple-100 text-purple-700',
-  delivered: 'bg-teal-100 text-teal-700',
-  completed: 'bg-gray-100 text-gray-700',
-  cancelled: 'bg-red-100 text-red-700',
-};
+const PAGE_SIZE = 50;
 
 export default function OrdersList() {
   const [orders, setOrders] = useState<OrderWithDetails[]>([]);
+  const [totalCount, setTotalCount] = useState(0);
+  const [page, setPage] = useState(0);
   const [branches, setBranches] = useState<Branch[]>([]);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
+  // Kept apart from `error`, so loading the orders does not hide a failed branch list
+  const [branchesError, setBranchesError] = useState('');
   const [filters, setFilters] = useState({
     branchId: '',
     status: '' as OrderStatus | '',
-    paymentMethod: '',
+    paymentMethod: '' as OrderPaymentMethod | '',
     startDate: '',
     endDate: '',
   });
+  // Only the newest request may update the table (filters can change faster than responses arrive)
+  const requestId = useRef(0);
 
   useEffect(() => {
     fetchBranches();
@@ -53,45 +51,51 @@ export default function OrdersList() {
 
   useEffect(() => {
     fetchOrders();
-  }, [filters]);
+  }, [filters, page]);
 
   const fetchBranches = async () => {
-    const { data } = await branchesService.getAll();
+    const { data, error: branchesError } = await branchesService.getAll();
+    setBranchesError(branchesError ? toUserMessage(branchesError, 'تعذر تحميل الفروع') : '');
     setBranches(data || []);
   };
 
+  const updateFilters = (next: Partial<typeof filters>) => {
+    setPage(0);
+    setFilters({ ...filters, ...next });
+  };
+
   const fetchOrders = async () => {
+    const current = ++requestId.current;
     setLoading(true);
-    const { data } = await ordersService.getAll(
-      filters.branchId || undefined,
-      filters.status || undefined
+    // All filters run in the database, so every matching order is reachable page by page
+    const { data, count, error: ordersError } = await ordersService.getPage(
+      {
+        branchId: filters.branchId || undefined,
+        status: filters.status || undefined,
+        paymentMethod: filters.paymentMethod || undefined,
+        startDate: filters.startDate || undefined,
+        endDate: filters.endDate || undefined,
+      },
+      page,
+      PAGE_SIZE,
     );
-    
-    // Apply client-side filters for payment method and date
-    let filteredData = data || [];
-    
-    if (filters.paymentMethod) {
-      filteredData = filteredData.filter(order => order.payment_method === filters.paymentMethod);
+    if (current !== requestId.current) return;
+
+    if (ordersError) {
+      setError(toUserMessage(ordersError, 'تعذر تحميل الأوردرات'));
+      setOrders([]);
+      setTotalCount(0);
+    } else {
+      setError('');
+      setOrders(data);
+      setTotalCount(count);
     }
-    
-    if (filters.startDate) {
-      filteredData = filteredData.filter(order => 
-        new Date(order.created_at) >= new Date(filters.startDate)
-      );
-    }
-    
-    if (filters.endDate) {
-      filteredData = filteredData.filter(order => 
-        new Date(order.created_at) <= new Date(filters.endDate + 'T23:59:59')
-      );
-    }
-    
-    setOrders(filteredData);
     setLoading(false);
   };
 
   const formatDate = (date: string) => {
     return new Date(date).toLocaleDateString('ar-EG', {
+      timeZone: APP_TIME_ZONE,
       month: 'short',
       day: 'numeric',
       hour: '2-digit',
@@ -100,8 +104,12 @@ export default function OrdersList() {
   };
 
   const formatCurrency = (amount: number) => {
-    return (amount || 0).toLocaleString('ar-EG') + ' ج.م';
+    return (Number(amount) || 0).toLocaleString('ar-EG') + ' ج.م';
   };
+
+  const totalPages = Math.max(1, Math.ceil(totalCount / PAGE_SIZE));
+  const firstRow = totalCount === 0 ? 0 : page * PAGE_SIZE + 1;
+  const lastRow = Math.min((page + 1) * PAGE_SIZE, totalCount);
 
   return (
     <div className="space-y-6">
@@ -124,7 +132,7 @@ export default function OrdersList() {
         <div className="grid grid-cols-1 md:grid-cols-3 lg:grid-cols-5 gap-4">
           <select
             value={filters.branchId}
-            onChange={(e) => setFilters({ ...filters, branchId: e.target.value })}
+            onChange={(e) => updateFilters({ branchId: e.target.value })}
             className="px-4 py-2 border border-gray-300 rounded-lg"
             aria-label="الفرع"
           >
@@ -135,31 +143,30 @@ export default function OrdersList() {
           </select>
           <select
             value={filters.status}
-            onChange={(e) => setFilters({ ...filters, status: e.target.value as OrderStatus | '' })}
+            onChange={(e) => updateFilters({ status: e.target.value as OrderStatus | '' })}
             className="px-4 py-2 border border-gray-300 rounded-lg"
             aria-label="الحالة"
           >
             <option value="">كل الحالات</option>
-            {Object.entries(STATUS_LABELS).map(([key, label]) => (
+            {Object.entries(ORDER_STATUS_LABELS).map(([key, label]) => (
               <option key={key} value={key}>{label}</option>
             ))}
           </select>
           <select
             value={filters.paymentMethod}
-            onChange={(e) => setFilters({ ...filters, paymentMethod: e.target.value })}
+            onChange={(e) => updateFilters({ paymentMethod: e.target.value as OrderPaymentMethod | '' })}
             className="px-4 py-2 border border-gray-300 rounded-lg"
             aria-label="طريقة الدفع"
           >
             <option value="">كل طرق الدفع</option>
-            <option value="cash">كاش</option>
-            <option value="visa">فيزا</option>
-            <option value="instapay">إنستاباي</option>
-            <option value="vodafone_cash">فودافون كاش</option>
+            {PAYMENT_METHODS.map((method) => (
+              <option key={method} value={method}>{PAYMENT_METHOD_LABELS[method]}</option>
+            ))}
           </select>
           <input
             type="date"
             value={filters.startDate}
-            onChange={(e) => setFilters({ ...filters, startDate: e.target.value })}
+            onChange={(e) => updateFilters({ startDate: e.target.value })}
             className="px-4 py-2 border border-gray-300 rounded-lg"
             placeholder="من تاريخ"
             aria-label="من تاريخ"
@@ -167,7 +174,7 @@ export default function OrdersList() {
           <input
             type="date"
             value={filters.endDate}
-            onChange={(e) => setFilters({ ...filters, endDate: e.target.value })}
+            onChange={(e) => updateFilters({ endDate: e.target.value })}
             className="px-4 py-2 border border-gray-300 rounded-lg"
             placeholder="إلى تاريخ"
             aria-label="إلى تاريخ"
@@ -175,13 +182,21 @@ export default function OrdersList() {
         </div>
         <div className="mt-4">
           <button
-            onClick={() => setFilters({ branchId: '', status: '', paymentMethod: '', startDate: '', endDate: '' })}
+            onClick={() => updateFilters({ branchId: '', status: '', paymentMethod: '', startDate: '', endDate: '' })}
             className="px-4 py-2 text-gray-600 hover:bg-gray-100 rounded-lg"
           >
             إعادة تعيين الفلاتر
           </button>
         </div>
       </div>
+
+      {branchesError && (
+        <div className="p-4 bg-red-50 border border-red-200 rounded-lg text-red-700">{branchesError}</div>
+      )}
+
+      {error && (
+        <div className="p-4 bg-red-50 border border-red-200 rounded-lg text-red-700">{error}</div>
+      )}
 
       {/* Orders Table */}
       <div className="bg-white rounded-lg shadow-sm border border-gray-100 overflow-hidden">
@@ -215,7 +230,7 @@ export default function OrdersList() {
                     <td className="py-3 px-4">
                       <div className="flex items-center gap-2">
                         <Building2 className="w-4 h-4 text-gray-400" />
-                        {(order.branch as { name_ar?: string } | null)?.name_ar || '-'}
+                        {order.branch?.name_ar || '-'}
                       </div>
                     </td>
                     <td className="py-3 px-4">
@@ -231,15 +246,13 @@ export default function OrdersList() {
                       </div>
                     </td>
                     <td className="py-3 px-4">
-                      <span className={`px-2 py-1 text-xs rounded ${
-                        order.payment_method === 'cash' ? 'bg-green-100 text-green-700' : 'bg-purple-100 text-purple-700'
-                      }`}>
-                        {order.payment_method === 'cash' ? 'كاش' : order.payment_method === 'visa' ? 'فيزا' : order.payment_method || '-'}
+                      <span className={`px-2 py-1 text-xs rounded ${paymentMethodColor(order.payment_method)}`}>
+                        {paymentMethodLabel(order.payment_method)}
                       </span>
                     </td>
                     <td className="py-3 px-4">
-                      <span className={`px-2 py-1 text-xs rounded ${STATUS_COLORS[order.status] || 'bg-gray-100'}`}>
-                        {STATUS_LABELS[order.status] || order.status}
+                      <span className={`px-2 py-1 text-xs rounded ${orderStatusColor(order.status)}`}>
+                        {orderStatusLabel(order.status)}
                       </span>
                     </td>
                     <td className="py-3 px-4">
@@ -264,6 +277,36 @@ export default function OrdersList() {
                 ))}
               </tbody>
             </table>
+          </div>
+        )}
+
+        {/* Pagination */}
+        {!loading && totalCount > 0 && (
+          <div className="flex items-center justify-between p-4 border-t border-gray-100">
+            <div className="text-sm text-gray-600">
+              عرض {firstRow.toLocaleString('ar-EG')} - {lastRow.toLocaleString('ar-EG')} من {totalCount.toLocaleString('ar-EG')} أوردر
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setPage(page - 1)}
+                disabled={page === 0}
+                className="px-3 py-1 rounded-lg border border-gray-300 text-gray-700 hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                السابق
+              </button>
+              <span className="text-sm text-gray-600">
+                صفحة {(page + 1).toLocaleString('ar-EG')} من {totalPages.toLocaleString('ar-EG')}
+              </span>
+              <button
+                type="button"
+                onClick={() => setPage(page + 1)}
+                disabled={page + 1 >= totalPages}
+                className="px-3 py-1 rounded-lg border border-gray-300 text-gray-700 hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                التالي
+              </button>
+            </div>
           </div>
         )}
       </div>

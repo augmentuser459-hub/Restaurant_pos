@@ -1,38 +1,58 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useAuth } from '../../contexts/AuthContext'
-import { ordersService } from '../../services/orders.service'
-import { posManagementService } from '../../services/posManagement.service'
+import { ordersService, PosSellableItem, CashierCategory, OrderSummary } from '../../services/orders.service'
 import { shiftsService, CashierShift } from '../../services/shifts.service'
 import { useCart } from '../../hooks/useCart'
-import { MenuItem, MenuCategory, OrderPaymentMethod } from '../../types/database.types'
-import { formatCurrency } from '../../lib/utils'
+import { OrderPaymentMethod } from '../../types/database.types'
+import { formatCurrency, formatDateTime, formatNumber, parseDecimal, roundMoney, roundQuantity } from '../../lib/utils'
+import { toUserMessage, isInsufficientStock } from '../../lib/errors'
+import { paymentMethodLabel } from '../orders/orderLabels'
+import { findItemsByScan } from '../inventory/stockHelpers'
 import { ShoppingCart, Plus, Minus, Trash2, CreditCard, Banknote, Smartphone, Wallet, X, Printer, Play, Square, Clock, DollarSign, Search, Package, ChefHat } from 'lucide-react'
-import { supabase } from '../../lib/supabase'
 
-interface Category {
-  id: string
-  name: string
-  name_ar: string
-  code: string
+const hasHint = (error: unknown, hint: string) => (error as { hint?: string } | null)?.hint === hint
+
+// Quantity per item, to compare a retried checkout with the order an earlier attempt saved
+const quantitiesByItem = (lines: { item_id: string | null; quantity: number }[]) => {
+  const byItem = new Map<string, number>()
+  for (const line of lines) {
+    if (line.item_id) byItem.set(line.item_id, (byItem.get(line.item_id) ?? 0) + Number(line.quantity))
+  }
+  return byItem
 }
+const sameQuantities = (a: Map<string, number>, b: Map<string, number>) =>
+  a.size === b.size && [...a].every(([itemId, qty]) => b.get(itemId) === qty)
+
+// Every value placed in the receipt HTML is escaped (item names and notes are user-entered).
+const escapeHtml = (value: unknown) =>
+  String(value ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] as string))
 
 export default function POSCashier() {
   const { user } = useAuth()
   const cart = useCart()
-  const [menuItems, setMenuItems] = useState<MenuItem[]>([])
-  const [categories, setCategories] = useState<Category[]>([])
+  const [menuItems, setMenuItems] = useState<PosSellableItem[]>([])
+  const [categories, setCategories] = useState<CashierCategory[]>([])
+  const [loadError, setLoadError] = useState<string | null>(null)
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null)
   const [searchTerm, setSearchTerm] = useState('')
+  const [scanChoices, setScanChoices] = useState<{ term: string; ids: string[] } | null>(null)
   const [viewMode, setViewMode] = useState<'items' | 'recipes'>('items')
   const [loading, setLoading] = useState(true)
   const [processing, setProcessing] = useState(false)
   const [showPayment, setShowPayment] = useState(false)
   const [paidAmount, setPaidAmount] = useState<string>('')
-  const [lastOrder, setLastOrder] = useState<{ orderNumber: string; items: typeof cart.items; total: number; paid: number; change: number } | null>(null)
-  const changeAmount = paidAmount ? parseFloat(paidAmount) - cart.total : 0
+  const [lastOrder, setLastOrder] = useState<OrderSummary | null>(null)
+  // One key per checkout attempt: a retry after a lost response returns the saved order instead of selling twice
+  const checkoutKey = useRef<string | null>(null)
+  // Set synchronously, so a double click cannot start a second request before `processing` re-renders
+  const busy = useRef(false)
+  const paidValue = paidAmount.trim() ? parseDecimal(paidAmount) : null
+  const changeAmount = paidValue !== null ? roundMoney(paidValue - cart.total) : 0
+  const cashUnderpaid = paidValue !== null && paidValue < cart.total
 
   // Shift state
   const [currentShift, setCurrentShift] = useState<CashierShift | null>(null)
+  const [shiftError, setShiftError] = useState<string | null>(null)
   const [showStartShift, setShowStartShift] = useState(false)
   const [showEndShift, setShowEndShift] = useState(false)
   const [openingAmount, setOpeningAmount] = useState<string>('0')
@@ -44,65 +64,64 @@ export default function POSCashier() {
     checkOpenShift()
   }, [])
 
-  const fetchData = async () => {
-    // Get POS items from inventory
-    if (user?.branch_id) {
-      const { data } = await posManagementService.getPOSItemsForCashier(user.branch_id)
-      if (data) {
-        // Transform to MenuItem format with stock info
-        const items = data.map((posItem: any) => ({
-          id: posItem.item_id,
-          code: posItem.item?.code || '',
-          barcode: posItem.item?.barcode || '',
-          name: posItem.item?.name || '',
-          name_ar: posItem.item?.name_ar || '',
-          price: parseFloat(posItem.price) || 0,
-          is_available: posItem.is_available && posItem.in_stock,
-          image_url: posItem.item?.image_url,
-          category_id: posItem.item?.category_id || null,
-          stock_quantity: parseFloat(posItem.stock_quantity) || 0,
-          in_stock: posItem.in_stock,
-          is_recipe: posItem.item?.is_recipe || false
-        }))
-        setMenuItems(items)
-      }
-      
-      // Fetch categories accessible by this cashier
-      if (user?.id) {
-        const { data: categoriesData } = await supabase.rpc('get_cashier_categories', {
-          p_user_id: user.id
-        })
-        
-        if (categoriesData) {
-          setCategories(categoriesData)
-        }
-      }
+  // A new cart is a new checkout
+  useEffect(() => {
+    if (cart.items.length === 0) checkoutKey.current = null
+  }, [cart.items.length])
+
+  // Escape closes the open dialog
+  useEffect(() => {
+    if (!showPayment && !showStartShift && !showEndShift) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape' || processing) return
+      setShowPayment(false)
+      setShowStartShift(false)
+      setShowEndShift(false)
     }
-    
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [showPayment, showStartShift, showEndShift, processing])
+
+  // Loads what this cashier may sell (server prices, category limits applied by the server).
+  // Any failure shows nothing rather than items the cashier may not sell.
+  const fetchData = async (): Promise<PosSellableItem[] | null> => {
+    if (!user?.branch_id) {
+      setLoadError('لا يوجد فرع مرتبط بحسابك')
+      setLoading(false)
+      return null
+    }
+    const [itemsRes, categoriesRes] = await Promise.all([
+      ordersService.getSellableItems(user.branch_id),
+      ordersService.getCashierCategories(),
+    ])
+    const error = itemsRes.error || categoriesRes.error
+    if (error) {
+      setMenuItems([])
+      setCategories([])
+      setLoadError(toUserMessage(error, 'تعذر تحميل الأصناف'))
+      setLoading(false)
+      return null
+    }
+    setMenuItems(itemsRes.data)
+    setCategories(categoriesRes.data.categories)
+    setLoadError(null)
     setLoading(false)
+    return itemsRes.data
   }
 
-  // Add item to cart with stock validation
-  const handleAddToCart = (item: MenuItem) => {
-    const stockQty = (item as any).stock_quantity || 0
-    const isRecipe = (item as any).is_recipe || false
-    
-    // Recipes don't need stock validation (they're produced on demand)
-    if (isRecipe) {
-      cart.addItem(item)
-      return
+  // Add item to cart with stock validation (the server checks again at checkout)
+  const handleAddToCart = (item: PosSellableItem) => {
+    if (!item.in_stock) return
+
+    if (item.has_stock_row) {
+      const cartItem = cart.items.find(ci => ci.item.item_id === item.item_id)
+      const currentCartQty = cartItem ? cartItem.quantity : 0
+      if (currentCartQty + 1 > item.stock_quantity) {
+        alert(`لا يمكن إضافة المزيد. الكمية المتاحة: ${formatNumber(roundQuantity(item.stock_quantity))}`)
+        return
+      }
     }
-    
-    // Check current quantity in cart
-    const cartItem = cart.items.find(ci => ci.item.id === item.id)
-    const currentCartQty = cartItem ? cartItem.quantity : 0
-    
-    // Prevent adding if it would exceed stock
-    if (currentCartQty >= stockQty) {
-      alert(`لا يمكن إضافة المزيد. الكمية المتاحة: ${stockQty.toFixed(2)}`)
-      return
-    }
-    
+
     cart.addItem(item)
   }
 
@@ -110,60 +129,77 @@ export default function POSCashier() {
   const handleUpdateQuantity = (itemId: string, newQuantity: number) => {
     const cartItem = cart.items.find(ci => ci.id === itemId)
     if (!cartItem) return
-    
-    const menuItem = menuItems.find(mi => mi.id === cartItem.item.id)
-    if (!menuItem) return
-    
-    const stockQty = (menuItem as any).stock_quantity || 0
-    const isRecipe = (menuItem as any).is_recipe || false
-    
-    // Recipes don't need stock validation
-    if (!isRecipe && newQuantity > stockQty) {
-      alert(`الكمية المتاحة فقط: ${stockQty.toFixed(2)}`)
+
+    const latest = menuItems.find(mi => mi.item_id === cartItem.item.item_id) ?? cartItem.item
+    if (newQuantity > cartItem.quantity && latest.has_stock_row && newQuantity > latest.stock_quantity) {
+      alert(`الكمية المتاحة فقط: ${formatNumber(roundQuantity(latest.stock_quantity))}`)
       return
     }
-    
+
     cart.updateQuantity(itemId, newQuantity)
   }
 
   const checkOpenShift = async () => {
     if (!user?.id || !user?.branch_id) return
-    const { data } = await shiftsService.getOpenShift(user.id, user.branch_id)
+    const { data, error } = await shiftsService.getOpenShift(user.id, user.branch_id)
+    if (error) {
+      setShiftError(toUserMessage(error, 'تعذر التحقق من الشيفت المفتوح'))
+      return
+    }
+    setShiftError(null)
     setCurrentShift(data)
   }
 
   const handleStartShift = async () => {
-    if (!user?.id || !user?.branch_id) return
+    if (!user?.id || !user?.branch_id || busy.current) return
+    const amount = parseDecimal(openingAmount)
+    if (amount === null || amount < 0) {
+      alert('أدخل رصيد افتتاح صحيح (صفر أو أكثر)')
+      return
+    }
+    busy.current = true
     setProcessing(true)
-    const { data, error } = await shiftsService.startShift(user.id, user.branch_id, parseFloat(openingAmount) || 0)
-    if (error) {
-      alert('فشل في بدء الشيفت')
+    const { data, error } = await shiftsService.startShift(user.branch_id, roundMoney(amount))
+    if (error || !data) {
+      alert(toUserMessage(error, 'فشل في بدء الشيفت'))
     } else {
+      if (data.existing) alert('لديك شيفت مفتوح بالفعل، تم استكماله')
       setCurrentShift(data)
+      setShiftError(null)
       setShowStartShift(false)
       setOpeningAmount('0')
     }
+    busy.current = false
     setProcessing(false)
   }
 
   const handleEndShift = async () => {
-    if (!currentShift || !user?.id) return
+    if (!currentShift || !user?.id || busy.current) return
+    const amount = parseDecimal(closingAmount)
+    if (amount === null || amount < 0) {
+      alert('أدخل المبلغ الفعلي في الدرج (صفر أو أكثر)')
+      return
+    }
+    busy.current = true
     setProcessing(true)
-    const { error } = await shiftsService.closeShift(
-      currentShift.id,
-      parseFloat(closingAmount) || 0,
-      user.id,
-      shiftNotes || undefined
-    )
-    if (error) {
-      alert('فشل في إنهاء الشيفت')
+    const { data, error } = await shiftsService.closeShift(currentShift.id, roundMoney(amount), shiftNotes.trim() || undefined)
+    if (error || !data) {
+      alert(toUserMessage(error, 'فشل في إنهاء الشيفت'))
+      if (hasHint(error, 'SHIFT_CLOSED')) await checkOpenShift()
     } else {
-      alert('تم إنهاء الشيفت بنجاح')
+      const unpaid = data.unpaid_orders > 0 ? `\nتنبيه: ${formatNumber(data.unpaid_orders)} طلب غير مدفوع لم يُحسب في المبيعات` : ''
+      alert(
+        `تم إنهاء الشيفت بنجاح\n` +
+        `إجمالي المبيعات: ${formatCurrency(Number(data.total_sales) || 0)}\n` +
+        `المتوقع في الدرج: ${formatCurrency(Number(data.expected_amount) || 0)}\n` +
+        `الفرق: ${formatCurrency(Number(data.difference) || 0)}${unpaid}`
+      )
       setCurrentShift(null)
       setShowEndShift(false)
       setClosingAmount('')
       setShiftNotes('')
     }
+    busy.current = false
     setProcessing(false)
   }
 
@@ -171,47 +207,94 @@ export default function POSCashier() {
     return new Date(time).toLocaleTimeString('ar-EG', { hour: '2-digit', minute: '2-digit' })
   }
 
-  const filteredItems = menuItems.filter(item => {
-    // Filter by view mode (items vs recipes)
-    if (viewMode === 'items' && item.is_recipe) return false
-    if (viewMode === 'recipes' && !item.is_recipe) return false
-    
-    // Filter by search term (including barcode) - BYPASSES category filter
-    if (searchTerm) {
-      const term = searchTerm.toLowerCase()
-      return (
-        item.name_ar?.toLowerCase().includes(term) ||
-        item.name?.toLowerCase().includes(term) ||
-        item.code?.toLowerCase().includes(term) ||
-        (item as any).barcode?.toLowerCase().includes(term)
-      )
-    }
-    
-    // Filter by category if selected
-    if (selectedCategory) {
-      return item.category_id === selectedCategory
-    }
-    
-    // If no category selected and categories exist, only show items that belong to accessible categories
-    // Items without category are hidden unless "الكل" is selected
-    if (!selectedCategory && categories.length > 0) {
-      return item.category_id && categories.some(cat => cat.id === item.category_id)
-    }
-    
-    return true
-  })
+  const matchesSearch = (item: PosSellableItem, term: string) =>
+    item.name_ar?.toLowerCase().includes(term) ||
+    item.name?.toLowerCase().includes(term) ||
+    item.code?.toLowerCase().includes(term) ||
+    item.barcode?.toLowerCase().includes(term)
 
-  // Print receipt function
-  const printReceipt = (orderNumber: string, items: typeof cart.items, total: number, paid: number) => {
-    const change = paid - total
-    const now = new Date()
-    const dateStr = `${now.getDate()}/${now.getMonth() + 1}/${now.getFullYear()}`
-    const timeStr = `${now.getHours()}:${String(now.getMinutes()).padStart(2, '0')}`
-    
+  // A scanned code that matches several items: the list shows exactly those items (in either view)
+  // until the search text changes, and the cashier picks one. Nothing is picked silently.
+  const activeScanChoices = scanChoices && scanChoices.term === searchTerm ? scanChoices.ids : null
+
+  // The list only holds items this cashier may sell, so search and browsing respect category limits.
+  const filteredItems = activeScanChoices
+    ? menuItems.filter(item => activeScanChoices.includes(item.item_id))
+    : menuItems.filter(item => {
+        // Filter by view mode (items vs recipes)
+        if (viewMode === 'items' && item.is_recipe) return false
+        if (viewMode === 'recipes' && !item.is_recipe) return false
+
+        // Filter by search term (including barcode)
+        const term = searchTerm.trim().toLowerCase()
+        if (term) return matchesSearch(item, term)
+
+        // Filter by category if selected; "الكل" shows every item, including ones without a category
+        if (selectedCategory) {
+          return item.category_id === selectedCategory
+        }
+        return true
+      })
+
+  // Enter in the search box (or a barcode scanner). Codes are matched like the stock screens (barcode, then the
+  // code with or without the literal quotes most imported codes carry): one match is added; several = the only
+  // one in stock, else the cashier chooses from the list; no code match = a name search with a single result.
+  const handleSearchEnter = () => {
+    const text = searchTerm.trim()
+    if (!text) return
+    const scanned = findItemsByScan(menuItems, text)
+    let target: PosSellableItem | undefined
+    if (scanned.length === 1) {
+      target = scanned[0]
+    } else if (scanned.length > 1) {
+      const inStock = scanned.filter(i => i.in_stock)
+      if (inStock.length === 1) {
+        target = inStock[0]
+      } else {
+        setScanChoices({ term: searchTerm, ids: scanned.map(i => i.item_id) })
+        alert(`يوجد ${formatNumber(scanned.length)} أصناف تطابق الكود "${text}". اختر الصنف المطلوب من القائمة`)
+        return
+      }
+    } else {
+      const term = text.toLowerCase()
+      const byName = menuItems.filter(item => matchesSearch(item, term))
+      if (byName.length === 0) {
+        alert(`لا يوجد صنف بهذا الكود أو الاسم: ${text}`)
+        setSearchTerm('')
+        return
+      }
+      // Results only in the other view (items / recipes): show them here instead of an empty list
+      const visible = filteredItems.length > 0 ? filteredItems : byName
+      if (visible.length !== 1) {
+        if (filteredItems.length === 0) setScanChoices({ term: searchTerm, ids: byName.map(i => i.item_id) })
+        return // several results: the cashier picks from the list
+      }
+      target = visible[0]
+    }
+    if (!target.in_stock) {
+      alert(`الصنف "${target.name_ar}" غير متاح`)
+      return
+    }
+    handleAddToCart(target)
+    setSearchTerm('')
+  }
+
+  // Print receipt from the saved order (server prices, totals and change)
+  const printReceipt = (order: OrderSummary) => {
+    const lines = order.items.map(item => `
+            <div class="item">
+              <span class="item-name">${escapeHtml(item.name_ar || 'صنف')}</span>
+              <span class="item-qty">×${escapeHtml(formatNumber(item.quantity))}</span>
+              <span class="item-price">${escapeHtml(formatCurrency(Number(item.total_price) || 0))}</span>
+            </div>
+          `).join('')
+    const isCash = order.payment_method === 'cash'
+
     const receiptContent = `
       <html dir="rtl">
       <head>
-        <title>فاتورة - ${orderNumber}</title>
+        <meta charset="UTF-8">
+        <title>فاتورة - ${escapeHtml(order.order_number)}</title>
         <style>
           body { font-family: Arial, sans-serif; padding: 20px; max-width: 300px; margin: 0 auto; }
           .header { text-align: center; margin-bottom: 20px; }
@@ -221,8 +304,8 @@ export default function POSCashier() {
           .items { margin: 10px 0; }
           .item { display: flex; justify-content: space-between; margin: 5px 0; font-size: 14px; }
           .item-name { flex: 1; }
-          .item-qty { width: 30px; text-align: center; }
-          .item-price { width: 70px; text-align: left; }
+          .item-qty { width: 40px; text-align: center; }
+          .item-price { width: 90px; text-align: left; }
           .totals { margin-top: 10px; }
           .total-row { display: flex; justify-content: space-between; margin: 5px 0; font-size: 14px; }
           .total-row.grand { font-weight: bold; font-size: 16px; }
@@ -233,120 +316,157 @@ export default function POSCashier() {
       <body>
         <div class="header">
           <h1>فاتورة مبيعات</h1>
-          <p>رقم الطلب: ${orderNumber}</p>
-          <p>${dateStr} - ${timeStr}</p>
+          <p>رقم الطلب: ${escapeHtml(order.order_number)}</p>
+          <p>${escapeHtml(formatDateTime(order.created_at))}</p>
         </div>
         <div class="divider"></div>
-        <div class="items">
-          ${items.map(item => `
-            <div class="item">
-              <span class="item-name">${item.item.name_ar}</span>
-              <span class="item-qty">x${item.quantity}</span>
-              <span class="item-price">${(item.item.price * item.quantity).toFixed(2)} ج.م</span>
-            </div>
-          `).join('')}
-        </div>
+        <div class="items">${lines}</div>
         <div class="divider"></div>
         <div class="totals">
+          ${Number(order.discount_amount) > 0 ? `
+          <div class="total-row">
+            <span>الخصم</span>
+            <span>${escapeHtml(formatCurrency(Number(order.discount_amount)))}</span>
+          </div>` : ''}
           <div class="total-row grand">
             <span>الإجمالي</span>
-            <span>${total.toFixed(2)} ج.م</span>
+            <span>${escapeHtml(formatCurrency(Number(order.total_amount) || 0))}</span>
           </div>
           <div class="total-row">
+            <span>طريقة الدفع</span>
+            <span>${escapeHtml(paymentMethodLabel(order.payment_method))}</span>
+          </div>
+          ${isCash ? `
+          <div class="total-row">
             <span>المدفوع</span>
-            <span>${paid.toFixed(2)} ج.م</span>
+            <span>${escapeHtml(formatCurrency(Number(order.paid_amount ?? order.total_amount) || 0))}</span>
           </div>
           <div class="total-row">
             <span>الباقي</span>
-            <span>${change.toFixed(2)} ج.م</span>
-          </div>
+            <span>${escapeHtml(formatCurrency(Number(order.change_amount) || 0))}</span>
+          </div>` : ''}
         </div>
         <div class="divider"></div>
         <div class="footer">
           <p>شكراً لزيارتكم</p>
         </div>
-        <script>window.onload = function() { window.print(); }</script>
       </body>
       </html>
     `
-    
+
     const printWindow = window.open('', '_blank', 'width=400,height=600')
-    if (printWindow) {
-      printWindow.document.write(receiptContent)
-      printWindow.document.close()
+    if (!printWindow) {
+      alert('تعذر فتح نافذة الطباعة. اسمح بالنوافذ المنبثقة لهذا الموقع')
+      return
     }
+    printWindow.opener = null
+    printWindow.document.write(receiptContent)
+    printWindow.document.close()
+    printWindow.focus()
+    setTimeout(() => printWindow.print(), 250)
   }
 
   // Print last order
   const handlePrintLastOrder = () => {
     if (lastOrder) {
-      printReceipt(lastOrder.orderNumber, lastOrder.items, lastOrder.total, lastOrder.paid)
+      printReceipt(lastOrder)
     }
   }
 
   const handlePayment = async (method: OrderPaymentMethod) => {
-    if (!user?.branch_id || cart.items.length === 0) return
-
-    setProcessing(true)
-    
-    console.log('Creating order with data:', {
-      branch_id: user.branch_id,
-      cashier_id: user.id,
-      shift_id: currentShift?.id,
-      items: cart.items
-    })
-    
-    // Create order with shift
-    const { data: order, error } = await ordersService.createWithShift({
-      branch_id: user.branch_id,
-      cashier_id: user.id,
-      shift_id: currentShift?.id,
-      items: cart.items.map(item => ({
-        item_id: item.item.id,
-        quantity: item.quantity,
-        unit_price: item.item.price,
-        notes: item.notes,
-      })),
-    })
-
-    console.log('Order creation result:', { order, error })
-
-    if (error || !order) {
-      console.error('Order creation failed:', error)
-      alert('فشل في إنشاء الطلب: ' + (error?.message || 'خطأ غير معروف'))
-      setProcessing(false)
+    if (busy.current || !user?.branch_id || cart.items.length === 0) return
+    if (!currentShift) {
+      alert('لا يوجد شيفت مفتوح. ابدأ شيفت جديد قبل البيع')
       return
     }
 
-    // Process payment
-    const { error: paymentError } = await ordersService.processPayment(order.id, method)
-    
-    if (paymentError) {
-      alert('فشل في معالجة الدفع')
-    } else {
-      // Save order info for printing
-      const paid = parseFloat(paidAmount) || cart.total
-      setLastOrder({
-        orderNumber: order.order_number,
-        items: [...cart.items],
-        total: cart.total,
-        paid: paid,
-        change: paid - cart.total,
-      })
-      cart.clearCart()
-      setShowPayment(false)
-      setPaidAmount('')
-      
-      // Refresh menu items to update stock quantities
-      await fetchData()
-      
-      // Ask to print
-      if (confirm(`تم إنشاء الطلب رقم ${order.order_number} بنجاح\n\nهل تريد طباعة الفاتورة؟`)) {
-        printReceipt(order.order_number, [...cart.items], cart.total, paid)
+    let paid: number | null = null
+    if (method === 'cash' && paidAmount.trim() !== '') {
+      if (paidValue === null || paidValue < 0) {
+        alert('أدخل مبلغاً مدفوعاً صحيحاً')
+        return
+      }
+      paid = roundMoney(paidValue)
+      if (paid < cart.total) {
+        alert(`المبلغ المدفوع أقل من الإجمالي. المتبقي على العميل: ${formatCurrency(roundMoney(cart.total - paid))}`)
+        return
       }
     }
-    
+
+    if (!checkoutKey.current) checkoutKey.current = crypto.randomUUID()
+    busy.current = true
+    setProcessing(true)
+
+    const submitted = cart.items.map(item => ({
+      item_id: item.item.item_id,
+      quantity: item.quantity,
+      notes: item.notes,
+    }))
+    const expectedTotal = cart.total
+    const { data: order, error } = await ordersService.checkout({
+      shiftId: currentShift.id,
+      items: submitted,
+      paymentMethod: method,
+      paidAmount: paid,
+      clientRequestId: checkoutKey.current,
+      expectedTotal,
+    })
+
+    busy.current = false
+    if (error || !order) {
+      setProcessing(false)
+      const message = toUserMessage(error, 'فشل في إتمام البيع')
+      if (hasHint(error, 'PRICE_CHANGED')) {
+        // Prices changed since the screen loaded: reload them into the cart so the cashier sees the real total
+        const fresh = await fetchData()
+        const removed = fresh ? cart.refreshItems(fresh) : []
+        alert(message + (removed.length ? `\nتم حذف أصناف لم تعد متاحة: ${removed.join('، ')}` : ''))
+        return
+      }
+      if (hasHint(error, 'SHIFT_CLOSED')) await checkOpenShift()
+      if (isInsufficientStock(error)) await fetchData()
+      alert(message)
+      return
+    }
+
+    checkoutKey.current = null
+    setLastOrder(order)
+    setShowPayment(false)
+    setPaidAmount('')
     setProcessing(false)
+
+    // Refresh menu items to update stock quantities
+    fetchData()
+
+    // A retry got back the order an earlier attempt saved (its answer was lost). If the cart was changed since,
+    // that order is not what is on screen: keep the cart (it was NOT sold) and say exactly what was sold.
+    if (order.duplicate &&
+        (!sameQuantities(quantitiesByItem(order.items), quantitiesByItem(submitted)) ||
+         roundMoney(Number(order.total_amount) || 0) !== expectedTotal)) {
+      const sold = order.items.map(i => `- ${i.name_ar || 'صنف'} × ${formatNumber(i.quantity)}`).join('\n')
+      alert(
+        `تنبيه: محاولة دفع سابقة تم حفظها بالفعل كطلب رقم ${order.order_number}\n` +
+        `(${formatCurrency(Number(order.total_amount) || 0)} - ${paymentMethodLabel(order.payment_method)}) وفيه:\n${sold}\n\n` +
+        `السلة الحالية لم تُبَع. احذف منها ما بيع في الطلب السابق، ثم ادفع الباقي كطلب جديد.`
+      )
+      return
+    }
+
+    cart.clearCart()
+    // For a retry, the change is for the amount entered now (the earlier attempt may have carried another)
+    const changeDue = order.duplicate
+      ? (method === 'cash' && paid !== null ? roundMoney(paid - expectedTotal) : 0)
+      : (order.payment_method === 'cash' ? Number(order.change_amount) || 0 : 0)
+    const changeText = changeDue > 0 ? `\nالباقي للعميل: ${formatCurrency(changeDue)}` : ''
+    const methodNote = order.duplicate && order.payment_method !== method
+      ? `\nمسجل بطريقة دفع: ${paymentMethodLabel(order.payment_method)} (يمكن للمدير تعديلها من شاشة الأوردرات)`
+      : ''
+    const title = order.duplicate
+      ? `هذا الطلب مسجل بالفعل برقم ${order.order_number}${methodNote}`
+      : `تم إنشاء الطلب رقم ${order.order_number} بنجاح`
+    if (confirm(`${title}${changeText}\n\nهل تريد طباعة الفاتورة؟`)) {
+      printReceipt(order)
+    }
   }
 
   if (loading) {
@@ -374,7 +494,7 @@ export default function POSCashier() {
               </div>
               <div className="flex items-center gap-2 text-gray-600">
                 <DollarSign className="w-4 h-4" />
-                <span>رصيد الافتتاح: {formatCurrency(currentShift.opening_amount)}</span>
+                <span>رصيد الافتتاح: {formatCurrency(Number(currentShift.opening_amount) || 0)}</span>
               </div>
             </div>
             <button
@@ -386,11 +506,25 @@ export default function POSCashier() {
               إنهاء الشيفت
             </button>
           </>
+        ) : shiftError ? (
+          <>
+            <div className="flex items-center gap-2 text-red-600">
+              <div className="w-3 h-3 bg-red-500 rounded-full" />
+              <span className="font-medium">{shiftError}</span>
+            </div>
+            <button
+              type="button"
+              onClick={checkOpenShift}
+              className="flex items-center gap-2 px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700"
+            >
+              إعادة المحاولة
+            </button>
+          </>
         ) : (
           <>
             <div className="flex items-center gap-2 text-orange-600">
               <div className="w-3 h-3 bg-orange-500 rounded-full" />
-              <span className="font-medium">لا يوجد شيفت مفتوح</span>
+              <span className="font-medium">لا يوجد شيفت مفتوح - ابدأ شيفت قبل البيع</span>
             </div>
             <button
               type="button"
@@ -455,6 +589,12 @@ export default function POSCashier() {
                 setSearchTerm(e.target.value)
                 setSelectedCategory(null) // Clear category when searching
               }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') {
+                  e.preventDefault()
+                  handleSearchEnter()
+                }
+              }}
               className="w-full pr-10 pl-4 py-2 border border-gray-300 rounded-lg"
             />
           </div>
@@ -495,7 +635,19 @@ export default function POSCashier() {
 
         {/* Menu Items Grid */}
         <div className="flex-1 overflow-y-auto">
-          {filteredItems.length === 0 ? (
+          {loadError ? (
+            <div className="flex flex-col items-center justify-center h-full text-red-600 gap-3">
+              <Package className="w-16 h-16 opacity-50" />
+              <p className="text-lg">{loadError}</p>
+              <button
+                type="button"
+                onClick={() => fetchData()}
+                className="px-4 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700"
+              >
+                إعادة المحاولة
+              </button>
+            </div>
+          ) : filteredItems.length === 0 ? (
             <div className="flex flex-col items-center justify-center h-full text-gray-500">
               <Package className="w-16 h-16 mb-4 opacity-50" />
               <p className="text-lg">لا توجد عناصر</p>
@@ -503,19 +655,18 @@ export default function POSCashier() {
           ) : (
             <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-4 gap-3">
               {filteredItems.map(item => {
-                  const stockQty = (item as any).stock_quantity || 0
-                  const inStock = (item as any).in_stock || false
-                  const isRecipe = (item as any).is_recipe || false
-                  
+                  const inStock = item.in_stock
+                  const stockText = item.has_stock_row ? `متاح: ${formatNumber(roundQuantity(item.stock_quantity))}` : ''
+
                   return (
                     <button
                       type="button"
-                      key={item.id}
+                      key={item.item_id}
                       onClick={() => inStock && handleAddToCart(item)}
                       disabled={!inStock}
                       className={`bg-white rounded-lg p-4 text-right transition-shadow border ${
-                        inStock 
-                          ? 'border-gray-100 hover:shadow-md cursor-pointer' 
+                        inStock
+                          ? 'border-gray-100 hover:shadow-md cursor-pointer'
                           : 'border-red-200 bg-red-50 opacity-60 cursor-not-allowed'
                       }`}
                     >
@@ -530,9 +681,9 @@ export default function POSCashier() {
                       <p className="text-blue-600 font-bold mb-1">{formatCurrency(item.price)}</p>
                       <div className="flex items-center justify-between">
                         <div className={`text-xs font-medium ${inStock ? 'text-green-600' : 'text-red-600'}`}>
-                          {isRecipe ? 'وصفة' : inStock ? `متاح: ${stockQty.toFixed(2)}` : 'غير متاح'}
+                          {!inStock ? 'غير متاح' : item.is_recipe ? (stockText ? `وصفة - ${stockText}` : 'وصفة') : stockText}
                         </div>
-                        {isRecipe && <ChefHat className="w-4 h-4 text-orange-500" />}
+                        {item.is_recipe && <ChefHat className="w-4 h-4 text-orange-500" />}
                       </div>
                     </button>
                   )
@@ -550,7 +701,7 @@ export default function POSCashier() {
             <ShoppingCart className="w-5 h-5 text-blue-600" />
             <h2 className="font-bold text-gray-900">السلة</h2>
             <span className="mr-auto bg-blue-100 text-blue-600 px-2 py-0.5 rounded-full text-sm">
-              {cart.itemCount}
+              {formatNumber(cart.itemCount)}
             </span>
           </div>
         </div>
@@ -588,7 +739,7 @@ export default function POSCashier() {
                   >
                     <Minus className="w-4 h-4" />
                   </button>
-                  <span className="w-8 text-center font-medium">{item.quantity}</span>
+                  <span className="w-8 text-center font-medium">{formatNumber(item.quantity)}</span>
                   <button
                     type="button"
                     onClick={() => handleUpdateQuantity(item.id, item.quantity + 1)}
@@ -598,7 +749,7 @@ export default function POSCashier() {
                     <Plus className="w-4 h-4" />
                   </button>
                   <span className="mr-auto font-bold text-gray-900">
-                    {formatCurrency(item.item.price * item.quantity)}
+                    {formatCurrency(roundMoney(item.item.price * item.quantity))}
                   </span>
                 </div>
               </div>
@@ -627,7 +778,8 @@ export default function POSCashier() {
             <button
               type="button"
               onClick={() => setShowPayment(true)}
-              disabled={cart.items.length === 0}
+              disabled={cart.items.length === 0 || !currentShift}
+              title={!currentShift ? 'ابدأ شيفت قبل البيع' : undefined}
               className={`${lastOrder ? 'flex-1' : 'w-full'} py-3 bg-blue-600 text-white font-medium rounded-lg hover:bg-blue-700 transition-colors disabled:opacity-50 disabled:cursor-not-allowed`}
             >
               الدفع
@@ -651,13 +803,15 @@ export default function POSCashier() {
             <div className="mb-6">
               <label className="block text-sm font-medium text-gray-700 mb-2">رصيد الافتتاح (الدرج)</label>
               <input
-                type="number"
+                type="text"
+                inputMode="decimal"
                 value={openingAmount}
                 onChange={(e) => setOpeningAmount(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') handleStartShift() }}
                 placeholder="0"
                 className="w-full px-4 py-3 text-lg border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500"
                 aria-label="رصيد الافتتاح"
-                min="0"
+                autoFocus
               />
             </div>
             <button
@@ -685,18 +839,19 @@ export default function POSCashier() {
             </div>
             <div className="mb-4 p-4 bg-gray-50 rounded-lg">
               <p className="text-sm text-gray-600 mb-1">رصيد الافتتاح</p>
-              <p className="text-lg font-bold">{formatCurrency(currentShift?.opening_amount || 0)}</p>
+              <p className="text-lg font-bold">{formatCurrency(Number(currentShift?.opening_amount) || 0)}</p>
             </div>
             <div className="mb-4">
               <label className="block text-sm font-medium text-gray-700 mb-2">المبلغ الفعلي في الدرج</label>
               <input
-                type="number"
+                type="text"
+                inputMode="decimal"
                 value={closingAmount}
                 onChange={(e) => setClosingAmount(e.target.value)}
                 placeholder="أدخل المبلغ الفعلي"
                 className="w-full px-4 py-3 text-lg border border-gray-300 rounded-lg focus:ring-2 focus:ring-red-500"
                 aria-label="المبلغ الفعلي"
-                min="0"
+                autoFocus
               />
             </div>
             <div className="mb-6">
@@ -712,7 +867,7 @@ export default function POSCashier() {
             <button
               type="button"
               onClick={handleEndShift}
-              disabled={processing || !closingAmount}
+              disabled={processing || !closingAmount.trim()}
               className="w-full py-3 bg-red-600 text-white font-medium rounded-lg hover:bg-red-700 disabled:opacity-50 flex items-center justify-center gap-2"
             >
               {processing ? <span className="w-5 h-5 border-2 border-white border-t-transparent rounded-full animate-spin" /> : <Square className="w-5 h-5" />}
@@ -734,7 +889,8 @@ export default function POSCashier() {
                   setShowPayment(false)
                   setPaidAmount('')
                 }}
-                className="p-2 hover:bg-gray-100 rounded-lg"
+                disabled={processing}
+                className="p-2 hover:bg-gray-100 rounded-lg disabled:opacity-50"
                 title="إغلاق"
               >
                 <X className="w-5 h-5" />
@@ -749,33 +905,43 @@ export default function POSCashier() {
               </div>
             </div>
 
-            {/* Paid Amount Input */}
+            {/* Paid Amount Input (cash) */}
             <div className="mb-4">
               <label className="block text-sm font-medium text-gray-700 mb-2">
-                المبلغ المدفوع
+                المبلغ المدفوع (نقدي)
               </label>
               <input
-                type="number"
+                type="text"
+                inputMode="decimal"
                 value={paidAmount}
                 onChange={(e) => setPaidAmount(e.target.value)}
-                placeholder="أدخل المبلغ المدفوع"
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault()
+                    handlePayment('cash')
+                  }
+                }}
+                placeholder="أدخل المبلغ المدفوع (Enter = دفع نقدي)"
                 className="w-full px-4 py-3 text-lg border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
                 aria-label="المبلغ المدفوع"
-                min="0"
-                step="0.01"
+                autoFocus
               />
             </div>
 
             {/* Change Amount */}
-            {paidAmount && parseFloat(paidAmount) > 0 && (
-              <div className={`mb-4 p-4 rounded-lg ${changeAmount >= 0 ? 'bg-green-50' : 'bg-red-50'}`}>
-                <div className="flex justify-between text-lg font-bold">
-                  <span>{changeAmount >= 0 ? 'الباقي' : 'المتبقي على العميل'}</span>
-                  <span className={changeAmount >= 0 ? 'text-green-600' : 'text-red-600'}>
-                    {formatCurrency(Math.abs(changeAmount))}
-                  </span>
+            {paidAmount.trim() !== '' && (
+              paidValue === null || paidValue < 0 ? (
+                <div className="mb-4 p-4 rounded-lg bg-red-50 text-red-600 font-medium">المبلغ المدخل غير صحيح</div>
+              ) : paidValue > 0 && (
+                <div className={`mb-4 p-4 rounded-lg ${changeAmount >= 0 ? 'bg-green-50' : 'bg-red-50'}`}>
+                  <div className="flex justify-between text-lg font-bold">
+                    <span>{changeAmount >= 0 ? 'الباقي' : 'المتبقي على العميل'}</span>
+                    <span className={changeAmount >= 0 ? 'text-green-600' : 'text-red-600'}>
+                      {formatCurrency(Math.abs(changeAmount))}
+                    </span>
+                  </div>
                 </div>
-              </div>
+              )
             )}
 
             {/* Quick Amount Buttons */}
@@ -787,12 +953,12 @@ export default function POSCashier() {
                   onClick={() => setPaidAmount(String(amount))}
                   className="py-2 px-3 bg-gray-100 hover:bg-gray-200 rounded-lg text-sm font-medium"
                 >
-                  {amount}
+                  {formatNumber(amount)}
                 </button>
               ))}
               <button
                 type="button"
-                onClick={() => setPaidAmount(String(cart.total))}
+                onClick={() => setPaidAmount(cart.total.toFixed(2))}
                 className="py-2 px-3 bg-blue-100 hover:bg-blue-200 text-blue-700 rounded-lg text-sm font-medium"
               >
                 بالضبط
@@ -804,25 +970,25 @@ export default function POSCashier() {
                 icon={Banknote}
                 label="نقدي"
                 onClick={() => handlePayment('cash')}
-                disabled={processing}
+                disabled={processing || !currentShift || cashUnderpaid}
               />
               <PaymentButton
                 icon={CreditCard}
                 label="فيزا"
                 onClick={() => handlePayment('visa')}
-                disabled={processing}
+                disabled={processing || !currentShift}
               />
               <PaymentButton
                 icon={Smartphone}
                 label="انستاباي"
                 onClick={() => handlePayment('instapay')}
-                disabled={processing}
+                disabled={processing || !currentShift}
               />
               <PaymentButton
                 icon={Wallet}
                 label="محفظة"
                 onClick={() => handlePayment('wallet')}
-                disabled={processing}
+                disabled={processing || !currentShift}
               />
             </div>
 

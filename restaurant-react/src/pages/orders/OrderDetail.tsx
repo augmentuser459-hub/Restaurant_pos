@@ -1,6 +1,10 @@
 import { useState, useEffect } from 'react';
 import { useParams, useNavigate, Link } from 'react-router-dom';
 import { ordersService, OrderWithDetails } from '../../services/orders.service';
+import { APP_TIME_ZONE } from '../../lib/dates';
+import { toUserMessage } from '../../lib/errors';
+import { formatNumber } from '../../lib/utils';
+import { orderStatusColor, orderStatusLabel, paymentMethodLabel } from './orderLabels';
 import {
   ArrowRight,
   ShoppingCart,
@@ -13,48 +17,27 @@ import {
   Package,
 } from 'lucide-react';
 
-const STATUS_LABELS: Record<string, string> = {
-  new: 'جديد',
-  pending_payment: 'في انتظار الدفع',
-  paid: 'مدفوع',
-  in_kitchen: 'في المطبخ',
-  preparing: 'قيد التحضير',
-  ready: 'جاهز',
-  delivered: 'تم التسليم',
-  completed: 'مكتمل',
-  cancelled: 'ملغي',
-};
-
-const STATUS_COLORS: Record<string, string> = {
-  new: 'bg-blue-100 text-blue-700',
-  pending_payment: 'bg-yellow-100 text-yellow-700',
-  paid: 'bg-green-100 text-green-700',
-  in_kitchen: 'bg-orange-100 text-orange-700',
-  preparing: 'bg-purple-100 text-purple-700',
-  ready: 'bg-teal-100 text-teal-700',
-  delivered: 'bg-gray-100 text-gray-700',
-  completed: 'bg-gray-100 text-gray-700',
-  cancelled: 'bg-red-100 text-red-700',
-};
-
 export default function OrderDetail() {
   const { id } = useParams();
   const navigate = useNavigate();
   const [order, setOrder] = useState<OrderWithDetails | null>(null);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState('');
 
   useEffect(() => {
     if (id) fetchOrder(id);
   }, [id]);
 
   const fetchOrder = async (orderId: string) => {
-    const { data } = await ordersService.getById(orderId);
+    const { data, error: fetchError } = await ordersService.getById(orderId);
+    if (fetchError) setError(toUserMessage(fetchError, 'تعذر تحميل الأوردر'));
     setOrder(data);
     setLoading(false);
   };
 
   const formatDate = (date: string) => {
     return new Date(date).toLocaleDateString('ar-EG', {
+      timeZone: APP_TIME_ZONE,
       year: 'numeric',
       month: 'long',
       day: 'numeric',
@@ -63,7 +46,7 @@ export default function OrderDetail() {
     });
   };
 
-  const formatCurrency = (amount: number) => (amount || 0).toLocaleString('ar-EG') + ' ج.م';
+  const formatCurrency = (amount: number | null | undefined) => (Number(amount) || 0).toLocaleString('ar-EG') + ' ج.م';
 
   if (loading) {
     return (
@@ -77,7 +60,7 @@ export default function OrderDetail() {
     return (
       <div className="text-center py-12">
         <ShoppingCart className="w-12 h-12 text-gray-300 mx-auto mb-4" />
-        <p className="text-gray-500">الأوردر غير موجود</p>
+        <p className={error ? 'text-red-600' : 'text-gray-500'}>{error || 'الأوردر غير موجود'}</p>
       </div>
     );
   }
@@ -99,10 +82,12 @@ export default function OrderDetail() {
           </div>
         </div>
         <div className="flex items-center gap-2">
-          <Link to={`/orders/${id}/edit`} className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700">
-            <Edit className="w-4 h-4" />
-            تعديل
-          </Link>
+          {order.status !== 'cancelled' && (
+            <Link to={`/orders/${id}/edit`} className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700">
+              <Edit className="w-4 h-4" />
+              تعديل
+            </Link>
+          )}
         </div>
       </div>
 
@@ -113,10 +98,13 @@ export default function OrderDetail() {
           <div className="bg-white rounded-lg shadow-sm border border-gray-100 p-6">
             <div className="flex items-center justify-between">
               <h2 className="text-lg font-semibold text-gray-900">حالة الأوردر</h2>
-              <span className={`px-4 py-2 rounded-lg text-sm font-medium ${STATUS_COLORS[order.status] || 'bg-gray-100'}`}>
-                {STATUS_LABELS[order.status] || order.status}
+              <span className={`px-4 py-2 rounded-lg text-sm font-medium ${orderStatusColor(order.status)}`}>
+                {orderStatusLabel(order.status)}
               </span>
             </div>
+            {order.status === 'cancelled' && order.cancellation_reason && (
+              <p className="mt-3 text-sm text-red-600">سبب الإلغاء: {order.cancellation_reason}</p>
+            )}
           </div>
 
           {/* Order Items */}
@@ -135,13 +123,13 @@ export default function OrderDetail() {
                 </tr>
               </thead>
               <tbody>
-                {order.items?.map((item, index) => (
-                  <tr key={index} className="border-b border-gray-100">
+                {order.items?.map((item) => (
+                  <tr key={item.id} className="border-b border-gray-100">
                     <td className="py-3">
-                      <p className="font-medium">{item.menu_item?.name_ar || '-'}</p>
+                      <p className="font-medium">{item.item?.name_ar ?? item.menu_item?.name_ar ?? '-'}</p>
                       {item.notes && <p className="text-sm text-gray-500">{item.notes}</p>}
                     </td>
-                    <td className="py-3 text-center">{item.quantity}</td>
+                    <td className="py-3 text-center">{formatNumber(item.quantity)}</td>
                     <td className="py-3">{formatCurrency(item.unit_price)}</td>
                     <td className="py-3 font-medium">{formatCurrency(item.total_price)}</td>
                   </tr>
@@ -151,7 +139,7 @@ export default function OrderDetail() {
           </div>
 
           {/* Notes */}
-          {(order.notes || (order as unknown as Record<string, string>).kitchen_notes) && (
+          {(order.notes || order.kitchen_notes) && (
             <div className="bg-white rounded-lg shadow-sm border border-gray-100 p-6">
               <h2 className="text-lg font-semibold text-gray-900 mb-4">ملاحظات</h2>
               {order.notes && (
@@ -160,10 +148,10 @@ export default function OrderDetail() {
                   <p className="text-gray-700">{order.notes}</p>
                 </div>
               )}
-              {(order as unknown as Record<string, string>).kitchen_notes && (
+              {order.kitchen_notes && (
                 <div>
                   <p className="text-sm text-gray-500 mb-1">ملاحظات المطبخ</p>
-                  <p className="text-gray-700">{(order as unknown as Record<string, string>).kitchen_notes}</p>
+                  <p className="text-gray-700">{order.kitchen_notes}</p>
                 </div>
               )}
             </div>
@@ -181,9 +169,9 @@ export default function OrderDetail() {
                 <span>{formatCurrency(order.subtotal)}</span>
               </div>
 
-              {order.discount_amount > 0 && (
+              {Number(order.discount_amount) > 0 && (
                 <div className="flex justify-between text-red-600">
-                  <span>الخصم</span>
+                  <span>الخصم{order.discount_reason ? ` (${order.discount_reason})` : ''}</span>
                   <span>-{formatCurrency(order.discount_amount)}</span>
                 </div>
               )}
@@ -191,6 +179,18 @@ export default function OrderDetail() {
                 <span>الإجمالي</span>
                 <span className="text-green-600">{formatCurrency(order.total_amount)}</span>
               </div>
+              {order.payment_method === 'cash' && order.paid_amount != null && (
+                <>
+                  <div className="flex justify-between text-sm text-gray-600">
+                    <span>المدفوع</span>
+                    <span>{formatCurrency(order.paid_amount)}</span>
+                  </div>
+                  <div className="flex justify-between text-sm text-gray-600">
+                    <span>الباقي</span>
+                    <span>{formatCurrency(order.change_amount)}</span>
+                  </div>
+                </>
+              )}
             </div>
           </div>
 
@@ -216,11 +216,7 @@ export default function OrderDetail() {
                 <CreditCard className="w-5 h-5 text-gray-400" />
                 <div>
                   <p className="text-sm text-gray-500">طريقة الدفع</p>
-                  <p className="font-medium">
-                    {order.payment_method === 'cash' ? 'كاش' : 
-                     order.payment_method === 'visa' ? 'فيزا' : 
-                     order.payment_method || '-'}
-                  </p>
+                  <p className="font-medium">{paymentMethodLabel(order.payment_method)}</p>
                 </div>
               </div>
               <div className="flex items-center gap-3">
