@@ -1,4 +1,9 @@
 import { supabase } from '../lib/supabase'
+import { todayLocal } from '../lib/dates'
+
+// Reports are aggregated in the database (report_* functions in 050_purchasing.sql): no 1000-row cap,
+// Cairo calendar days with an inclusive end day, and revenue from paid, not cancelled orders only.
+// Dates are passed as YYYY-MM-DD strings.
 
 export interface SalesReportData {
   totalOrders: number
@@ -8,6 +13,8 @@ export interface SalesReportData {
   ordersByPaymentMethod: { method: string; count: number; total: number }[]
   dailySales: { date: string; orders: number; revenue: number }[]
   topItems: { item_id: string; name_ar: string; quantity: number; revenue: number }[]
+  cancelledOrders: { count: number; total: number }
+  unpaidOrders: { count: number; total: number }
 }
 
 export interface InventoryReportData {
@@ -19,166 +26,135 @@ export interface InventoryReportData {
   stockMovements: { date: string; in: number; out: number }[]
 }
 
+export interface PerformanceData {
+  sales: { total: number; count: number; avgOrder: number }
+  inventory: { totalItems: number; lowStock: number; outOfStock: number; value: number }
+  transfers: { total: number; pending: number; completed: number }
+  damages: { total: number; value: number }
+  suppliers: { totalSupplies: number; totalPayments: number; balance: number }
+  branches: { id: string; name: string; orders: number; revenue: number }[]
+}
+
+export interface StatementTransaction {
+  id: string
+  date: string
+  kind: string
+  type: 'supply' | 'payment' | 'return'
+  reference: string
+  description: string
+  debit: number  // مدين (مشتريات / مديونية)
+  credit: number // دائن (مدفوعات / مرتجعات)
+  balance: number
+}
+
+export interface SupplierStatementData {
+  supplier: {
+    id: string
+    code: string
+    name: string
+    name_ar: string | null
+    phone: string | null
+    current_balance: number
+    credit_limit: number
+    status: string
+  }
+  openingBalance: number
+  transactions: StatementTransaction[]
+  totalDebit: number
+  totalCredit: number
+  closingBalance: number
+  // Period totals per kind: opening + purchases + manual debts - payments - returns = closing
+  manualDebtTotal: number
+  totalPurchases: number // credit purchase orders (net of cancellations) + unpaid part of supplies
+  totalPayments: number  // purchase-order payments + supplier payments
+  totalReturns: number   // approved supplier returns
+}
+
+export interface SuppliersSummaryData {
+  totalSupplies: number
+  totalSuppliesValue: number
+  totalPayments: number
+  totalPaymentsValue: number
+  totalReturnsValue: number
+  totalManualDebts: number
+  openingBalance: number
+  balance: number
+  supplies: {
+    id: string
+    supply_number: string
+    supplier: string
+    total_amount: number
+    supply_date: string
+    kind: string
+    description: string
+    payment_status: 'paid' | 'partial' | 'pending' | 'cancelled' | null
+  }[]
+  payments: {
+    id: string
+    payment_number: string
+    supplier: string
+    amount: number
+    payment_date: string
+    payment_method: string
+    description: string
+  }[]
+  bySupplier: {
+    supplier_id: string
+    supplier: string
+    opening: number
+    supplies: number
+    manual_debts: number
+    payments: number
+    returns: number
+    balance: number
+  }[]
+}
+
+/** Cairo date n months before today (YYYY-MM-DD), for default report ranges. */
+export function monthsAgoLocal(months: number): string {
+  const [y, m, d] = todayLocal().split('-').map(Number)
+  return new Date(Date.UTC(y, m - 1 - months, d)).toISOString().slice(0, 10)
+}
+
+/** Returns an Arabic message when a report date range cannot be queried yet (e.g. while a date is being typed). */
+export function dateRangeError(from: string, to: string): string | null {
+  const valid = (v: string) => /^\d{4}-\d{2}-\d{2}$/.test(v) && Number(v.slice(0, 4)) >= 2000 && Number(v.slice(0, 4)) <= 2100
+  if (!valid(from) || !valid(to)) return 'أدخل تاريخ البداية وتاريخ النهاية بشكل صحيح'
+  if (from > to) return 'تاريخ البداية بعد تاريخ النهاية'
+  return null
+}
+
 export const reportsService = {
-  // Sales Report
   async getSalesReport(startDate: string, endDate: string, branchId?: string) {
-    // Get orders in date range
-    let ordersQuery = supabase
-      .from('orders')
-      .select('*')
-      .gte('created_at', startDate)
-      .lte('created_at', endDate)
-
-    if (branchId) {
-      ordersQuery = ordersQuery.eq('branch_id', branchId)
-    }
-
-    const { data: orders } = await ordersQuery
-
-    if (!orders) return { data: null, error: new Error('Failed to fetch orders') }
-
-    // Calculate stats
-    const totalOrders = orders.length
-    const totalRevenue = orders.reduce((sum, o) => sum + (o.total_amount || 0), 0)
-    const averageOrderValue = totalOrders > 0 ? totalRevenue / totalOrders : 0
-
-    // Orders by status
-    const statusCounts: Record<string, number> = {}
-    orders.forEach(o => {
-      statusCounts[o.status] = (statusCounts[o.status] || 0) + 1
+    const { data, error } = await supabase.rpc('report_sales', {
+      p_from: startDate,
+      p_to: endDate,
+      p_branch_id: branchId ?? null,
     })
-    const ordersByStatus = Object.entries(statusCounts).map(([status, count]) => ({ status, count }))
-
-    // Orders by payment method
-    const paymentCounts: Record<string, { count: number; total: number }> = {}
-    orders.forEach(o => {
-      const method = o.payment_method || 'unknown'
-      if (!paymentCounts[method]) paymentCounts[method] = { count: 0, total: 0 }
-      paymentCounts[method].count++
-      paymentCounts[method].total += o.total_amount || 0
-    })
-    const ordersByPaymentMethod = Object.entries(paymentCounts).map(([method, data]) => ({
-      method,
-      count: data.count,
-      total: data.total,
-    }))
-
-    // Daily sales
-    const dailyData: Record<string, { orders: number; revenue: number }> = {}
-    orders.forEach(o => {
-      const date = o.created_at.split('T')[0]
-      if (!dailyData[date]) dailyData[date] = { orders: 0, revenue: 0 }
-      dailyData[date].orders++
-      dailyData[date].revenue += o.total_amount || 0
-    })
-    const dailySales = Object.entries(dailyData)
-      .map(([date, data]) => ({ date, ...data }))
-      .sort((a, b) => a.date.localeCompare(b.date))
-
-    // Top items
-    const orderIds = orders.map(o => o.id)
-    const { data: orderItems } = await supabase
-      .from('order_items')
-      .select('*, item:items(name_ar)')
-      .in('order_id', orderIds)
-
-    const itemStats: Record<string, { name_ar: string; quantity: number; revenue: number }> = {}
-    orderItems?.forEach(item => {
-      if (!itemStats[item.item_id]) {
-        itemStats[item.item_id] = { name_ar: item.item?.name_ar || '', quantity: 0, revenue: 0 }
-      }
-      itemStats[item.item_id].quantity += item.quantity
-      itemStats[item.item_id].revenue += item.total_price || 0
-    })
-    const topItems = Object.entries(itemStats)
-      .map(([item_id, data]) => ({ item_id, ...data }))
-      .sort((a, b) => b.revenue - a.revenue)
-      .slice(0, 10)
-
-    const data: SalesReportData = {
-      totalOrders,
-      totalRevenue,
-      averageOrderValue,
-      ordersByStatus,
-      ordersByPaymentMethod,
-      dailySales,
-      topItems,
-    }
-
-    return { data, error: null }
+    return { data: error ? null : (data as SalesReportData), error }
   },
 
-  // Inventory Report
   async getInventoryReport(branchId?: string) {
-    let inventoryQuery = supabase
-      .from('inventory')
-      .select('*, item:items(*, category:categories(name_ar))')
-
-    if (branchId) {
-      inventoryQuery = inventoryQuery.eq('branch_id', branchId)
-    }
-
-    const { data: inventory } = await inventoryQuery
-
-    if (!inventory) return { data: null, error: new Error('Failed to fetch inventory') }
-
-    const totalItems = inventory.length
-    const lowStockItems = inventory.filter(i => i.quantity < (i.item?.min_stock_level || 10)).length
-    const outOfStockItems = inventory.filter(i => i.quantity <= 0).length
-    const totalValue = inventory.reduce((sum, i) => sum + (i.quantity * (i.item?.purchase_price || 0)), 0)
-
-    // Items by category
-    const categoryStats: Record<string, { count: number; value: number }> = {}
-    inventory.forEach(i => {
-      const category = i.item?.category?.name_ar || 'غير مصنف'
-      if (!categoryStats[category]) categoryStats[category] = { count: 0, value: 0 }
-      categoryStats[category].count++
-      categoryStats[category].value += i.quantity * (i.item?.purchase_price || 0)
-    })
-    const itemsByCategory = Object.entries(categoryStats).map(([category, data]) => ({
-      category,
-      ...data,
-    }))
-
-    const data: InventoryReportData = {
-      totalItems,
-      lowStockItems,
-      outOfStockItems,
-      totalValue,
-      itemsByCategory,
-      stockMovements: [],
-    }
-
-    return { data, error: null }
+    const { data, error } = await supabase.rpc('report_inventory', { p_branch_id: branchId ?? null })
+    return { data: error ? null : (data as InventoryReportData), error }
   },
 
-  // Supplier Report
-  async getSupplierReport(startDate: string, endDate: string) {
-    const { data: supplies } = await supabase
-      .from('supplies')
-      .select('*, supplier:suppliers(name_ar)')
-      .gte('supply_date', startDate)
-      .lte('supply_date', endDate)
+  async getPerformanceReport(startDate: string, endDate: string) {
+    const { data, error } = await supabase.rpc('report_performance', { p_from: startDate, p_to: endDate })
+    return { data: error ? null : (data as PerformanceData), error }
+  },
 
-    const { data: payments } = await supabase
-      .from('payments')
-      .select('*, supplier:suppliers(name_ar)')
-      .gte('payment_date', startDate)
-      .lte('payment_date', endDate)
+  async getSupplierStatement(supplierId: string, startDate: string, endDate: string) {
+    const { data, error } = await supabase.rpc('report_supplier_statement', {
+      p_supplier_id: supplierId,
+      p_from: startDate,
+      p_to: endDate,
+    })
+    return { data: error ? null : (data as SupplierStatementData), error }
+  },
 
-    const totalSupplies = supplies?.reduce((sum, s) => sum + (s.total_amount || 0), 0) || 0
-    const totalPayments = payments?.reduce((sum, p) => sum + (p.amount || 0), 0) || 0
-
-    return {
-      data: {
-        totalSupplies,
-        totalPayments,
-        suppliesCount: supplies?.length || 0,
-        paymentsCount: payments?.length || 0,
-        supplies: supplies || [],
-        payments: payments || [],
-      },
-      error: null,
-    }
+  async getSuppliersSummary(startDate: string, endDate: string) {
+    const { data, error } = await supabase.rpc('report_suppliers_summary', { p_from: startDate, p_to: endDate })
+    return { data: error ? null : (data as SuppliersSummaryData), error }
   },
 }

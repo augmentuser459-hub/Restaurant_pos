@@ -1,58 +1,54 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { suppliersService } from '../../services/suppliers.service'
 import { Supplier } from '../../types/database.types'
-import { formatCurrency } from '../../lib/utils'
-import { supabase } from '../../lib/supabase'
-import { Plus, Edit, Trash2, Truck, Phone, Mail, User, CreditCard, DollarSign, X } from 'lucide-react'
+import { formatCurrency, parseDecimal, roundMoney } from '../../lib/utils'
+import { toUserMessage } from '../../lib/errors'
+import { Plus, Edit, Trash2, Truck, Phone, Mail, User, CreditCard, DollarSign, X, PackagePlus, Wallet, FileText, AlertCircle } from 'lucide-react'
 
 export default function SupplierList() {
   const [suppliers, setSuppliers] = useState<Supplier[]>([])
-  const [debtTransactions, setDebtTransactions] = useState<Record<string, any[]>>({})
+  // All-time manual debt per supplier (for the "base + manual" display)
+  const [manualDebts, setManualDebts] = useState<Record<string, number>>({})
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
   const [deleteId, setDeleteId] = useState<string | null>(null)
   const [showDebtModal, setShowDebtModal] = useState(false)
   const [selectedSupplier, setSelectedSupplier] = useState<Supplier | null>(null)
-  const [debtAmount, setDebtAmount] = useState(0)
+  const [debtAmount, setDebtAmount] = useState('')
   const [debtNotes, setDebtNotes] = useState('')
   const [processing, setProcessing] = useState(false)
+  const processingRef = useRef(false)
 
   useEffect(() => {
     fetchSuppliers()
   }, [])
 
   const fetchSuppliers = async () => {
-    const { data } = await suppliersService.getAll()
-    setSuppliers(data || [])
-    
-    // Fetch debt transactions for all suppliers
-    if (data && data.length > 0) {
-      const { data: transactions } = await supabase
-        .from('supplier_debt_transactions')
-        .select('*')
-        .in('supplier_id', data.map(s => s.id))
-        .gt('amount', 0)
-        .order('created_at', { ascending: true })
-      
-      if (transactions) {
-        const grouped = transactions.reduce((acc, t) => {
-          if (!acc[t.supplier_id]) acc[t.supplier_id] = []
-          acc[t.supplier_id].push(t)
-          return acc
-        }, {} as Record<string, any[]>)
-        setDebtTransactions(grouped)
-      }
+    const [suppliersRes, debtsRes] = await Promise.all([
+      suppliersService.getAll(),
+      suppliersService.getManualDebts(),
+    ])
+    const loadError = suppliersRes.error || debtsRes.error
+    setError(loadError ? 'فشل في تحميل الموردين: ' + toUserMessage(loadError) : '')
+    setSuppliers(suppliersRes.data || [])
+
+    const totals: Record<string, number> = {}
+    for (const d of debtsRes.data || []) {
+      if (Number(d.amount) > 0) totals[d.supplier_id] = roundMoney((totals[d.supplier_id] || 0) + Number(d.amount))
     }
-    
+    setManualDebts(totals)
     setLoading(false)
   }
 
   const handleDelete = async (id: string) => {
     if (!confirm('هل أنت متأكد من حذف هذا المورد؟')) return
-    
+
     setDeleteId(id)
     const { error } = await suppliersService.delete(id)
-    if (!error) {
+    if (error) {
+      alert('فشل في حذف المورد: ' + toUserMessage(error))
+    } else {
       setSuppliers(suppliers.filter(s => s.id !== id))
     }
     setDeleteId(null)
@@ -60,53 +56,36 @@ export default function SupplierList() {
 
   const handleOpenDebtModal = (supplier: Supplier) => {
     setSelectedSupplier(supplier)
-    setDebtAmount(0)
+    setDebtAmount('')
     setDebtNotes('')
     setShowDebtModal(true)
   }
 
+  const parsedDebt = parseDecimal(debtAmount)
+  const debtValue = parsedDebt !== null && parsedDebt > 0 ? roundMoney(parsedDebt) : 0
+
   const handleAddDebt = async () => {
-    if (!selectedSupplier || debtAmount <= 0) {
+    if (processingRef.current) return
+    if (!selectedSupplier || debtValue <= 0) {
       alert('يجب إدخال مبلغ صحيح')
       return
     }
 
+    processingRef.current = true
     setProcessing(true)
-    
-    const newBalance = (selectedSupplier.current_balance || 0) + debtAmount
-    
-    // Update supplier balance
-    const { error: balanceError } = await supabase
-      .from('suppliers')
-      .update({ 
-        current_balance: newBalance,
-        updated_at: new Date().toISOString()
-      })
-      .eq('id', selectedSupplier.id)
 
-    if (balanceError) {
-      alert('فشل في إضافة المديونية: ' + balanceError.message)
-      setProcessing(false)
-      return
+    // The balance is increased in the database (current_balance + amount, under a row lock) together with
+    // the manual-debt record, so a payment made meanwhile is never overwritten.
+    const { error } = await suppliersService.addManualDebt(selectedSupplier.id, debtValue, debtNotes || undefined)
+
+    if (error) {
+      alert('فشل في إضافة المديونية: ' + toUserMessage(error))
+    } else {
+      alert('تمت إضافة المديونية بنجاح')
+      setShowDebtModal(false)
+      await fetchSuppliers()
     }
-
-    // Record debt transaction
-    const { error: transactionError } = await supabase
-      .from('supplier_debt_transactions')
-      .insert({
-        supplier_id: selectedSupplier.id,
-        transaction_type: 'manual_debt',
-        amount: debtAmount,
-        description: debtNotes || 'إضافة مديونية يدوية',
-      })
-
-    if (transactionError) {
-      console.error('Failed to record transaction:', transactionError)
-    }
-
-    alert('تمت إضافة المديونية بنجاح')
-    setShowDebtModal(false)
-    fetchSuppliers()
+    processingRef.current = false
     setProcessing(false)
   }
 
@@ -142,14 +121,37 @@ export default function SupplierList() {
           <h1 className="text-2xl font-bold text-gray-900">الموردين</h1>
           <p className="text-gray-600">إدارة الموردين والتوريدات</p>
         </div>
-        <Link
-          to="/suppliers/new"
-          className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
-        >
-          <Plus className="w-5 h-5" />
-          مورد جديد
-        </Link>
+        <div className="flex items-center gap-2">
+          <Link
+            to="/supplies/new"
+            className="flex items-center gap-2 px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors"
+          >
+            <PackagePlus className="w-5 h-5" />
+            توريد جديد
+          </Link>
+          <Link
+            to="/payments/new"
+            className="flex items-center gap-2 px-4 py-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-700 transition-colors"
+          >
+            <Wallet className="w-5 h-5" />
+            دفعة جديدة
+          </Link>
+          <Link
+            to="/suppliers/new"
+            className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors"
+          >
+            <Plus className="w-5 h-5" />
+            مورد جديد
+          </Link>
+        </div>
       </div>
+
+      {error && (
+        <div className="p-4 bg-red-50 border border-red-200 rounded-lg flex items-center gap-3">
+          <AlertCircle className="w-5 h-5 text-red-500 shrink-0" />
+          <p className="text-red-700">{error}</p>
+        </div>
+      )}
 
       {/* Suppliers Table */}
       <div className="bg-white rounded-lg shadow-sm border border-gray-100 overflow-hidden">
@@ -165,18 +167,22 @@ export default function SupplierList() {
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-100">
-              {suppliers.map((supplier) => (
+              {suppliers.map((supplier) => {
+                const balance = roundMoney(Number(supplier.current_balance || 0))
+                const manualDebtTotal = manualDebts[supplier.id] || 0
+                const baseDebt = roundMoney(balance - manualDebtTotal)
+                return (
                 <tr key={supplier.id} className="hover:bg-gray-50">
                   <td className="px-6 py-4">
-                    <div className="flex items-center gap-3">
+                    <Link to={`/suppliers/${supplier.id}`} className="flex items-center gap-3 group">
                       <div className="w-10 h-10 bg-green-100 rounded-lg flex items-center justify-center">
                         <Truck className="w-5 h-5 text-green-600" />
                       </div>
                       <div>
-                        <p className="font-medium text-gray-900">{supplier.name_ar}</p>
+                        <p className="font-medium text-gray-900 group-hover:text-blue-600">{supplier.name_ar}</p>
                         <p className="text-sm text-gray-500">{supplier.code}</p>
                       </div>
-                    </div>
+                    </Link>
                   </td>
                   <td className="px-6 py-4">
                     <div className="space-y-1 text-sm">
@@ -201,58 +207,67 @@ export default function SupplierList() {
                     </div>
                   </td>
                   <td className="px-6 py-4">
-                    {(() => {
-                      const transactions = debtTransactions[supplier.id] || []
-                      const manualDebtTotal = transactions
-                        .filter(t => t.transaction_type === 'manual_debt')
-                        .reduce((sum, t) => sum + Number(t.amount), 0)
-                      
-                      const baseDebt = supplier.current_balance - manualDebtTotal
-                      
-                      if (manualDebtTotal > 0 && supplier.current_balance > 0) {
-                        // Show: 500 + 140 (base + manual additions)
-                        return (
-                          <div>
-                            <div className="flex items-center gap-2">
-                              <CreditCard className="w-4 h-4 text-red-500" />
-                              <span className="font-medium text-lg text-red-600">
-                                {formatCurrency(baseDebt)} + {formatCurrency(manualDebtTotal)}
-                              </span>
-                            </div>
-                            <p className="text-xs text-red-500 mt-1">
-                              = {formatCurrency(supplier.current_balance)} مستحق للمورد
-                            </p>
-                          </div>
-                        )
-                      } else {
-                        // Show simple balance
-                        return (
-                          <div>
-                            <div className="flex items-center gap-2">
-                              <CreditCard className={`w-4 h-4 ${supplier.current_balance > 0 ? 'text-red-500' : 'text-green-500'}`} />
-                              <span className={`font-medium text-lg ${supplier.current_balance > 0 ? 'text-red-600' : 'text-green-600'}`}>
-                                {formatCurrency(Math.abs(supplier.current_balance))}
-                              </span>
-                            </div>
-                            {supplier.current_balance > 0 && (
-                              <p className="text-xs text-red-500 mt-1">مستحق للمورد</p>
-                            )}
-                            {supplier.current_balance < 0 && (
-                              <p className="text-xs text-green-500 mt-1">مدفوع زيادة</p>
-                            )}
-                            {supplier.current_balance === 0 && (
-                              <p className="text-xs text-gray-500 mt-1">لا يوجد مديونية</p>
-                            )}
-                          </div>
-                        )
-                      }
-                    })()}
+                    {manualDebtTotal > 0 && balance > 0 && baseDebt >= 0 ? (
+                      // Show: 500 + 140 (base + manual additions); a negative base (payments above the
+                      // other purchases) would be misleading, so then only the balance is shown
+                      <div>
+                        <div className="flex items-center gap-2">
+                          <CreditCard className="w-4 h-4 text-red-500" />
+                          <span className="font-medium text-lg text-red-600">
+                            {formatCurrency(baseDebt)} + {formatCurrency(manualDebtTotal)}
+                          </span>
+                        </div>
+                        <p className="text-xs text-red-500 mt-1">
+                          = {formatCurrency(balance)} مستحق للمورد
+                        </p>
+                      </div>
+                    ) : (
+                      // Show simple balance
+                      <div>
+                        <div className="flex items-center gap-2">
+                          <CreditCard className={`w-4 h-4 ${balance > 0 ? 'text-red-500' : 'text-green-500'}`} />
+                          <span className={`font-medium text-lg ${balance > 0 ? 'text-red-600' : 'text-green-600'}`}>
+                            {formatCurrency(Math.abs(balance))}
+                          </span>
+                        </div>
+                        {balance > 0 && (
+                          <p className="text-xs text-red-500 mt-1">مستحق للمورد</p>
+                        )}
+                        {balance < 0 && (
+                          <p className="text-xs text-green-500 mt-1">مدفوع زيادة</p>
+                        )}
+                        {balance === 0 && (
+                          <p className="text-xs text-gray-500 mt-1">لا يوجد مديونية</p>
+                        )}
+                      </div>
+                    )}
                   </td>
                   <td className="px-6 py-4">
                     {getStatusBadge(supplier.status)}
                   </td>
                   <td className="px-6 py-4">
                     <div className="flex items-center gap-2">
+                      <Link
+                        to={`/suppliers/${supplier.id}/supply`}
+                        className="p-1.5 text-green-600 hover:bg-green-50 rounded-lg transition-colors"
+                        title="توريد جديد"
+                      >
+                        <PackagePlus className="w-4 h-4" />
+                      </Link>
+                      <Link
+                        to={`/suppliers/${supplier.id}/payment`}
+                        className="p-1.5 text-indigo-600 hover:bg-indigo-50 rounded-lg transition-colors"
+                        title="دفعة جديدة"
+                      >
+                        <Wallet className="w-4 h-4" />
+                      </Link>
+                      <Link
+                        to={`/reports/supplier-statement?supplier=${supplier.id}`}
+                        className="p-1.5 text-gray-600 hover:bg-gray-100 rounded-lg transition-colors"
+                        title="كشف حساب"
+                      >
+                        <FileText className="w-4 h-4" />
+                      </Link>
                       <button
                         type="button"
                         onClick={() => handleOpenDebtModal(supplier)}
@@ -280,12 +295,13 @@ export default function SupplierList() {
                     </div>
                   </td>
                 </tr>
-              ))}
+                )
+              })}
             </tbody>
           </table>
         </div>
 
-        {suppliers.length === 0 && (
+        {suppliers.length === 0 && !error && (
           <div className="text-center py-12">
             <Truck className="w-12 h-12 text-gray-400 mx-auto mb-4" />
             <h3 className="text-lg font-medium text-gray-900 mb-2">لا يوجد موردين</h3>
@@ -315,25 +331,25 @@ export default function SupplierList() {
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-2">المبلغ المضاف <span className="text-red-500">*</span></label>
                 <input
-                  type="number"
-                  min="0"
-                  step="0.01"
+                  type="text"
+                  inputMode="decimal"
                   value={debtAmount}
-                  onChange={(e) => setDebtAmount(Number(e.target.value))}
+                  onChange={(e) => setDebtAmount(e.target.value)}
                   className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500"
                   placeholder="0.00"
+                  dir="ltr"
                 />
               </div>
-              
+
               {/* Calculation Display */}
               <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
                 <p className="text-sm text-gray-600 mb-2">الحساب:</p>
                 <div className="flex items-center justify-center gap-3 text-lg font-medium">
-                  <span className="text-gray-900">{formatCurrency(selectedSupplier.current_balance || 0)}</span>
+                  <span className="text-gray-900">{formatCurrency(Number(selectedSupplier.current_balance || 0))}</span>
                   <span className="text-blue-600">+</span>
-                  <span className="text-orange-600">{formatCurrency(debtAmount)}</span>
+                  <span className="text-orange-600">{formatCurrency(debtValue)}</span>
                   <span className="text-gray-400">=</span>
-                  <span className="text-red-600 font-bold">{formatCurrency((selectedSupplier.current_balance || 0) + debtAmount)}</span>
+                  <span className="text-red-600 font-bold">{formatCurrency(roundMoney(Number(selectedSupplier.current_balance || 0) + debtValue))}</span>
                 </div>
                 <p className="text-xs text-gray-500 text-center mt-2">
                   المديونية الحالية + المبلغ المضاف = المديونية الجديدة
@@ -355,7 +371,7 @@ export default function SupplierList() {
               <button
                 type="button"
                 onClick={handleAddDebt}
-                disabled={processing || debtAmount <= 0}
+                disabled={processing || debtValue <= 0}
                 className="flex-1 px-6 py-2 bg-orange-600 text-white rounded-lg hover:bg-orange-700 disabled:opacity-50"
               >
                 {processing ? 'جاري الحفظ...' : 'إضافة المديونية'}

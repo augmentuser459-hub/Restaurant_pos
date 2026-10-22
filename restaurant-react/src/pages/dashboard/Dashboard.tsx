@@ -3,7 +3,8 @@ import { Link } from 'react-router-dom'
 import { useAuth } from '../../contexts/AuthContext'
 import { dashboardService, DashboardStats } from '../../services/dashboard.service'
 import StatCard from '../../components/ui/StatCard'
-import { formatCurrency } from '../../lib/utils'
+import { formatCurrency, formatNumber } from '../../lib/utils'
+import { toUserMessage } from '../../lib/errors'
 import {
   Building2,
   Truck,
@@ -30,14 +31,16 @@ export default function Dashboard() {
             ? (user.role as { name: string }).name
             : user?.role
         const branchId = userRole !== 'admin' ? user?.branch_id : undefined
-        const { data, error: fetchError } = await dashboardService.getStats(branchId)
+        const { data, error: fetchError } = await dashboardService.getStats(branchId || undefined)
         if (fetchError) {
-          setError(fetchError.message)
+          setStats(null)
+          setError(toUserMessage(fetchError))
         } else {
+          setError(null)
           setStats(data)
         }
       } catch (err) {
-        setError(err instanceof Error ? err.message : 'حدث خطأ')
+        setError(toUserMessage(err))
       } finally {
         setLoading(false)
       }
@@ -73,19 +76,19 @@ export default function Dashboard() {
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <StatCard
           title="الفروع"
-          value={stats?.totalBranches || 0}
+          value={formatNumber(stats?.totalBranches || 0)}
           icon={Building2}
           color="blue"
         />
         <StatCard
           title="الموردين"
-          value={stats?.totalSuppliers || 0}
+          value={formatNumber(stats?.totalSuppliers || 0)}
           icon={Truck}
           color="green"
         />
         <StatCard
           title="الأصناف"
-          value={stats?.totalItems || 0}
+          value={formatNumber(stats?.totalItems || 0)}
           icon={Package}
           color="purple"
         />
@@ -101,25 +104,25 @@ export default function Dashboard() {
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <StatCard
           title="طلبات اليوم"
-          value={stats?.todayOrders || 0}
+          value={formatNumber(stats?.todayOrders || 0)}
           icon={ShoppingCart}
           color="blue"
         />
         <StatCard
           title="تحويلات معلقة"
-          value={stats?.pendingTransfers || 0}
+          value={formatNumber(stats?.pendingTransfers || 0)}
           icon={ArrowLeftRight}
           color="yellow"
         />
         <StatCard
           title="تالف معلق"
-          value={stats?.pendingDamages || 0}
+          value={formatNumber(stats?.pendingDamages || 0)}
           icon={AlertTriangle}
           color="red"
         />
         <StatCard
           title="مخزون منخفض"
-          value={stats?.lowStockItems || 0}
+          value={formatNumber(stats?.lowStockItems || 0)}
           icon={TrendingDown}
           color="red"
         />

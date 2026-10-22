@@ -3,26 +3,39 @@ import { useNavigate, useParams } from 'react-router-dom'
 import { suppliersService, CreateSupplyData } from '../../services/suppliers.service'
 import { branchesService } from '../../services/branches.service'
 import { inventoryService } from '../../services/inventory.service'
-import { useAuth } from '../../contexts/AuthContext'
-import { Supplier, Branch, Item, PaymentMethod, PaymentStatus } from '../../types/database.types'
+import { Supplier, Branch, Item, PaymentMethod } from '../../types/database.types'
+import { parseDecimal, roundMoney, roundQuantity } from '../../lib/utils'
+import { todayLocal } from '../../lib/dates'
+import { toUserMessage } from '../../lib/errors'
+import { findItemsByScan } from '../inventory/stockHelpers'
 import { Save, ArrowRight, AlertCircle, Plus, Trash2, Barcode, Search } from 'lucide-react'
 
+// Quantities and prices are kept as typed (Arabic digits allowed) and parsed with parseDecimal.
 interface SupplyItemForm {
   item_id: string
-  quantity: number
-  unit_price: number
+  quantity: string
+  unit_price: string
   expiry_date?: string
   batch_number?: string
+}
+
+const emptyRow = (): SupplyItemForm => ({ item_id: '', quantity: '1', unit_price: '' })
+
+const lineTotal = (row: SupplyItemForm) => {
+  const qty = parseDecimal(row.quantity)
+  const price = parseDecimal(row.unit_price)
+  if (qty === null || price === null || qty <= 0 || price < 0) return 0
+  return roundMoney(roundQuantity(qty) * roundMoney(price))
 }
 
 export default function SupplyForm() {
   const { supplierId } = useParams()
   const navigate = useNavigate()
-  const { user } = useAuth()
 
   const [loading, setLoading] = useState(false)
   const [fetchLoading, setFetchLoading] = useState(true)
   const [error, setError] = useState('')
+  const submittingRef = useRef(false)
 
   const [suppliers, setSuppliers] = useState<Supplier[]>([])
   const [branches, setBranches] = useState<Branch[]>([])
@@ -31,17 +44,14 @@ export default function SupplyForm() {
   const [formData, setFormData] = useState({
     supplier_id: supplierId || '',
     branch_id: '',
-    supply_date: new Date().toISOString().split('T')[0],
+    supply_date: todayLocal(),
     payment_method: 'cash' as PaymentMethod,
-    payment_status: 'pending' as PaymentStatus,
-    paid_amount: 0,
+    paid_amount: '',
     invoice_number: '',
     notes: '',
   })
 
-  const [supplyItems, setSupplyItems] = useState<SupplyItemForm[]>([
-    { item_id: '', quantity: 1, unit_price: 0 }
-  ])
+  const [supplyItems, setSupplyItems] = useState<SupplyItemForm[]>([emptyRow()])
   const [barcodeInput, setBarcodeInput] = useState('')
   const [barcodeError, setBarcodeError] = useState('')
   const barcodeInputRef = useRef<HTMLInputElement>(null)
@@ -57,6 +67,8 @@ export default function SupplyForm() {
       inventoryService.getAllItems()
     ])
 
+    const loadError = suppliersRes.error || branchesRes.error || itemsRes.error
+    if (loadError) setError('فشل في تحميل البيانات: ' + toUserMessage(loadError))
     if (suppliersRes.data) setSuppliers(suppliersRes.data)
     if (branchesRes.data) setBranches(branchesRes.data)
     if (itemsRes.data) setItems(itemsRes.data.filter(i => i.status === 'active'))
@@ -65,24 +77,29 @@ export default function SupplyForm() {
   }
 
 
+  // Only rows with a selected item are saved, so only they count in the total
   const calculateTotal = () => {
-    return supplyItems.reduce((sum, item) => sum + (item.quantity * item.unit_price), 0)
+    return roundMoney(supplyItems.filter(row => row.item_id).reduce((sum, row) => sum + lineTotal(row), 0))
   }
 
   const handleAddItem = () => {
-    setSupplyItems([...supplyItems, { item_id: '', quantity: 1, unit_price: 0 }])
+    setSupplyItems([...supplyItems, emptyRow()])
   }
 
   // Barcode search function
   const handleBarcodeSearch = () => {
-    if (!barcodeInput.trim()) return
+    const code = barcodeInput.trim()
+    if (!code) return
     setBarcodeError('')
 
-    // Search by barcode or code
-    const item = items.find(i => 
-      (i as Item & { barcode?: string }).barcode === barcodeInput.trim() || 
-      i.code === barcodeInput.trim()
-    )
+    // Matched like the cashier: barcode, then code (also codes stored in quotes, e.g. "6223000123456"),
+    // then the only partial match. Several matches = the user picks the item from the list.
+    const matches = findItemsByScan(items, code)
+    if (matches.length > 1) {
+      setBarcodeError(`يوجد ${matches.length} أصناف تطابق "${code}". اكتب الكود كاملاً أو اختر الصنف من القائمة`)
+      return
+    }
+    const item = matches[0]
 
     if (item) {
       // Check if item already exists in list
@@ -90,14 +107,15 @@ export default function SupplyForm() {
       if (existingIndex >= 0) {
         // Increment quantity
         const updated = [...supplyItems]
-        updated[existingIndex].quantity += 1
+        const current = parseDecimal(updated[existingIndex].quantity) ?? 0
+        updated[existingIndex] = { ...updated[existingIndex], quantity: String(roundQuantity(current + 1)) }
         setSupplyItems(updated)
       } else {
         // Add new item with purchase price
         const newItem: SupplyItemForm = {
           item_id: item.id,
-          quantity: 1,
-          unit_price: item.purchase_price || 0
+          quantity: '1',
+          unit_price: item.purchase_price ? String(item.purchase_price) : ''
         }
         // Replace empty item or add new
         const emptyIndex = supplyItems.findIndex(si => !si.item_id)
@@ -129,64 +147,101 @@ export default function SupplyForm() {
     }
   }
 
-  const handleItemChange = (index: number, field: keyof SupplyItemForm, value: string | number) => {
+  const handleItemChange = (index: number, field: keyof SupplyItemForm, value: string) => {
     const updated = [...supplyItems]
     updated[index] = { ...updated[index], [field]: value }
+    if (field === 'item_id' && value && !updated[index].unit_price) {
+      const selectedItem = items.find(i => i.id === value)
+      if (selectedItem?.purchase_price) updated[index].unit_price = String(selectedItem.purchase_price)
+    }
     setSupplyItems(updated)
   }
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault()
+    if (submittingRef.current) return
     setError('')
 
     // Validate items
-    const validItems = supplyItems.filter(item => item.item_id && item.quantity > 0)
-    if (validItems.length === 0) {
+    const lines: CreateSupplyData['items'] = []
+    for (let i = 0; i < supplyItems.length; i++) {
+      const row = supplyItems[i]
+      if (!row.item_id) {
+        if (row.unit_price.trim() !== '' && parseDecimal(row.unit_price) !== 0) {
+          setError(`السطر ${i + 1}: اختر الصنف أو احذف السطر`)
+          return
+        }
+        continue
+      }
+      const name = items.find(it => it.id === row.item_id)?.name_ar || `السطر ${i + 1}`
+      const qty = parseDecimal(row.quantity)
+      const price = row.unit_price.trim() === '' ? 0 : parseDecimal(row.unit_price)
+      if (qty === null || qty <= 0) {
+        setError(`الكمية غير صحيحة للصنف "${name}"`)
+        return
+      }
+      if (price === null || price < 0) {
+        setError(`سعر الوحدة غير صحيح للصنف "${name}"`)
+        return
+      }
+      lines.push({
+        item_id: row.item_id,
+        quantity: roundQuantity(qty),
+        unit_price: roundMoney(price),
+        expiry_date: row.expiry_date || undefined,
+        batch_number: row.batch_number || undefined,
+      })
+    }
+    if (lines.length === 0) {
       setError('يجب إضافة صنف واحد على الأقل')
       return
     }
 
     // Check for duplicate items
-    const itemIds = validItems.map(i => i.item_id)
+    const itemIds = lines.map(i => i.item_id)
     if (new Set(itemIds).size !== itemIds.length) {
       setError('لا يمكن تكرار نفس الصنف')
       return
     }
 
+    const totalAmount = calculateTotal()
+    // Cash supplies are paid in full on delivery; on credit the paid part is between 0 and the total
+    let paidAmount = totalAmount
+    if (formData.payment_method === 'credit') {
+      const paid = formData.paid_amount.trim() === '' ? 0 : parseDecimal(formData.paid_amount)
+      if (paid === null || paid < 0 || roundMoney(paid) > totalAmount) {
+        setError('المبلغ المدفوع يجب أن يكون بين صفر وإجمالي التوريد')
+        return
+      }
+      paidAmount = roundMoney(paid)
+    }
+
+    submittingRef.current = true
     setLoading(true)
 
-    const totalAmount = calculateTotal()
-    const supplyData: CreateSupplyData = {
+    // Supply, lines, stock (+ expiry batches) and the unpaid part as supplier debt are saved in one transaction
+    const { error: submitError } = await suppliersService.createSupply({
       supplier_id: formData.supplier_id,
       branch_id: formData.branch_id,
-      supply_date: formData.supply_date,
-      total_amount: totalAmount,
-      paid_amount: formData.paid_amount,
+      invoice_date: formData.supply_date,
       payment_method: formData.payment_method,
-      payment_status: formData.paid_amount >= totalAmount ? 'paid' : formData.paid_amount > 0 ? 'partial' : 'pending',
+      paid_amount: paidAmount,
       invoice_number: formData.invoice_number || undefined,
       notes: formData.notes || undefined,
-      created_by: user?.id || '',
-      items: validItems.map(item => ({
-        item_id: item.item_id,
-        quantity: item.quantity,
-        unit_price: item.unit_price,
-        expiry_date: item.expiry_date || undefined,
-        batch_number: item.batch_number || undefined,
-      }))
-    }
-
-    const { error: submitError } = await suppliersService.createSupply(supplyData)
+      items: lines,
+    })
 
     if (submitError) {
-      setError('فشل في حفظ التوريد')
-    } else {
-      navigate(supplierId ? `/suppliers/${supplierId}` : '/suppliers')
+      setError('فشل في حفظ التوريد: ' + toUserMessage(submitError))
+      setLoading(false)
+      submittingRef.current = false
+      return
     }
-    setLoading(false)
+    alert('تم حفظ التوريد وإضافة الكميات إلى المخزون')
+    navigate(`/suppliers/${formData.supplier_id}`)
   }
 
-  const handleChange = (field: string, value: string | number) => {
+  const handleChange = (field: string, value: string) => {
     setFormData(prev => ({ ...prev, [field]: value }))
   }
 
@@ -199,7 +254,9 @@ export default function SupplyForm() {
   }
 
   const totalAmount = calculateTotal()
-  const remainingAmount = totalAmount - formData.paid_amount
+  const paidInput = parseDecimal(formData.paid_amount)
+  const paidAmount = formData.payment_method === 'cash' ? totalAmount : roundMoney(paidInput !== null && paidInput > 0 ? paidInput : 0)
+  const remainingAmount = roundMoney(totalAmount - paidAmount)
 
   return (
     <div className="max-w-4xl mx-auto">
@@ -243,7 +300,7 @@ export default function SupplyForm() {
             </div>
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-2">تاريخ التوريد <span className="text-red-500">*</span></label>
-              <input type="date" value={formData.supply_date} onChange={(e) => handleChange('supply_date', e.target.value)} required
+              <input type="date" value={formData.supply_date} max={todayLocal()} onChange={(e) => handleChange('supply_date', e.target.value)} required
                 aria-label="تاريخ التوريد" className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500" dir="ltr" />
             </div>
             <div>
@@ -278,7 +335,7 @@ export default function SupplyForm() {
                 type="text"
                 value={barcodeInput}
                 onChange={(e) => setBarcodeInput(e.target.value)}
-                onKeyPress={handleBarcodeKeyPress}
+                onKeyDown={handleBarcodeKeyPress}
                 placeholder="امسح الباركود أو أدخل كود الصنف"
                 className="flex-1 px-4 py-2 border border-green-300 rounded-lg focus:ring-2 focus:ring-green-500"
                 dir="ltr"
@@ -320,15 +377,15 @@ export default function SupplyForm() {
                       </select>
                     </td>
                     <td className="py-3 px-2">
-                      <input type="number" min="0.001" step="0.001" value={item.quantity} onChange={(e) => handleItemChange(index, 'quantity', Number(e.target.value))}
+                      <input type="text" inputMode="decimal" value={item.quantity} onChange={(e) => handleItemChange(index, 'quantity', e.target.value)}
                         aria-label="الكمية" placeholder="مثال: 19.200" className="w-24 px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 text-sm" dir="ltr" />
                     </td>
                     <td className="py-3 px-2">
-                      <input type="number" min="0" step="0.01" value={item.unit_price} onChange={(e) => handleItemChange(index, 'unit_price', Number(e.target.value))}
-                        aria-label="سعر الوحدة" className="w-28 px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 text-sm" dir="ltr" />
+                      <input type="text" inputMode="decimal" value={item.unit_price} onChange={(e) => handleItemChange(index, 'unit_price', e.target.value)}
+                        aria-label="سعر الوحدة" placeholder="0.00" className="w-28 px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 text-sm" dir="ltr" />
                     </td>
                     <td className="py-3 px-2 text-sm font-medium text-gray-900">
-                      {(item.quantity * item.unit_price).toLocaleString('ar-EG')} ج.م
+                      {(item.item_id ? lineTotal(item) : 0).toLocaleString('ar-EG')} ج.م
                     </td>
                     <td className="py-3 px-2">
                       <input type="date" value={item.expiry_date || ''} onChange={(e) => handleItemChange(index, 'expiry_date', e.target.value)}
@@ -361,8 +418,14 @@ export default function SupplyForm() {
             </div>
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-2">المبلغ المدفوع</label>
-              <input type="number" min="0" step="0.01" value={formData.paid_amount} onChange={(e) => handleChange('paid_amount', Number(e.target.value))}
-                aria-label="المبلغ المدفوع" className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500" dir="ltr" />
+              {formData.payment_method === 'cash' ? (
+                <input type="text" value={totalAmount.toLocaleString('ar-EG')} disabled
+                  aria-label="المبلغ المدفوع" className="w-full px-4 py-2 border border-gray-300 rounded-lg bg-gray-50 text-gray-500" dir="ltr" />
+              ) : (
+                <input type="text" inputMode="decimal" value={formData.paid_amount} onChange={(e) => handleChange('paid_amount', e.target.value)}
+                  aria-label="المبلغ المدفوع" placeholder="0.00" className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500" dir="ltr" />
+              )}
+              {formData.payment_method === 'cash' && <p className="text-xs text-gray-500 mt-1">التوريد النقدي يُدفع بالكامل عند الاستلام</p>}
             </div>
             <div className="flex flex-col justify-end">
               <div className="bg-gray-50 rounded-lg p-4">
@@ -372,7 +435,7 @@ export default function SupplyForm() {
                 </div>
                 <div className="flex justify-between text-sm mb-2">
                   <span className="text-gray-600">المدفوع:</span>
-                  <span className="font-medium text-green-600">{formData.paid_amount.toLocaleString('ar-EG')} ج.م</span>
+                  <span className="font-medium text-green-600">{paidAmount.toLocaleString('ar-EG')} ج.م</span>
                 </div>
                 <div className="flex justify-between text-sm pt-2 border-t border-gray-200">
                   <span className="text-gray-600">المتبقي:</span>

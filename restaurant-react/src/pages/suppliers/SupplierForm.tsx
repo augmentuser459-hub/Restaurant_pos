@@ -1,8 +1,13 @@
-import { useState, useEffect, FormEvent } from 'react'
+import { useState, useEffect, useRef, FormEvent } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
 import { suppliersService, CreateSupplierData } from '../../services/suppliers.service'
 import { SupplierStatus, PaymentMethod } from '../../types/database.types'
+import { parseDecimal, roundMoney } from '../../lib/utils'
+import { toUserMessage } from '../../lib/errors'
 import { Save, ArrowRight, AlertCircle } from 'lucide-react'
+
+// The credit limit is kept as typed and parsed with parseDecimal on save
+type SupplierFormState = Omit<CreateSupplierData, 'credit_limit'> & { credit_limit: string }
 
 export default function SupplierForm() {
   const { id } = useParams()
@@ -12,8 +17,9 @@ export default function SupplierForm() {
   const [loading, setLoading] = useState(false)
   const [fetchLoading, setFetchLoading] = useState(isEdit)
   const [error, setError] = useState('')
+  const submittingRef = useRef(false)
 
-  const [formData, setFormData] = useState<CreateSupplierData>({
+  const [formData, setFormData] = useState<SupplierFormState>({
     code: '',
     name: '',
     name_ar: '',
@@ -22,7 +28,7 @@ export default function SupplierForm() {
     address: '',
     contact_person: '',
     payment_terms: 'cash',
-    credit_limit: 0,
+    credit_limit: '0',
     status: 'active',
     notes: '',
   })
@@ -36,18 +42,18 @@ export default function SupplierForm() {
   const fetchSupplier = async (supplierId: string) => {
     const { data, error } = await suppliersService.getById(supplierId)
     if (error) {
-      setError('فشل في تحميل بيانات المورد')
+      setError('فشل في تحميل بيانات المورد: ' + toUserMessage(error))
     } else if (data) {
       setFormData({
         code: data.code,
         name: data.name,
-        name_ar: data.name_ar,
+        name_ar: data.name_ar || '',
         phone: data.phone || '',
         email: data.email || '',
         address: data.address || '',
         contact_person: data.contact_person || '',
         payment_terms: data.payment_terms || 'cash',
-        credit_limit: data.credit_limit || 0,
+        credit_limit: String(data.credit_limit || 0),
         status: data.status,
         notes: data.notes || '',
       })
@@ -57,29 +63,34 @@ export default function SupplierForm() {
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault()
+    if (submittingRef.current) return
     setError('')
-    setLoading(true)
 
-    const { exists } = await suppliersService.codeExists(formData.code, id)
-    if (exists) {
-      setError('كود المورد موجود مسبقاً')
-      setLoading(false)
+    const creditLimit = formData.credit_limit.trim() === '' ? 0 : parseDecimal(formData.credit_limit)
+    if (creditLimit === null || creditLimit < 0) {
+      setError('حد الائتمان يجب أن يكون رقماً غير سالب (0 = بدون حد)')
       return
     }
 
+    submittingRef.current = true
+    setLoading(true)
+
+    // Duplicate codes are refused by the database with an Arabic message
+    const supplierData: CreateSupplierData = { ...formData, credit_limit: roundMoney(creditLimit) }
     const result = isEdit && id
-      ? await suppliersService.update(id, formData)
-      : await suppliersService.create(formData)
+      ? await suppliersService.update(id, supplierData)
+      : await suppliersService.create(supplierData)
 
     if (result.error) {
-      setError('فشل في حفظ البيانات')
-    } else {
-      navigate('/suppliers')
+      setError('فشل في حفظ البيانات: ' + toUserMessage(result.error))
+      setLoading(false)
+      submittingRef.current = false
+      return
     }
-    setLoading(false)
+    navigate('/suppliers')
   }
 
-  const handleChange = (field: keyof CreateSupplierData, value: string | number) => {
+  const handleChange = (field: keyof SupplierFormState, value: string) => {
     setFormData(prev => ({ ...prev, [field]: value }))
   }
 
@@ -94,7 +105,7 @@ export default function SupplierForm() {
   return (
     <div className="max-w-2xl mx-auto">
       <div className="flex items-center gap-4 mb-6">
-        <button onClick={() => navigate('/suppliers')} className="p-2 hover:bg-gray-100 rounded-lg" title="رجوع">
+        <button type="button" onClick={() => navigate('/suppliers')} className="p-2 hover:bg-gray-100 rounded-lg" title="رجوع">
           <ArrowRight className="w-5 h-5" />
         </button>
         <div>
@@ -167,8 +178,9 @@ export default function SupplierForm() {
           </div>
           <div>
             <label className="block text-sm font-medium text-gray-700 mb-2">حد الائتمان</label>
-            <input type="number" value={formData.credit_limit} onChange={(e) => handleChange('credit_limit', Number(e.target.value))}
-              className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500" placeholder="0" dir="ltr" />
+            <input type="text" inputMode="decimal" value={formData.credit_limit} onChange={(e) => handleChange('credit_limit', e.target.value)}
+              aria-label="حد الائتمان" className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500" placeholder="0" dir="ltr" />
+            <p className="text-xs text-gray-500 mt-1">0 = بدون حد. لا يمكن تجاوز الحد بأوامر الشراء الآجلة أو التوريدات أو المديونيات</p>
           </div>
           <div className="md:col-span-2">
             <label className="block text-sm font-medium text-gray-700 mb-2">ملاحظات</label>

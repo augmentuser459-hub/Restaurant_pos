@@ -1,28 +1,31 @@
-import { useState, useEffect, FormEvent } from 'react'
+import { useState, useEffect, useRef, FormEvent } from 'react'
 import { useNavigate, useParams } from 'react-router-dom'
-import { suppliersService, CreatePaymentData } from '../../services/suppliers.service'
-import { useAuth } from '../../contexts/AuthContext'
-import { Supplier, Supply } from '../../types/database.types'
+import { suppliersService, SupplyRecord, supplyOutstanding } from '../../services/suppliers.service'
+import { Supplier } from '../../types/database.types'
+import { formatCurrency, formatDate, parseDecimal, roundMoney } from '../../lib/utils'
+import { todayLocal } from '../../lib/dates'
+import { toUserMessage } from '../../lib/errors'
 import { Save, ArrowRight, AlertCircle, CreditCard } from 'lucide-react'
 
 export default function PaymentForm() {
   const { supplierId } = useParams()
   const navigate = useNavigate()
-  const { user } = useAuth()
 
   const [loading, setLoading] = useState(false)
   const [fetchLoading, setFetchLoading] = useState(true)
   const [error, setError] = useState('')
+  const submittingRef = useRef(false)
+  const supplierRef = useRef('')
 
   const [suppliers, setSuppliers] = useState<Supplier[]>([])
-  const [supplies, setSupplies] = useState<Supply[]>([])
+  const [supplies, setSupplies] = useState<SupplyRecord[]>([])
   const [selectedSupplier, setSelectedSupplier] = useState<Supplier | null>(null)
 
   const [formData, setFormData] = useState({
     supplier_id: supplierId || '',
     supply_id: '',
-    amount: 0,
-    payment_date: new Date().toISOString().split('T')[0],
+    amount: '',
+    payment_date: todayLocal(),
     payment_method: 'cash',
     reference_number: '',
     notes: '',
@@ -33,13 +36,18 @@ export default function PaymentForm() {
   }, [])
 
   useEffect(() => {
+    supplierRef.current = formData.supplier_id
+    setSelectedSupplier(null)
+    setSupplies([])
+    setFormData(prev => ({ ...prev, supply_id: '' }))
     if (formData.supplier_id) {
       fetchSupplierData(formData.supplier_id)
     }
   }, [formData.supplier_id])
 
   const fetchSuppliers = async () => {
-    const { data } = await suppliersService.getActive()
+    const { data, error } = await suppliersService.getActive()
+    if (error) setError('فشل في تحميل الموردين: ' + toUserMessage(error))
     if (data) setSuppliers(data)
     setFetchLoading(false)
   }
@@ -49,47 +57,64 @@ export default function PaymentForm() {
       suppliersService.getById(id),
       suppliersService.getSupplies(id)
     ])
+    if (supplierRef.current !== id) return // another supplier was picked meanwhile
+    const loadError = supplierRes.error || suppliesRes.error
+    if (loadError) setError('فشل في تحميل بيانات المورد: ' + toUserMessage(loadError))
     if (supplierRes.data) setSelectedSupplier(supplierRes.data)
     if (suppliesRes.data) {
-      // Filter unpaid/partial supplies
-      setSupplies(suppliesRes.data.filter(s => s.payment_status !== 'paid'))
+      // Supplies with something left to pay (approved returns already deducted)
+      setSupplies(suppliesRes.data.filter(s => supplyOutstanding(s) > 0))
     }
   }
 
+  const balance = roundMoney(Number(selectedSupplier?.current_balance || 0))
+  const selectedSupply = supplies.find(s => s.id === formData.supply_id)
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault()
+    if (submittingRef.current) return
     setError('')
 
-    if (formData.amount <= 0) {
+    const amount = parseDecimal(formData.amount)
+    if (amount === null || amount <= 0) {
       setError('يجب أن يكون المبلغ أكبر من صفر')
       return
     }
+    const value = roundMoney(amount)
+    if (selectedSupply && value > supplyOutstanding(selectedSupply)) {
+      setError(`المبلغ أكبر من المتبقي على التوريد (${formatCurrency(supplyOutstanding(selectedSupply))})`)
+      return
+    }
+    if (selectedSupplier && value > balance) {
+      setError(`المبلغ أكبر من مديونية المورد الحالية (${formatCurrency(balance)})`)
+      return
+    }
 
+    submittingRef.current = true
     setLoading(true)
 
-    const paymentData: CreatePaymentData = {
+    // Saved to supplier_payments; the supply's paid amount and the supplier balance change in the same transaction
+    const { error: submitError } = await suppliersService.createPayment({
       supplier_id: formData.supplier_id,
       supply_id: formData.supply_id || undefined,
-      amount: formData.amount,
+      amount: value,
       payment_date: formData.payment_date,
       payment_method: formData.payment_method,
       reference_number: formData.reference_number || undefined,
       notes: formData.notes || undefined,
-      created_by: user?.id || '',
-    }
-
-    const { error: submitError } = await suppliersService.createPayment(paymentData)
+    })
 
     if (submitError) {
-      setError('فشل في حفظ الدفعة')
-    } else {
-      navigate(supplierId ? `/suppliers/${supplierId}` : '/suppliers')
+      setError('فشل في حفظ الدفعة: ' + toUserMessage(submitError))
+      setLoading(false)
+      submittingRef.current = false
+      return
     }
-    setLoading(false)
+    alert('تم تسجيل الدفعة بنجاح')
+    navigate(`/suppliers/${formData.supplier_id}`)
   }
 
-  const handleChange = (field: string, value: string | number) => {
+  const handleChange = (field: string, value: string) => {
     setFormData(prev => ({ ...prev, [field]: value }))
   }
 
@@ -98,8 +123,9 @@ export default function PaymentForm() {
     if (supplyId) {
       const supply = supplies.find(s => s.id === supplyId)
       if (supply) {
-        const remaining = supply.total_amount - (supply.paid_amount || 0)
-        setFormData(prev => ({ ...prev, supply_id: supplyId, amount: remaining }))
+        // Prefill what can actually be paid: never more than the supplier's current balance
+        const suggested = selectedSupplier ? Math.min(supplyOutstanding(supply), Math.max(balance, 0)) : supplyOutstanding(supply)
+        setFormData(prev => ({ ...prev, supply_id: supplyId, amount: suggested > 0 ? String(roundMoney(suggested)) : '' }))
       }
     }
   }
@@ -134,7 +160,7 @@ export default function PaymentForm() {
       <form onSubmit={handleSubmit} className="space-y-6">
         <div className="bg-white rounded-lg shadow-sm border border-gray-100 p-6">
           <h2 className="text-lg font-semibold text-gray-900 mb-4">معلومات الدفعة</h2>
-          
+
           <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-2">المورد <span className="text-red-500">*</span></label>
@@ -147,7 +173,7 @@ export default function PaymentForm() {
 
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-2">تاريخ الدفع <span className="text-red-500">*</span></label>
-              <input type="date" value={formData.payment_date} onChange={(e) => handleChange('payment_date', e.target.value)} required
+              <input type="date" value={formData.payment_date} max={todayLocal()} onChange={(e) => handleChange('payment_date', e.target.value)} required
                 aria-label="تاريخ الدفع" className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500" dir="ltr" />
             </div>
 
@@ -157,7 +183,7 @@ export default function PaymentForm() {
                   <CreditCard className="w-5 h-5 text-blue-600" />
                   <div>
                     <p className="text-sm text-gray-600">الرصيد الحالي للمورد</p>
-                    <p className="text-xl font-bold text-blue-600">{selectedSupplier.current_balance.toLocaleString('ar-EG')} ج.م</p>
+                    <p className="text-xl font-bold text-blue-600">{balance.toLocaleString('ar-EG')} ج.م</p>
                   </div>
                 </div>
               </div>
@@ -171,7 +197,7 @@ export default function PaymentForm() {
                   <option value="">دفعة عامة (بدون ربط)</option>
                   {supplies.map(s => (
                     <option key={s.id} value={s.id}>
-                      {s.supply_number} - {new Date(s.supply_date).toLocaleDateString('ar-EG')} - متبقي: {(s.total_amount - (s.paid_amount || 0)).toLocaleString('ar-EG')} ج.م
+                      {s.supply_number} - {formatDate(s.invoice_date || s.created_at)} - متبقي: {formatCurrency(supplyOutstanding(s))}
                     </option>
                   ))}
                 </select>
@@ -181,8 +207,14 @@ export default function PaymentForm() {
 
             <div>
               <label className="block text-sm font-medium text-gray-700 mb-2">المبلغ <span className="text-red-500">*</span></label>
-              <input type="number" min="0.01" step="0.01" value={formData.amount} onChange={(e) => handleChange('amount', Number(e.target.value))} required
-                aria-label="المبلغ" className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500" dir="ltr" />
+              <input type="text" inputMode="decimal" value={formData.amount} onChange={(e) => handleChange('amount', e.target.value)} required
+                aria-label="المبلغ" placeholder="0.00" className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500" dir="ltr" />
+              {selectedSupply && (
+                <p className="text-xs text-gray-500 mt-1">
+                  المتبقي على التوريد: {formatCurrency(supplyOutstanding(selectedSupply))}
+                  {Number(selectedSupply.returned_amount || 0) > 0 && ` (بعد خصم مرتجعات ${formatCurrency(selectedSupply.returned_amount || 0)})`}
+                </p>
+              )}
             </div>
 
             <div>

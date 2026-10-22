@@ -1,11 +1,22 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useParams, Link } from 'react-router-dom'
 import { purchaseService, PurchaseOrderWithDetails } from '../../services/purchase.service'
-import { supabase } from '../../lib/supabase'
 import { useAuth } from '../../contexts/AuthContext'
-import { formatDate, formatCurrency, formatNumber } from '../../lib/utils'
+import { getUserRole } from '../../components/layout/roleAccess'
+import { formatDate, formatCurrency, formatNumber, formatQuantity, parseDecimal, roundMoney, roundQuantity } from '../../lib/utils'
+import { toUserMessage } from '../../lib/errors'
 import { ArrowRight, Package, CheckCircle, XCircle, Clock, Truck, FileText, DollarSign, Plus, X } from 'lucide-react'
 import type { PurchaseOrderPayment } from '../../types/database.types'
+
+const paymentMethodLabels: Record<string, string> = {
+  cash: 'كاش',
+  bank_transfer: 'تحويل بنكي',
+  check: 'شيك',
+}
+
+// Statuses in which goods can still be received / a credit order can be paid
+const RECEIVABLE = ['approved', 'sent', 'partially_received']
+const PAYABLE = ['approved', 'sent', 'partially_received', 'received']
 
 export default function PurchaseOrderDetail() {
   const { id } = useParams<{ id: string }>()
@@ -14,13 +25,16 @@ export default function PurchaseOrderDetail() {
   const [payments, setPayments] = useState<PurchaseOrderPayment[]>([])
   const [loading, setLoading] = useState(true)
   const [processing, setProcessing] = useState(false)
+  const processingRef = useRef(false)
   const [showPaymentModal, setShowPaymentModal] = useState(false)
   const [paymentData, setPaymentData] = useState({
-    amount: 0,
+    amount: '',
     payment_method: 'cash',
     reference_number: '',
     notes: ''
   })
+  const [showReceiveModal, setShowReceiveModal] = useState(false)
+  const [receiveQty, setReceiveQty] = useState<Record<string, string>>({})
 
   useEffect(() => {
     if (id) fetchOrder()
@@ -30,7 +44,7 @@ export default function PurchaseOrderDetail() {
     if (!id) return
     const { data, error } = await purchaseService.getOrderById(id)
     if (error) {
-      alert('فشل في تحميل أمر الشراء: ' + error.message)
+      alert('فشل في تحميل أمر الشراء: ' + toUserMessage(error))
     } else if (data) {
       setOrder(data)
       await fetchPayments(id)
@@ -39,123 +53,127 @@ export default function PurchaseOrderDetail() {
   }
 
   const fetchPayments = async (orderId: string) => {
-    const { data, error } = await supabase
-      .from('purchase_order_payments')
-      .select('*')
-      .eq('order_id', orderId)
-      .order('payment_date', { ascending: false })
-    
-    if (!error && data) {
-      setPayments(data)
+    const { data, error } = await purchaseService.getOrderPayments(orderId)
+    if (error) {
+      alert('فشل في تحميل الدفعات: ' + toUserMessage(error))
+      return
     }
+    setPayments(data)
   }
+
+  // Runs one action at a time (a double click cannot apply it twice; the database also checks the status).
+  const runAction = async (action: () => Promise<{ error: unknown }>, successMessage: string, failurePrefix: string) => {
+    if (processingRef.current) return false
+    processingRef.current = true
+    setProcessing(true)
+    let ok = false
+    try {
+      const { error } = await action()
+      if (error) {
+        alert(failurePrefix + toUserMessage(error))
+      } else {
+        ok = true
+        alert(successMessage)
+      }
+    } catch (err) {
+      alert(failurePrefix + toUserMessage(err))
+    }
+    await fetchOrder()
+    processingRef.current = false
+    setProcessing(false)
+    return ok
+  }
+
+  const remaining = order ? roundMoney(Number(order.total_amount || 0) - Number(order.paid_amount || 0)) : 0
 
   const handleAddPayment = async () => {
     if (!id || !user || !order) return
-    
-    if (paymentData.amount <= 0) {
+
+    const amount = parseDecimal(paymentData.amount)
+    if (amount === null || amount <= 0) {
       alert('يجب إدخال مبلغ صحيح')
       return
     }
-
-    if (paymentData.amount > (order.remaining_amount || 0)) {
+    if (roundMoney(amount) > remaining) {
       alert('المبلغ المدخل أكبر من المبلغ المتبقي')
       return
     }
 
-    setProcessing(true)
-    const paymentNumber = `PAY-${Date.now()}`
-
-    const { error } = await supabase
-      .from('purchase_order_payments')
-      .insert({
-        order_id: id,
-        payment_number: paymentNumber,
-        payment_date: new Date().toISOString(),
-        amount: paymentData.amount,
+    // Payment, the order's paid / remaining / status and the supplier balance are updated together
+    const ok = await runAction(
+      () => purchaseService.addPayment(id, {
+        amount: roundMoney(amount),
         payment_method: paymentData.payment_method,
-        reference_number: paymentData.reference_number || null,
-        notes: paymentData.notes || null,
-        created_by: user.id
-      })
-
-    if (error) {
-      alert('فشل في إضافة الدفعة: ' + error.message)
-    } else {
-      // Update supplier balance - reduce debt when payment is made
-      if (order.supplier?.id) {
-        const { data: supplier } = await supabase
-          .from('suppliers')
-          .select('current_balance')
-          .eq('id', order.supplier.id)
-          .single()
-        
-        if (supplier) {
-          const newBalance = (supplier.current_balance || 0) - paymentData.amount
-          await supabase
-            .from('suppliers')
-            .update({ 
-              current_balance: newBalance,
-              updated_at: new Date().toISOString()
-            })
-            .eq('id', order.supplier.id)
-          
-          console.log(`✅ Reduced supplier balance from ${supplier.current_balance} to ${newBalance} (-${paymentData.amount})`)
-        }
-      }
-      
-      alert('تمت إضافة الدفعة بنجاح')
+        reference_number: paymentData.reference_number || undefined,
+        notes: paymentData.notes || undefined,
+      }),
+      'تمت إضافة الدفعة بنجاح',
+      'فشل في إضافة الدفعة: '
+    )
+    if (ok) {
       setShowPaymentModal(false)
-      setPaymentData({ amount: 0, payment_method: 'cash', reference_number: '', notes: '' })
-      fetchOrder()
+      setPaymentData({ amount: '', payment_method: 'cash', reference_number: '', notes: '' })
     }
-    setProcessing(false)
   }
 
   const handleApprove = async () => {
-    if (!id || !user) return
+    if (!id || !user || !order) return
+    if (order.created_by === user.id && getUserRole(user) !== 'admin') return
     if (!confirm('هل تريد الموافقة على أمر الشراء؟')) return
-    
-    setProcessing(true)
-    const { error } = await purchaseService.approveOrder(id, user.id)
-    if (error) {
-      alert('فشل في الموافقة: ' + error.message)
-    } else {
-      alert('تمت الموافقة بنجاح')
-      fetchOrder()
-    }
-    setProcessing(false)
+    await runAction(() => purchaseService.approveOrder(id), 'تمت الموافقة بنجاح', 'فشل في الموافقة: ')
   }
 
   const handleReject = async () => {
     if (!id || !user) return
     const reason = prompt('سبب الرفض:')
-    if (!reason) return
-    
-    setProcessing(true)
-    const { error } = await purchaseService.rejectOrder(id, user.id, reason)
-    if (error) {
-      alert('فشل في الرفض: ' + error.message)
-    } else {
-      alert('تم الرفض')
-      fetchOrder()
+    if (!reason || !reason.trim()) return
+    await runAction(() => purchaseService.rejectOrder(id, reason.trim()), 'تم الرفض', 'فشل في الرفض: ')
+  }
+
+  const handleCancel = async () => {
+    if (!id || !user) return
+    const reason = prompt('سبب إلغاء أمر الشراء:')
+    if (!reason || !reason.trim()) return
+    await runAction(() => purchaseService.cancelOrder(id, reason.trim()), 'تم إلغاء أمر الشراء', 'فشل في الإلغاء: ')
+  }
+
+  const openReceiveModal = () => {
+    if (!order) return
+    const initial: Record<string, string> = {}
+    for (const line of order.items || []) {
+      initial[line.id] = String(roundQuantity(Number(line.quantity) - Number(line.received_quantity || 0)))
     }
-    setProcessing(false)
+    setReceiveQty(initial)
+    setShowReceiveModal(true)
   }
 
   const handleReceive = async () => {
-    if (!id || !user) return
-    if (!confirm('هل تم استلام البضاعة؟')) return
-    
-    setProcessing(true)
-    const { error } = await purchaseService.receiveOrder(id, user.id)
-    if (error) {
-      alert('فشل في تسجيل الاستلام: ' + error.message)
-    } else {
-      alert('تم تسجيل الاستلام بنجاح')
-      fetchOrder()
+    if (!id || !user || !order) return
+
+    const lines: { id: string; quantity: number }[] = []
+    for (const line of order.items || []) {
+      const outstanding = roundQuantity(Number(line.quantity) - Number(line.received_quantity || 0))
+      if (outstanding <= 0) continue
+      const qty = parseDecimal(receiveQty[line.id] ?? '0')
+      if (qty === null || qty < 0) {
+        alert(`الكمية غير صحيحة للصنف "${line.item?.name_ar || '-'}"`)
+        return
+      }
+      if (roundQuantity(qty) > outstanding) {
+        alert(`الكمية المستلمة للصنف "${line.item?.name_ar || '-'}" أكبر من المتبقي (${formatQuantity(outstanding)})`)
+        return
+      }
+      lines.push({ id: line.id, quantity: roundQuantity(qty) })
     }
-    setProcessing(false)
+    if (!lines.some(l => l.quantity > 0)) {
+      alert('أدخل كمية مستلمة لصنف واحد على الأقل')
+      return
+    }
+    if (!confirm('هل تم استلام البضاعة؟ سيتم إضافة الكميات إلى المخزون')) return
+
+    // Stock is added in the database (stock_adjust), only while the order is approved / partially received
+    const ok = await runAction(() => purchaseService.receiveOrder(id, lines), 'تم تسجيل الاستلام بنجاح', 'فشل في تسجيل الاستلام: ')
+    if (ok) setShowReceiveModal(false)
   }
 
   const getStatusBadge = (status: string) => {
@@ -164,11 +182,12 @@ export default function PurchaseOrderDetail() {
       pending: { bg: 'bg-yellow-100', text: 'text-yellow-800', icon: Clock, label: 'في انتظار الموافقة' },
       approved: { bg: 'bg-blue-100', text: 'text-blue-800', icon: CheckCircle, label: 'موافق عليه' },
       sent: { bg: 'bg-purple-100', text: 'text-purple-800', icon: Truck, label: 'تم الإرسال للمورد' },
+      partially_received: { bg: 'bg-purple-100', text: 'text-purple-800', icon: Package, label: 'استلام جزئي' },
       received: { bg: 'bg-green-100', text: 'text-green-800', icon: Package, label: 'تم الاستلام' },
       rejected: { bg: 'bg-red-100', text: 'text-red-800', icon: XCircle, label: 'مرفوض' },
       cancelled: { bg: 'bg-gray-100', text: 'text-gray-800', icon: XCircle, label: 'ملغي' },
     }
-    const c = config[status] || config.pending
+    const c = config[status] || { bg: 'bg-gray-100', text: 'text-gray-800', icon: FileText, label: status }
     const Icon = c.icon
     return (
       <span className={`inline-flex items-center gap-1 px-3 py-1 rounded-full text-sm font-medium ${c.bg} ${c.text}`}>
@@ -210,6 +229,17 @@ export default function PurchaseOrderDetail() {
       </div>
     )
   }
+
+  // Approve / reject / cancel / pay are for the admin and the purchase manager (the database refuses everyone
+  // else); receiving the goods stays available to the warehouse manager.
+  const userRole = getUserRole(user)
+  const canManage = userRole === 'admin' || userRole === 'purchase_manager'
+  // Separation of duties (also enforced in purchase_approve_order): only an admin may approve their own order
+  const isOwnOrder = !!user?.id && order.created_by === user.id
+  const canApprove = canManage && (userRole === 'admin' || !isOwnOrder)
+  const anyReceived = (order.items || []).some(i => Number(i.received_quantity || 0) > 0)
+  const canPay = canManage && order.payment_type === 'credit' && PAYABLE.includes(order.status) && remaining > 0
+  const canCancel = canManage && ['draft', 'pending', 'approved', 'sent'].includes(order.status) && !anyReceived && payments.length === 0
 
   return (
     <div className="space-y-6">
@@ -257,8 +287,14 @@ export default function PurchaseOrderDetail() {
             </div>
             <div className="flex justify-between">
               <span className="text-gray-500">طريقة الدفع</span>
-              <span className="font-medium">{order.payment_type === 'cash' ? 'كاش' : 'آجل'}</span>
+              <span className="font-medium">{order.payment_type === 'cash' ? 'كاش (يدفع عند الاستلام)' : 'آجل'}</span>
             </div>
+            {order.received_at && (
+              <div className="flex justify-between">
+                <span className="text-gray-500">تاريخ الاستلام</span>
+                <span className="font-medium">{formatDate(order.received_at)}</span>
+              </div>
+            )}
           </div>
         </div>
 
@@ -271,7 +307,7 @@ export default function PurchaseOrderDetail() {
             </div>
             <div className="flex justify-between">
               <span className="text-gray-500">إجمالي الكمية</span>
-              <span className="font-medium">{formatNumber(order.items?.reduce((sum, i) => sum + (i.quantity || 0), 0) || 0)}</span>
+              <span className="font-medium">{formatQuantity(roundQuantity(order.items?.reduce((sum, i) => sum + Number(i.quantity || 0), 0) || 0))}</span>
             </div>
             <div className="flex justify-between text-lg font-bold pt-2 border-t">
               <span>الإجمالي</span>
@@ -285,13 +321,29 @@ export default function PurchaseOrderDetail() {
                 </div>
                 <div className="flex justify-between text-red-600">
                   <span>المتبقي</span>
-                  <span className="font-medium">{formatCurrency(order.remaining_amount || 0)}</span>
+                  <span className="font-medium">{formatCurrency(remaining)}</span>
                 </div>
               </>
             )}
           </div>
         </div>
       </div>
+
+      {/* Rejection / cancellation reason (kept apart from the order notes) */}
+      {order.status === 'rejected' && order.rejection_reason && (
+        <div className="bg-red-50 border border-red-200 rounded-lg p-4">
+          <p className="text-sm font-medium text-red-800">سبب الرفض</p>
+          <p className="text-red-700">{order.rejection_reason}</p>
+          {order.rejected_at && <p className="text-xs text-red-500 mt-1">{formatDate(order.rejected_at)}</p>}
+        </div>
+      )}
+      {order.status === 'cancelled' && order.cancellation_reason && (
+        <div className="bg-gray-50 border border-gray-200 rounded-lg p-4">
+          <p className="text-sm font-medium text-gray-800">سبب الإلغاء</p>
+          <p className="text-gray-700">{order.cancellation_reason}</p>
+          {order.cancelled_at && <p className="text-xs text-gray-500 mt-1">{formatDate(order.cancelled_at)}</p>}
+        </div>
+      )}
 
       {/* Payment Section - Only show for credit orders */}
       {order.payment_type === 'credit' && (
@@ -301,17 +353,21 @@ export default function PurchaseOrderDetail() {
               <DollarSign className="w-5 h-5" />
               الدفعات
             </h3>
-            {order.payment_status !== 'paid' && (
+            {canPay && (
               <button
                 type="button"
                 onClick={() => setShowPaymentModal(true)}
-                className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700"
+                disabled={processing}
+                className="flex items-center gap-2 px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
               >
                 <Plus className="w-4 h-4" />
                 إضافة دفعة
               </button>
             )}
           </div>
+          {['draft', 'pending'].includes(order.status) && (
+            <p className="text-sm text-gray-500 mb-3">يمكن تسجيل الدفعات بعد اعتماد أمر الشراء</p>
+          )}
 
           {payments.length > 0 ? (
             <div className="overflow-x-auto">
@@ -331,7 +387,7 @@ export default function PurchaseOrderDetail() {
                       <td className="px-4 py-3 text-sm">{payment.payment_number}</td>
                       <td className="px-4 py-3 text-sm">{formatDate(payment.payment_date)}</td>
                       <td className="px-4 py-3 text-sm font-medium text-green-600">{formatCurrency(payment.amount)}</td>
-                      <td className="px-4 py-3 text-sm">{payment.payment_method}</td>
+                      <td className="px-4 py-3 text-sm">{paymentMethodLabels[payment.payment_method] || payment.payment_method}</td>
                       <td className="px-4 py-3 text-sm">{payment.reference_number || '-'}</td>
                     </tr>
                   ))}
@@ -355,6 +411,7 @@ export default function PurchaseOrderDetail() {
               <tr>
                 <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">الصنف</th>
                 <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">الكمية</th>
+                {anyReceived && <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">المستلم</th>}
                 <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">سعر الوحدة</th>
                 <th className="px-4 py-3 text-right text-sm font-medium text-gray-700">الإجمالي</th>
               </tr>
@@ -368,9 +425,10 @@ export default function PurchaseOrderDetail() {
                       <p className="text-sm text-gray-500">{item.item?.code || '-'}</p>
                     </div>
                   </td>
-                  <td className="px-4 py-3">{formatNumber(item.quantity)}</td>
+                  <td className="px-4 py-3">{formatQuantity(item.quantity)} {item.item?.unit?.name_ar || ''}</td>
+                  {anyReceived && <td className="px-4 py-3">{formatQuantity(item.received_quantity || 0)}</td>}
                   <td className="px-4 py-3">{formatCurrency(item.unit_price || 0)}</td>
-                  <td className="px-4 py-3 font-medium">{formatCurrency(item.total_price || (item.quantity * (item.unit_price || 0)))}</td>
+                  <td className="px-4 py-3 font-medium">{formatCurrency(item.total_price || roundMoney(item.quantity * (item.unit_price || 0)))}</td>
                 </tr>
               ))}
             </tbody>
@@ -388,7 +446,17 @@ export default function PurchaseOrderDetail() {
 
       {/* Actions */}
       <div className="flex gap-3 justify-end">
-        {order.status === 'pending' && (
+        {canCancel && order.status !== 'pending' && order.status !== 'draft' && (
+          <button
+            type="button"
+            onClick={handleCancel}
+            disabled={processing}
+            className="px-6 py-2 bg-gray-600 text-white rounded-lg hover:bg-gray-700 disabled:opacity-50"
+          >
+            إلغاء الأمر
+          </button>
+        )}
+        {canManage && (order.status === 'pending' || order.status === 'draft') && (
           <>
             <button
               type="button"
@@ -398,20 +466,24 @@ export default function PurchaseOrderDetail() {
             >
               رفض
             </button>
-            <button
-              type="button"
-              onClick={handleApprove}
-              disabled={processing}
-              className="px-6 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-50"
-            >
-              موافقة
-            </button>
+            {canApprove ? (
+              <button
+                type="button"
+                onClick={handleApprove}
+                disabled={processing}
+                className="px-6 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-50"
+              >
+                موافقة
+              </button>
+            ) : (
+              <span className="self-center text-sm text-gray-500">لا يمكن اعتماد أمر شراء أنشأته بنفسك</span>
+            )}
           </>
         )}
-        {(order.status === 'approved' || order.status === 'sent') && (
+        {RECEIVABLE.includes(order.status) && (
           <button
             type="button"
-            onClick={handleReceive}
+            onClick={openReceiveModal}
             disabled={processing}
             className="px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
           >
@@ -419,6 +491,72 @@ export default function PurchaseOrderDetail() {
           </button>
         )}
       </div>
+
+      {/* Receive Modal */}
+      {showReceiveModal && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
+          <div className="bg-white rounded-lg shadow-xl max-w-2xl w-full mx-4">
+            <div className="flex items-center justify-between p-6 border-b">
+              <h3 className="text-lg font-semibold">تأكيد استلام البضاعة</h3>
+              <button type="button" onClick={() => setShowReceiveModal(false)} className="p-1 hover:bg-gray-100 rounded" title="إغلاق">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <div className="p-6 max-h-[60vh] overflow-y-auto">
+              <p className="text-sm text-gray-500 mb-3">عدّل الكمية إذا كان المستلم أقل من المطلوب، ويمكن استلام الباقي لاحقاً</p>
+              <table className="w-full">
+                <thead className="bg-gray-50">
+                  <tr>
+                    <th className="px-3 py-2 text-right text-sm font-medium text-gray-700">الصنف</th>
+                    <th className="px-3 py-2 text-right text-sm font-medium text-gray-700">المتبقي</th>
+                    <th className="px-3 py-2 text-right text-sm font-medium text-gray-700">الكمية المستلمة</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-100">
+                  {order.items?.map(line => {
+                    const outstanding = roundQuantity(Number(line.quantity) - Number(line.received_quantity || 0))
+                    if (outstanding <= 0) return null
+                    return (
+                      <tr key={line.id}>
+                        <td className="px-3 py-2 text-sm">{line.item?.name_ar || '-'}</td>
+                        <td className="px-3 py-2 text-sm">{formatQuantity(outstanding)}</td>
+                        <td className="px-3 py-2">
+                          <input
+                            type="text"
+                            inputMode="decimal"
+                            value={receiveQty[line.id] ?? ''}
+                            onChange={(e) => setReceiveQty({ ...receiveQty, [line.id]: e.target.value })}
+                            aria-label="الكمية المستلمة"
+                            className="w-28 px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 text-sm"
+                            dir="ltr"
+                          />
+                        </td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </div>
+            <div className="flex gap-3 p-6 border-t">
+              <button
+                type="button"
+                onClick={handleReceive}
+                disabled={processing}
+                className="flex-1 px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
+              >
+                {processing ? 'جاري الحفظ...' : 'تأكيد الاستلام'}
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowReceiveModal(false)}
+                className="px-6 py-2 text-gray-700 hover:bg-gray-100 rounded-lg"
+              >
+                إلغاء
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Payment Modal */}
       {showPaymentModal && (
@@ -434,16 +572,15 @@ export default function PurchaseOrderDetail() {
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-2">المبلغ <span className="text-red-500">*</span></label>
                 <input
-                  type="number"
-                  min="0"
-                  step="0.01"
-                  max={order.remaining_amount || 0}
+                  type="text"
+                  inputMode="decimal"
                   value={paymentData.amount}
-                  onChange={(e) => setPaymentData({ ...paymentData, amount: Number(e.target.value) })}
+                  onChange={(e) => setPaymentData({ ...paymentData, amount: e.target.value })}
                   className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500"
                   placeholder="0.00"
+                  dir="ltr"
                 />
-                <p className="text-sm text-gray-500 mt-1">المتبقي: {formatCurrency(order.remaining_amount || 0)}</p>
+                <p className="text-sm text-gray-500 mt-1">المتبقي: {formatCurrency(remaining)}</p>
               </div>
               <div>
                 <label className="block text-sm font-medium text-gray-700 mb-2">طريقة الدفع</label>
@@ -483,7 +620,7 @@ export default function PurchaseOrderDetail() {
               <button
                 type="button"
                 onClick={handleAddPayment}
-                disabled={processing || paymentData.amount <= 0}
+                disabled={processing || !paymentData.amount.trim()}
                 className="flex-1 px-6 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50"
               >
                 {processing ? 'جاري الحفظ...' : 'حفظ الدفعة'}

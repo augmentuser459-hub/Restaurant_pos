@@ -6,14 +6,27 @@ import { inventoryService } from '../../services/inventory.service'
 import { suppliersService } from '../../services/suppliers.service'
 import { useAuth } from '../../contexts/AuthContext'
 import { Branch, Item, Supplier } from '../../types/database.types'
+import { parseDecimal, roundMoney, roundQuantity } from '../../lib/utils'
+import { toUserMessage } from '../../lib/errors'
+import { findItemsByScan } from '../inventory/stockHelpers'
 import { Save, ArrowRight, AlertCircle, Plus, Trash2, Barcode, Search } from 'lucide-react'
 
+// Quantities and prices are kept as typed (Arabic digits allowed) and parsed with parseDecimal.
 interface RequestItem {
   item_id: string
   supplier_id: string
-  requested_quantity: number
-  estimated_unit_price: number
+  requested_quantity: string
+  estimated_unit_price: string
   notes: string
+}
+
+const emptyRow = (): RequestItem => ({ item_id: '', supplier_id: '', requested_quantity: '1', estimated_unit_price: '', notes: '' })
+
+const lineTotal = (row: RequestItem) => {
+  const qty = parseDecimal(row.requested_quantity)
+  const price = parseDecimal(row.estimated_unit_price)
+  if (qty === null || price === null || qty <= 0 || price < 0) return 0
+  return roundMoney(roundQuantity(qty) * roundMoney(price))
 }
 
 export default function PurchaseRequestForm() {
@@ -23,6 +36,7 @@ export default function PurchaseRequestForm() {
   const [loading, setLoading] = useState(false)
   const [fetchLoading, setFetchLoading] = useState(true)
   const [error, setError] = useState('')
+  const submittingRef = useRef(false)
 
   const [branches, setBranches] = useState<Branch[]>([])
   const [items, setItems] = useState<Item[]>([])
@@ -34,9 +48,7 @@ export default function PurchaseRequestForm() {
     notes: '',
   })
 
-  const [requestItems, setRequestItems] = useState<RequestItem[]>([
-    { item_id: '', supplier_id: '', requested_quantity: 1, estimated_unit_price: 0, notes: '' }
-  ])
+  const [requestItems, setRequestItems] = useState<RequestItem[]>([emptyRow()])
   const [barcodeInput, setBarcodeInput] = useState('')
   const [barcodeError, setBarcodeError] = useState('')
   const barcodeInputRef = useRef<HTMLInputElement>(null)
@@ -51,6 +63,8 @@ export default function PurchaseRequestForm() {
       inventoryService.getAllItems(),
       suppliersService.getActive()
     ])
+    const loadError = branchesRes.error || itemsRes.error || suppliersRes.error
+    if (loadError) setError('فشل في تحميل البيانات: ' + toUserMessage(loadError))
     if (branchesRes.data) setBranches(branchesRes.data)
     if (itemsRes.data) setItems(itemsRes.data.filter(i => i.status === 'active'))
     if (suppliersRes.data) setSuppliers(suppliersRes.data)
@@ -59,23 +73,27 @@ export default function PurchaseRequestForm() {
 
 
   const calculateTotal = () => {
-    return requestItems.reduce((sum, item) => sum + (item.requested_quantity * item.estimated_unit_price), 0)
+    return roundMoney(requestItems.filter(row => row.item_id).reduce((sum, row) => sum + lineTotal(row), 0))
   }
 
   const handleAddItem = () => {
-    setRequestItems([...requestItems, { item_id: '', supplier_id: '', requested_quantity: 1, estimated_unit_price: 0, notes: '' }])
+    setRequestItems([...requestItems, emptyRow()])
   }
 
   // Barcode search function
   const handleBarcodeSearch = () => {
-    if (!barcodeInput.trim()) return
+    const code = barcodeInput.trim()
+    if (!code) return
     setBarcodeError('')
 
-    // Search by barcode or code
-    const item = items.find(i => 
-      (i as Item & { barcode?: string }).barcode === barcodeInput.trim() || 
-      i.code === barcodeInput.trim()
-    )
+    // Matched like the cashier: barcode, then code (also codes stored in quotes, e.g. "6223000123456"),
+    // then the only partial match. Several matches = the user picks the item from the list.
+    const matches = findItemsByScan(items, code)
+    if (matches.length > 1) {
+      setBarcodeError(`يوجد ${matches.length} أصناف تطابق "${code}". اكتب الكود كاملاً أو اختر الصنف من القائمة`)
+      return
+    }
+    const item = matches[0]
 
     if (item) {
       // Check if item already exists in list
@@ -83,15 +101,16 @@ export default function PurchaseRequestForm() {
       if (existingIndex >= 0) {
         // Increment quantity
         const updated = [...requestItems]
-        updated[existingIndex].requested_quantity += 1
+        const current = parseDecimal(updated[existingIndex].requested_quantity) ?? 0
+        updated[existingIndex] = { ...updated[existingIndex], requested_quantity: String(roundQuantity(current + 1)) }
         setRequestItems(updated)
       } else {
         // Add new item with purchase price
         const newItem: RequestItem = {
           item_id: item.id,
           supplier_id: '',
-          requested_quantity: 1,
-          estimated_unit_price: item.purchase_price || 0,
+          requested_quantity: '1',
+          estimated_unit_price: item.purchase_price ? String(item.purchase_price) : '',
           notes: ''
         }
         // Replace empty item or add new
@@ -124,7 +143,7 @@ export default function PurchaseRequestForm() {
     }
   }
 
-  const handleItemChange = (index: number, field: keyof RequestItem, value: string | number) => {
+  const handleItemChange = (index: number, field: keyof RequestItem, value: string) => {
     const updated = [...requestItems]
     updated[index] = { ...updated[index], [field]: value }
     setRequestItems(updated)
@@ -132,38 +151,54 @@ export default function PurchaseRequestForm() {
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault()
+    if (submittingRef.current) return
     setError('')
 
-    const validItems = requestItems.filter(item => item.item_id && item.requested_quantity > 0)
-    if (validItems.length === 0) {
+    const lines: CreatePurchaseRequestData['items'] = []
+    for (let i = 0; i < requestItems.length; i++) {
+      const row = requestItems[i]
+      if (!row.item_id) continue
+      const name = items.find(it => it.id === row.item_id)?.name_ar || `السطر ${i + 1}`
+      const qty = parseDecimal(row.requested_quantity)
+      if (qty === null || qty <= 0) {
+        setError(`الكمية غير صحيحة للصنف "${name}"`)
+        return
+      }
+      const price = row.estimated_unit_price.trim() === '' ? null : parseDecimal(row.estimated_unit_price)
+      if (row.estimated_unit_price.trim() !== '' && (price === null || price < 0)) {
+        setError(`السعر التقديري غير صحيح للصنف "${name}"`)
+        return
+      }
+      lines.push({
+        item_id: row.item_id,
+        supplier_id: row.supplier_id || undefined,
+        requested_quantity: roundQuantity(qty),
+        estimated_unit_price: price === null ? undefined : roundMoney(price),
+        notes: row.notes || undefined,
+      })
+    }
+    if (lines.length === 0) {
       setError('يجب إضافة صنف واحد على الأقل')
       return
     }
 
+    submittingRef.current = true
     setLoading(true)
 
-    const requestData: CreatePurchaseRequestData = {
+    const { error: submitError } = await purchaseService.createRequest({
       branch_id: formData.branch_id,
       priority: formData.priority,
       notes: formData.notes || undefined,
-      requested_by: user?.id || '',
-      items: validItems.map(item => ({
-        item_id: item.item_id,
-        supplier_id: item.supplier_id || undefined,
-        requested_quantity: item.requested_quantity,
-        estimated_unit_price: item.estimated_unit_price || undefined,
-        notes: item.notes || undefined,
-      }))
-    }
-
-    const { error: submitError } = await purchaseService.createRequest(requestData)
+      items: lines,
+    })
 
     if (submitError) {
-      setError('فشل في حفظ طلب الشراء')
-    } else {
-      navigate('/purchase/requests')
+      setError('فشل في حفظ طلب الشراء: ' + toUserMessage(submitError))
+      setLoading(false)
+      submittingRef.current = false
+      return
     }
-    setLoading(false)
+    navigate('/purchase/requests')
   }
 
   const handleChange = (field: string, value: string | number) => {
@@ -251,7 +286,7 @@ export default function PurchaseRequestForm() {
                 type="text"
                 value={barcodeInput}
                 onChange={(e) => setBarcodeInput(e.target.value)}
-                onKeyPress={handleBarcodeKeyPress}
+                onKeyDown={handleBarcodeKeyPress}
                 placeholder="امسح الباركود أو أدخل كود الصنف"
                 className="flex-1 px-4 py-2 border border-indigo-300 rounded-lg focus:ring-2 focus:ring-indigo-500"
                 dir="ltr"
@@ -300,15 +335,15 @@ export default function PurchaseRequestForm() {
                       </select>
                     </td>
                     <td className="py-3 px-2">
-                      <input type="number" min="0.001" step="0.001" value={item.requested_quantity} onChange={(e) => handleItemChange(index, 'requested_quantity', Number(e.target.value))}
+                      <input type="text" inputMode="decimal" value={item.requested_quantity} onChange={(e) => handleItemChange(index, 'requested_quantity', e.target.value)}
                         aria-label="الكمية" placeholder="مثال: 19.200" className="w-24 px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 text-sm" dir="ltr" />
                     </td>
                     <td className="py-3 px-2">
-                      <input type="number" min="0" step="0.01" value={item.estimated_unit_price} onChange={(e) => handleItemChange(index, 'estimated_unit_price', Number(e.target.value))}
-                        aria-label="السعر التقديري" className="w-28 px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 text-sm" dir="ltr" />
+                      <input type="text" inputMode="decimal" value={item.estimated_unit_price} onChange={(e) => handleItemChange(index, 'estimated_unit_price', e.target.value)}
+                        aria-label="السعر التقديري" placeholder="0.00" className="w-28 px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 text-sm" dir="ltr" />
                     </td>
                     <td className="py-3 px-2 text-sm font-medium text-gray-900">
-                      {(item.requested_quantity * item.estimated_unit_price).toLocaleString('ar-EG')} ج.م
+                      {lineTotal(item).toLocaleString('ar-EG')} ج.م
                     </td>
                     <td className="py-3 px-2">
                       <button type="button" onClick={() => handleRemoveItem(index)} disabled={requestItems.length === 1}

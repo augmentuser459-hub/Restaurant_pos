@@ -1,11 +1,14 @@
 import { supabase, fixEncodingInData } from '../lib/supabase'
-import type { PurchaseRequest, PurchaseRequestItem, PurchaseOrder, PurchaseOrderItem } from '../types/database.types'
+import { fetchAll } from '../lib/fetchAll'
+import type { PurchaseRequest, PurchaseRequestItem, PurchaseOrder, PurchaseOrderItem, PurchaseOrderPayment } from '../types/database.types'
+
+// Every write goes through a database function (050_purchasing.sql): it checks the role, locks the document,
+// checks its status and moves stock / supplier money in the same transaction.
 
 export interface CreatePurchaseRequestData {
   branch_id: string
   priority?: number
   notes?: string
-  requested_by: string
   items: {
     item_id: string
     supplier_id?: string
@@ -15,220 +18,261 @@ export interface CreatePurchaseRequestData {
   }[]
 }
 
+export interface CreatePurchaseOrderData {
+  supplier_id: string
+  branch_id: string
+  payment_type: 'cash' | 'credit'
+  expected_delivery_date?: string
+  notes?: string
+  request_id?: string
+  items: {
+    item_id: string
+    quantity: number
+    unit_price: number
+    notes?: string
+    request_item_id?: string
+  }[]
+}
+
+export interface AddOrderPaymentData {
+  amount: number
+  payment_method: string
+  reference_number?: string
+  notes?: string
+}
+
+type ItemRef = { id: string; name_ar: string; code: string; unit?: { name_ar: string } | null }
+type UserRef = { id: string; full_name: string; full_name_ar?: string | null } | null
+
+export type PurchaseRequestItemWithDetails = Omit<PurchaseRequestItem, 'item' | 'supplier'> & {
+  item: ItemRef | null
+  supplier?: { id: string; name_ar: string } | null
+}
+
 export interface PurchaseRequestWithDetails extends Omit<PurchaseRequest, 'branch' | 'items'> {
-  branch: { id: string; name_ar: string; code: string }
-  items: (PurchaseRequestItem & { 
-    item: { id: string; name_ar: string; code: string; unit: string }
-    supplier?: { id: string; name_ar: string }
-  })[]
+  branch: { id: string; name_ar: string; code: string } | null
+  requester?: UserRef
+  items: PurchaseRequestItemWithDetails[]
+}
+
+// One line of the flat request-items list.
+export interface PurchaseRequestListItem {
+  id: string
+  request_id: string
+  item_id: string
+  supplier_id: string | null
+  requested_quantity: number
+  notes: string | null
+  item_status: string | null
+  created_at: string
+  request: {
+    id: string
+    request_number: string
+    request_date: string
+    status: string
+    branch: { name_ar: string } | null
+  } | null
+  item: { id: string; code: string; name_ar: string } | null
+  supplier: { id: string; name_ar: string } | null
 }
 
 export interface PurchaseOrderWithDetails extends Omit<PurchaseOrder, 'supplier' | 'branch' | 'items'> {
-  supplier: { id: string; name_ar: string; code: string }
-  branch: { id: string; name_ar: string; code: string }
-  items: (PurchaseOrderItem & { item: { id: string; name_ar: string; code: string; unit: string } })[]
-  payment_type?: 'cash' | 'credit'
-  paid_amount?: number
-  remaining_amount?: number
-  payment_status?: 'pending' | 'partial' | 'paid'
+  supplier: { id: string; name_ar: string; code: string } | null
+  branch: { id: string; name_ar: string; code: string } | null
+  items: (Omit<PurchaseOrderItem, 'item'> & { item: ItemRef | null })[]
+  rejection_reason?: string | null
+  rejected_at?: string | null
+  cancellation_reason?: string | null
+  cancelled_at?: string | null
+  received_at?: string | null
 }
+
+const ORDER_SELECT = '*, supplier:suppliers(id, name_ar, code), branch:branches(id, name_ar, code)'
 
 const purchaseService = {
   async getRequests(branchId?: string) {
-    let query = supabase
-      .from('purchase_requests')
-      .select('*, branch:branches(id, name_ar, code)')
-      .order('created_at', { ascending: false })
-
-    if (branchId) {
-      query = query.eq('branch_id', branchId)
+    try {
+      const data = await fetchAll((from, to) => {
+        let query = supabase
+          .from('purchase_requests')
+          .select('*, branch:branches(id, name_ar, code)')
+          .order('created_at', { ascending: false })
+          .order('id')
+        if (branchId) query = query.eq('branch_id', branchId)
+        return query.range(from, to)
+      })
+      return { data: fixEncodingInData(data) as PurchaseRequestWithDetails[], error: null }
+    } catch (error) {
+      return { data: null, error }
     }
-
-    const { data, error } = await query
-    return { data: fixEncodingInData(data) as PurchaseRequestWithDetails[], error }
   },
 
-  // Get all request items (flat list for the table view)
+  // All request lines (flat list for the table view), with the request's status.
   async getRequestItems() {
-    const { data, error } = await supabase
-      .from('purchase_request_items')
-      .select(`
-        *,
-        request:purchase_requests(id, request_number, request_date),
-        item:items(id, code, name_ar),
-        supplier:suppliers(id, name_ar)
-      `)
-      .order('created_at', { ascending: false })
-
-    return { data: fixEncodingInData(data), error }
+    try {
+      const data = await fetchAll((from, to) =>
+        supabase
+          .from('purchase_request_items')
+          .select(`
+            id, request_id, item_id, supplier_id, requested_quantity, notes, item_status, created_at,
+            request:purchase_requests(id, request_number, request_date, status, branch:branches(name_ar)),
+            item:items(id, code, name_ar),
+            supplier:suppliers(id, name_ar)
+          `)
+          .order('created_at', { ascending: false })
+          .order('id')
+          .range(from, to)
+      )
+      return { data: fixEncodingInData(data) as unknown as PurchaseRequestListItem[], error: null }
+    } catch (error) {
+      return { data: null, error }
+    }
   },
 
   async getRequestById(id: string) {
     const { data, error } = await supabase
       .from('purchase_requests')
-      .select('*, branch:branches(id, name_ar, code), items:purchase_request_items(*, item:items(id, name_ar, code, unit), supplier:suppliers(id, name_ar))')
+      .select(`
+        *,
+        branch:branches(id, name_ar, code),
+        requester:users!purchase_requests_requested_by_fkey(id, full_name, full_name_ar),
+        items:purchase_request_items(*, item:items(id, name_ar, code, unit:units(name_ar)), supplier:suppliers(id, name_ar))
+      `)
       .eq('id', id)
       .single()
 
-    return { data: fixEncodingInData(data) as PurchaseRequestWithDetails, error }
+    return { data: fixEncodingInData(data) as PurchaseRequestWithDetails | null, error }
   },
 
   async createRequest(requestData: CreatePurchaseRequestData) {
-    const requestNumber = `PR-${Date.now()}`
-    const totalQuantity = requestData.items.reduce((sum, item) => sum + item.requested_quantity, 0)
-    const estimatedCost = requestData.items.reduce(
-      (sum, item) => sum + (item.requested_quantity * (item.estimated_unit_price || 0)), 0
-    )
+    const { data, error } = await supabase.rpc('purchase_create_request', {
+      p_branch_id: requestData.branch_id,
+      p_priority: requestData.priority ?? 1,
+      p_notes: requestData.notes ?? null,
+      p_items: requestData.items,
+    })
+    return { data: data as { id: string; request_number: string } | null, error }
+  },
 
-    const { data: request, error: requestError } = await supabase
-      .from('purchase_requests')
-      .insert({
-        request_number: requestNumber,
-        request_date: new Date().toISOString(),
-        branch_id: requestData.branch_id,
-        status: 'pending',
-        priority: requestData.priority || 1,
-        notes: requestData.notes,
-        total_items: requestData.items.length,
-        total_quantity: totalQuantity,
-        estimated_cost: estimatedCost,
-        requested_by: requestData.requested_by,
-        requested_at: new Date().toISOString(),
-      })
-      .select()
-      .single()
+  async approveRequest(requestId: string) {
+    const { error } = await supabase.rpc('purchase_approve_request', { p_request_id: requestId })
+    return { error }
+  },
 
-    if (requestError) return { data: null, error: requestError }
-
-    const requestItems = requestData.items.map(item => ({
-      request_id: request.id,
-      item_id: item.item_id,
-      supplier_id: item.supplier_id,
-      requested_quantity: item.requested_quantity,
-      estimated_unit_price: item.estimated_unit_price,
-      estimated_total: item.requested_quantity * (item.estimated_unit_price || 0),
-      notes: item.notes,
-    }))
-
-    const { error: itemsError } = await supabase
-      .from('purchase_request_items')
-      .insert(requestItems)
-
-    if (itemsError) return { data: null, error: itemsError }
-
-    return { data: request as PurchaseRequest, error: null }
+  async rejectRequest(requestId: string, reason: string) {
+    const { error } = await supabase.rpc('purchase_reject_request', { p_request_id: requestId, p_reason: reason })
+    return { error }
   },
 
   async getOrders(supplierId?: string) {
-    let query = supabase
-      .from('purchase_orders')
-      .select('*, supplier:suppliers(id, name_ar, code), branch:branches(id, name_ar, code)')
-      .order('created_at', { ascending: false })
-
-    if (supplierId) {
-      query = query.eq('supplier_id', supplierId)
+    try {
+      const data = await fetchAll((from, to) => {
+        let query = supabase
+          .from('purchase_orders')
+          .select(ORDER_SELECT)
+          .order('created_at', { ascending: false })
+          .order('id')
+        if (supplierId) query = query.eq('supplier_id', supplierId)
+        return query.range(from, to)
+      })
+      return { data: fixEncodingInData(data) as PurchaseOrderWithDetails[], error: null }
+    } catch (error) {
+      return { data: null, error }
     }
-
-    const { data, error } = await query
-    return { data: fixEncodingInData(data) as PurchaseOrderWithDetails[], error }
   },
 
   async getOrderById(id: string) {
     const { data, error } = await supabase
       .from('purchase_orders')
-      .select('*, supplier:suppliers(id, name_ar, code), branch:branches(id, name_ar, code), items:purchase_order_items(*, item:items(id, name_ar, code))')
+      .select(`${ORDER_SELECT}, items:purchase_order_items(*, item:items(id, name_ar, code, unit:units(name_ar)))`)
       .eq('id', id)
       .single()
 
-    console.log('getOrderById result:', { data, error })
-    return { data: fixEncodingInData(data) as PurchaseOrderWithDetails, error }
+    const order = fixEncodingInData(data) as PurchaseOrderWithDetails | null
+    order?.items?.sort((a, b) => a.created_at.localeCompare(b.created_at) || a.id.localeCompare(b.id))
+    return { data: order, error }
   },
 
-  async getPendingRequestsCount() {
-    const { count, error } = await supabase
-      .from('purchase_requests')
-      .select('id', { count: 'exact', head: true })
-      .eq('status', 'pending')
-
-    return { count, error }
-  },
-
-  async approveOrder(orderId: string, userId: string) {
+  async getOrderPayments(orderId: string) {
     const { data, error } = await supabase
-      .from('purchase_orders')
-      .update({
-        status: 'approved',
-        approved_by: userId,
-        approved_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', orderId)
-      .select()
-      .single()
-
-    return { data, error }
+      .from('purchase_order_payments')
+      .select('*')
+      .eq('order_id', orderId)
+      .order('payment_date', { ascending: false })
+      .order('created_at', { ascending: false })
+    return { data: (data || []) as PurchaseOrderPayment[], error }
   },
 
-  async rejectOrder(orderId: string, _userId: string, reason: string) {
-    const { data, error } = await supabase
-      .from('purchase_orders')
-      .update({
-        status: 'rejected',
-        notes: reason, // Store rejection reason in notes
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', orderId)
-      .select()
-      .single()
-
-    return { data, error }
+  // Counters for the purchasing dashboard (counted in the database, no row cap).
+  async getCounts() {
+    const count = (table: 'purchase_orders' | 'purchase_requests', status?: string) => {
+      let query = supabase.from(table).select('id', { count: 'exact', head: true })
+      if (status) query = query.eq('status', status)
+      return query
+    }
+    const results = await Promise.all([
+      count('purchase_orders'),
+      count('purchase_orders', 'pending'),
+      count('purchase_orders', 'received'),
+      count('purchase_requests', 'pending'),
+    ])
+    const error = results.find(r => r.error)?.error ?? null
+    return {
+      data: error ? null : {
+        totalOrders: results[0].count ?? 0,
+        pendingOrders: results[1].count ?? 0,
+        receivedOrders: results[2].count ?? 0,
+        pendingRequests: results[3].count ?? 0,
+      },
+      error,
+    }
   },
 
-  async receiveOrder(orderId: string, _userId: string) {
-    // Update order status - the trigger will handle inventory updates automatically
-    const { data, error } = await supabase
-      .from('purchase_orders')
-      .update({
-        status: 'received',
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', orderId)
-      .select()
-      .single()
-
-    return { data, error }
+  async createOrder(orderData: CreatePurchaseOrderData) {
+    const { data, error } = await supabase.rpc('purchase_create_order', {
+      p_supplier_id: orderData.supplier_id,
+      p_branch_id: orderData.branch_id,
+      p_payment_type: orderData.payment_type,
+      p_expected_delivery_date: orderData.expected_delivery_date || null,
+      p_notes: orderData.notes ?? null,
+      p_items: orderData.items,
+      p_request_id: orderData.request_id ?? null,
+    })
+    return { data: data as { id: string; order_number: string } | null, error }
   },
 
-  async approveRequest(requestId: string, userId: string) {
-    const { data, error } = await supabase
-      .from('purchase_requests')
-      .update({
-        status: 'approved',
-        approved_by: userId,
-        approved_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', requestId)
-      .select()
-      .single()
-
-    return { data, error }
+  async approveOrder(orderId: string) {
+    const { error } = await supabase.rpc('purchase_approve_order', { p_order_id: orderId })
+    return { error }
   },
 
-  async rejectRequest(requestId: string, userId: string, reason: string) {
-    const { data, error } = await supabase
-      .from('purchase_requests')
-      .update({
-        status: 'rejected',
-        rejected_by: userId,
-        rejected_at: new Date().toISOString(),
-        rejection_reason: reason,
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', requestId)
-      .select()
-      .single()
+  async rejectOrder(orderId: string, reason: string) {
+    const { error } = await supabase.rpc('purchase_reject_order', { p_order_id: orderId, p_reason: reason })
+    return { error }
+  },
 
+  async cancelOrder(orderId: string, reason: string) {
+    const { error } = await supabase.rpc('purchase_cancel_order', { p_order_id: orderId, p_reason: reason })
+    return { error }
+  },
+
+  // lines: quantities received now per order line; omit to receive everything still outstanding.
+  async receiveOrder(orderId: string, lines?: { id: string; quantity: number }[]) {
+    const { data, error } = await supabase.rpc('purchase_receive_order', {
+      p_order_id: orderId,
+      p_lines: lines ?? null,
+    })
+    return { data: data as { status: string } | null, error }
+  },
+
+  async addPayment(orderId: string, payment: AddOrderPaymentData) {
+    const { data, error } = await supabase.rpc('purchase_add_payment', {
+      p_order_id: orderId,
+      p_amount: payment.amount,
+      p_payment_method: payment.payment_method,
+      p_reference_number: payment.reference_number ?? null,
+      p_notes: payment.notes ?? null,
+    })
     return { data, error }
   },
 }

@@ -1,292 +1,75 @@
-import { useEffect, useState } from 'react';
-import { useNavigate } from 'react-router-dom';
+import { useEffect, useRef, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import { useAuth } from '../../contexts/AuthContext';
-import { supabase } from '../../lib/supabase';
+import { getUserRole } from '../../components/layout/roleAccess';
 import { suppliersService } from '../../services/suppliers.service';
+import { reportsService, SupplierStatementData, dateRangeError, monthsAgoLocal } from '../../services/reports.service';
+import { todayLocal } from '../../lib/dates';
+import { toUserMessage } from '../../lib/errors';
 import { formatDate, formatCurrency } from '../../lib/utils';
 import { Supplier } from '../../types/database.types';
-import { ArrowRight, FileText, Printer, TrendingUp, TrendingDown, DollarSign } from 'lucide-react';
+import { ArrowRight, FileText, Printer, TrendingUp, TrendingDown, DollarSign, AlertCircle } from 'lucide-react';
 
-interface Transaction {
-  id: string;
-  date: string;
-  type: 'supply' | 'payment' | 'return';
-  reference: string;
-  description: string;
-  debit: number;  // مدين (توريدات)
-  credit: number; // دائن (مدفوعات/مرتجعات)
-  balance: number;
-}
-
-interface StatementData {
-  supplier: Supplier | null;
-  openingBalance: number;
-  transactions: Transaction[];
-  totalDebit: number;
-  totalCredit: number;
-  closingBalance: number;
-  manualDebtTotal?: number;
+interface StatementView extends SupplierStatementData {
+  period: { from: string; to: string };
 }
 
 export default function SupplierStatement() {
   const { user } = useAuth();
+  const [searchParams] = useSearchParams();
   const [suppliers, setSuppliers] = useState<Supplier[]>([]);
-  const [selectedSupplier, setSelectedSupplier] = useState<string>('');
-  const [startDate, setStartDate] = useState(() => {
-    const d = new Date();
-    d.setMonth(d.getMonth() - 1);
-    return d.toISOString().split('T')[0];
-  });
-  const [endDate, setEndDate] = useState(() => new Date().toISOString().split('T')[0]);
-  const [data, setData] = useState<StatementData | null>(null);
+  const [selectedSupplier, setSelectedSupplier] = useState<string>(() => searchParams.get('supplier') || '');
+  const [startDate, setStartDate] = useState(() => searchParams.get('from') || monthsAgoLocal(1));
+  const [endDate, setEndDate] = useState(() => searchParams.get('to') || todayLocal());
+  const [data, setData] = useState<StatementView | null>(null);
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState('');
+  const requestId = useRef(0);
 
-  // Check if user is purchase_manager
-  const userRole = typeof user?.role === 'object' && user?.role !== null 
-    ? (user.role as { name: string }).name 
-    : String(user?.role || '');
-  const isPurchaseManager = userRole === 'مدير فرع' || userRole === 'purchase_manager';
+  // The purchase manager doesn't get the print button (role names are the English codes, see roleAccess)
+  const isPurchaseManager = getUserRole(user) === 'purchase_manager';
 
   useEffect(() => {
     fetchSuppliers();
+    // Opened from the supplier page / suppliers report: show the statement right away
+    if (searchParams.get('supplier')) fetchStatement();
   }, []);
 
   const fetchSuppliers = async () => {
-    const { data } = await suppliersService.getAll();
+    const { data, error } = await suppliersService.getAll();
+    if (error) setError(toUserMessage(error));
     setSuppliers(data || []);
   };
 
+  // Opening balance, every movement with its running balance and the closing balance come from one database
+  // ledger (same formula as the supplier list and the suppliers report).
   const fetchStatement = async () => {
     if (!selectedSupplier) return;
-    
+    const rangeError = dateRangeError(startDate, endDate);
+    if (rangeError) {
+      setData(null);
+      setError(rangeError);
+      return;
+    }
+
+    const id = ++requestId.current;
+    const period = { from: startDate, to: endDate };
     setLoading(true);
-    
-    // Get supplier info
-    const { data: supplier } = await suppliersService.getById(selectedSupplier);
-    
-    // Get manual debt transactions
-    const { data: manualDebtTransactions } = await supabase
-      .from('supplier_debt_transactions')
-      .select('*')
-      .eq('supplier_id', selectedSupplier)
-      .eq('transaction_type', 'manual_debt')
-      .gt('amount', 0);
-    
-    const manualDebtTotal = manualDebtTransactions?.reduce((sum, t) => sum + Number(t.amount), 0) || 0;
-    
-    // Get supplies before start date for opening balance
-    const { data: prevSupplies } = await supabase
-      .from('supplies')
-      .select('total_amount')
-      .eq('supplier_id', selectedSupplier)
-      .lt('created_at', startDate);
-    
-    // Get purchase orders before start date
-    const { data: prevOrders } = await supabase
-      .from('purchase_orders')
-      .select('total_amount')
-      .eq('supplier_id', selectedSupplier)
-      .lt('order_date', startDate);
-    
-    // Get supplier payments before start date
-    const { data: prevSupplierPayments } = await supabase
-      .from('supplier_payments')
-      .select('amount')
-      .eq('supplier_id', selectedSupplier)
-      .lt('payment_date', startDate);
-
-    // Get purchase order payments before start date
-    const { data: prevPOPayments } = await supabase
-      .from('purchase_order_payments')
-      .select('amount, order:purchase_orders!inner(supplier_id)')
-      .eq('order.supplier_id', selectedSupplier)
-      .lt('payment_date', startDate);
-
-    const { data: prevReturns } = await supabase
-      .from('supplier_returns')
-      .select('total_amount')
-      .eq('supplier_id', selectedSupplier)
-      .lt('created_at', startDate);
-
-    const prevSuppliesTotal = prevSupplies?.reduce((sum, s) => sum + (Number(s.total_amount) || 0), 0) || 0;
-    const prevOrdersTotal = prevOrders?.reduce((sum, o) => sum + (Number(o.total_amount) || 0), 0) || 0;
-    const prevSupplierPaymentsTotal = prevSupplierPayments?.reduce((sum, p) => sum + (Number(p.amount) || 0), 0) || 0;
-    const prevPOPaymentsTotal = prevPOPayments?.reduce((sum, p) => sum + (Number(p.amount) || 0), 0) || 0;
-    const prevReturnsTotal = prevReturns?.reduce((sum, r) => sum + (Number(r.total_amount) || 0), 0) || 0;
-    const openingBalance = prevSuppliesTotal + prevOrdersTotal - prevSupplierPaymentsTotal - prevPOPaymentsTotal - prevReturnsTotal;
-
-    // Get supplies in period
-    const { data: supplies } = await supabase
-      .from('supplies')
-      .select('id, supply_number, created_at, total_amount, invoice_number')
-      .eq('supplier_id', selectedSupplier)
-      .gte('created_at', startDate)
-      .lte('created_at', endDate + 'T23:59:59')
-      .order('created_at');
-
-    // Get purchase orders in period
-    const { data: orders } = await supabase
-      .from('purchase_orders')
-      .select('id, order_number, order_date, total_amount')
-      .eq('supplier_id', selectedSupplier)
-      .gte('order_date', startDate)
-      .lte('order_date', endDate)
-      .order('order_date');
-
-    // Get supplier payments in period
-    const { data: supplierPayments } = await supabase
-      .from('supplier_payments')
-      .select('id, payment_number, payment_date, amount, payment_method')
-      .eq('supplier_id', selectedSupplier)
-      .gte('payment_date', startDate)
-      .lte('payment_date', endDate)
-      .order('payment_date');
-
-    // Get purchase order payments in period
-    const { data: poPayments } = await supabase
-      .from('purchase_order_payments')
-      .select('id, payment_number, payment_date, amount, payment_method, order:purchase_orders!inner(supplier_id, order_number)')
-      .eq('order.supplier_id', selectedSupplier)
-      .gte('payment_date', startDate)
-      .lte('payment_date', endDate)
-      .order('payment_date');
-
-    // Get returns in period
-    const { data: returns } = await supabase
-      .from('supplier_returns')
-      .select('id, return_number, created_at, total_amount')
-      .eq('supplier_id', selectedSupplier)
-      .gte('created_at', startDate)
-      .lte('created_at', endDate + 'T23:59:59')
-      .order('created_at');
-
-    // Get manual debt transactions in period
-    const { data: manualDebts } = await supabase
-      .from('supplier_debt_transactions')
-      .select('id, created_at, amount, description, reference_number')
-      .eq('supplier_id', selectedSupplier)
-      .eq('transaction_type', 'manual_debt')
-      .gte('created_at', startDate)
-      .lte('created_at', endDate + 'T23:59:59')
-      .order('created_at');
-
-    // Combine and sort transactions
-    const transactions: Transaction[] = [];
-    let runningBalance = openingBalance;
-
-    // Add supplies
-    supplies?.forEach(s => {
-      runningBalance += Number(s.total_amount) || 0;
-      transactions.push({
-        id: s.id,
-        date: s.created_at,
-        type: 'supply',
-        reference: s.supply_number,
-        description: s.invoice_number ? `فاتورة: ${s.invoice_number}` : 'توريد',
-        debit: Number(s.total_amount) || 0,
-        credit: 0,
-        balance: runningBalance,
-      });
-    });
-
-    // Add purchase orders
-    orders?.forEach(o => {
-      runningBalance += Number(o.total_amount) || 0;
-      transactions.push({
-        id: o.id,
-        date: o.order_date,
-        type: 'supply',
-        reference: o.order_number,
-        description: 'أمر شراء',
-        debit: Number(o.total_amount) || 0,
-        credit: 0,
-        balance: runningBalance,
-      });
-    });
-
-    // Add supplier payments
-    supplierPayments?.forEach(p => {
-      runningBalance -= Number(p.amount) || 0;
-      transactions.push({
-        id: p.id,
-        date: p.payment_date,
-        type: 'payment',
-        reference: p.payment_number,
-        description: `دفعة توريد - ${p.payment_method || 'نقدي'}`,
-        debit: 0,
-        credit: Number(p.amount) || 0,
-        balance: runningBalance,
-      });
-    });
-
-    // Add purchase order payments
-    poPayments?.forEach(p => {
-      runningBalance -= Number(p.amount) || 0;
-      transactions.push({
-        id: p.id,
-        date: p.payment_date,
-        type: 'payment',
-        reference: p.payment_number,
-        description: `دفعة أمر شراء ${(p as any).order?.order_number || ''} - ${p.payment_method || 'نقدي'}`,
-        debit: 0,
-        credit: Number(p.amount) || 0,
-        balance: runningBalance,
-      });
-    });
-
-    // Add returns
-    returns?.forEach(r => {
-      runningBalance -= Number(r.total_amount) || 0;
-      transactions.push({
-        id: r.id,
-        date: r.created_at,
-        type: 'return',
-        reference: r.return_number,
-        description: 'مرتجع للمورد',
-        debit: 0,
-        credit: Number(r.total_amount) || 0,
-        balance: runningBalance,
-      });
-    });
-
-    // Add manual debt transactions
-    manualDebts?.forEach(d => {
-      runningBalance += Number(d.amount) || 0;
-      transactions.push({
-        id: d.id,
-        date: d.created_at,
-        type: 'supply',
-        reference: d.reference_number || 'يدوي',
-        description: d.description || 'إضافة مديونية يدوية',
-        debit: Number(d.amount) || 0,
-        credit: 0,
-        balance: runningBalance,
-      });
-    });
-
-    // Sort by date
-    transactions.sort((a, b) => new Date(a.date).getTime() - new Date(b.date).getTime());
-
-    // Recalculate running balance after sorting
-    let balance = openingBalance;
-    transactions.forEach(t => {
-      balance += t.debit - t.credit;
-      t.balance = balance;
-    });
-
-    const totalDebit = transactions.reduce((sum, t) => sum + t.debit, 0);
-    const totalCredit = transactions.reduce((sum, t) => sum + t.credit, 0);
-
-    setData({
-      supplier,
-      openingBalance,
-      transactions,
-      totalDebit,
-      totalCredit,
-      closingBalance: openingBalance + totalDebit - totalCredit,
-      manualDebtTotal, // Add this
-    });
-    
+    setError('');
+    try {
+      const { data: statement, error } = await reportsService.getSupplierStatement(selectedSupplier, period.from, period.to);
+      if (id !== requestId.current) return;
+      if (error || !statement) {
+        setData(null);
+        setError(toUserMessage(error));
+      } else {
+        setData({ ...statement, period });
+      }
+    } catch (err) {
+      if (id !== requestId.current) return;
+      setData(null);
+      setError(toUserMessage(err));
+    }
     setLoading(false);
   };
 
@@ -300,9 +83,9 @@ export default function SupplierStatement() {
       }
     `;
     document.head.appendChild(style);
-    
+
     window.print();
-    
+
     // Remove the style after printing
     setTimeout(() => {
       document.head.removeChild(style);
@@ -314,10 +97,11 @@ export default function SupplierStatement() {
       {/* Header */}
       <div className="flex items-center justify-between print:hidden">
         <div className="flex items-center gap-4">
-          <button 
-            onClick={() => window.history.back()} 
+          <button
+            onClick={() => window.history.back()}
             className="p-2 hover:bg-gray-100 rounded-lg"
             type="button"
+            title="رجوع"
           >
             <ArrowRight className="w-5 h-5" />
           </button>
@@ -399,6 +183,13 @@ export default function SupplierStatement() {
         </div>
       </div>
 
+      {error && (
+        <div className="p-4 bg-red-50 border border-red-200 rounded-lg flex items-center gap-3 print:hidden">
+          <AlertCircle className="w-5 h-5 text-red-500 shrink-0" />
+          <p className="text-red-700">{error}</p>
+        </div>
+      )}
+
       {/* Statement */}
       {data && (
         <div className="print:space-y-4">
@@ -406,17 +197,17 @@ export default function SupplierStatement() {
           <div className="bg-white rounded-lg shadow-sm border border-gray-100 p-6 print:shadow-none print:border print:rounded-none">
             <div className="flex justify-between items-start mb-4">
               <div>
-                <h2 className="text-xl font-bold text-gray-900">{data.supplier?.name_ar}</h2>
-                <p className="text-gray-600">كود: {data.supplier?.code}</p>
-                {data.supplier?.phone && <p className="text-gray-600">هاتف: {data.supplier?.phone}</p>}
+                <h2 className="text-xl font-bold text-gray-900">{data.supplier.name_ar || data.supplier.name}</h2>
+                <p className="text-gray-600">كود: {data.supplier.code}</p>
+                {data.supplier.phone && <p className="text-gray-600">هاتف: {data.supplier.phone}</p>}
               </div>
               <div className="text-left">
                 <p className="text-sm text-gray-500">الفترة</p>
-                <p className="font-medium">{formatDate(startDate)} - {formatDate(endDate)}</p>
+                <p className="font-medium">{formatDate(data.period.from)} - {formatDate(data.period.to)}</p>
               </div>
             </div>
 
-            {/* Summary Cards */}
+            {/* Summary Cards: opening + purchases + manual debts - payments - returns = amount due */}
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mt-6 print:gap-2">
               <div className="bg-gray-50 rounded-lg p-4 print:border print:border-gray-300 print:rounded-none">
                 <div className="flex items-center gap-2 text-gray-600 mb-1">
@@ -432,34 +223,31 @@ export default function SupplierStatement() {
                   <TrendingUp className="w-4 h-4 print:hidden" />
                   <span className="text-sm">إجمالي المشتريات</span>
                 </div>
-                <p className="text-xl font-bold text-red-600">{formatCurrency(data.totalDebit)}</p>
+                <p className="text-xl font-bold text-red-600">{formatCurrency(data.totalPurchases)}</p>
+                <p className="text-xs text-gray-500 mt-1">المشتريات الآجلة بعد خصم الأوامر الملغاة</p>
+                {data.manualDebtTotal !== 0 && (
+                  <p className="text-xs text-gray-600 mt-1">+ مديونيات يدوية: {formatCurrency(data.manualDebtTotal)}</p>
+                )}
               </div>
               <div className="bg-green-50 rounded-lg p-4 print:border print:border-gray-300 print:rounded-none">
                 <div className="flex items-center gap-2 text-green-600 mb-1">
                   <TrendingDown className="w-4 h-4 print:hidden" />
                   <span className="text-sm">إجمالي المدفوعات</span>
                 </div>
-                <p className="text-xl font-bold text-green-600">{formatCurrency(data.totalCredit)}</p>
+                <p className="text-xl font-bold text-green-600">{formatCurrency(data.totalPayments)}</p>
+                {data.totalReturns !== 0 && (
+                  <p className="text-xs text-gray-600 mt-1">+ مرتجعات للمورد: {formatCurrency(data.totalReturns)}</p>
+                )}
               </div>
               <div className={`rounded-lg p-4 print:border print:border-gray-300 print:rounded-none ${data.closingBalance > 0 ? 'bg-red-100' : 'bg-green-100'}`}>
                 <div className="flex items-center gap-2 mb-1">
                   <DollarSign className="w-4 h-4 print:hidden" />
                   <span className="text-sm">المبلغ المستحق</span>
                 </div>
-                {data.manualDebtTotal && data.manualDebtTotal > 0 ? (
-                  <div>
-                    <p className={`text-lg font-bold ${data.closingBalance > 0 ? 'text-red-600' : 'text-green-600'}`}>
-                      {formatCurrency(data.closingBalance - data.manualDebtTotal)} + {formatCurrency(data.manualDebtTotal)}
-                    </p>
-                    <p className="text-xs text-gray-600 mt-1">
-                      = {formatCurrency(data.closingBalance)}
-                    </p>
-                  </div>
-                ) : (
-                  <p className={`text-xl font-bold ${data.closingBalance > 0 ? 'text-red-600' : 'text-green-600'}`}>
-                    {formatCurrency(data.closingBalance)}
-                  </p>
-                )}
+                <p className={`text-xl font-bold ${data.closingBalance > 0 ? 'text-red-600' : 'text-green-600'}`}>
+                  {formatCurrency(data.closingBalance)}
+                </p>
+                <p className="text-xs text-gray-500 mt-1">في {formatDate(data.period.to)}</p>
               </div>
             </div>
           </div>
@@ -481,7 +269,7 @@ export default function SupplierStatement() {
                 <tbody className="divide-y divide-gray-100">
                   {/* Opening Balance Row */}
                   <tr className="bg-gray-100 font-medium">
-                    <td className="px-4 py-3 print:border print:border-gray-300">{formatDate(startDate)}</td>
+                    <td className="px-4 py-3 print:border print:border-gray-300">{formatDate(data.period.from)}</td>
                     <td className="px-4 py-3 print:border print:border-gray-300">-</td>
                     <td className="px-4 py-3 print:border print:border-gray-300">رصيد أول المدة</td>
                     <td className="px-4 py-3 print:border print:border-gray-300">-</td>
@@ -497,7 +285,7 @@ export default function SupplierStatement() {
                       <td className="px-4 py-3 font-mono text-sm print:border print:border-gray-300">{t.reference}</td>
                       <td className="px-4 py-3 print:border print:border-gray-300">
                         <span className={`inline-flex items-center gap-1 ${
-                          t.type === 'supply' ? 'text-blue-600' : 
+                          t.type === 'supply' ? 'text-blue-600' :
                           t.type === 'payment' ? 'text-green-600' : 'text-orange-600'
                         }`}>
                           {t.description}
@@ -529,7 +317,7 @@ export default function SupplierStatement() {
         </div>
       )}
 
-      {!data && !loading && (
+      {!data && !loading && !error && (
         <div className="bg-white rounded-lg shadow-sm border border-gray-100 p-12 text-center">
           <FileText className="w-16 h-16 text-gray-300 mx-auto mb-4" />
           <p className="text-gray-500">اختر المورد والفترة ثم اضغط "عرض الكشف"</p>

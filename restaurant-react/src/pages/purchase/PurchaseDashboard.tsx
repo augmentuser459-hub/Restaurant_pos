@@ -2,12 +2,14 @@ import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { purchaseService } from '../../services/purchase.service'
 import { formatNumber } from '../../lib/utils'
-import { ShoppingCart, Clock, Plus, ArrowLeft, Package } from 'lucide-react'
+import { toUserMessage } from '../../lib/errors'
+import { ShoppingCart, Clock, Plus, ArrowLeft, Package, ClipboardList, AlertCircle } from 'lucide-react'
 
 interface Stats {
   totalOrders: number
   pendingOrders: number
   receivedOrders: number
+  pendingRequests: number
 }
 
 export default function PurchaseDashboard() {
@@ -15,22 +17,23 @@ export default function PurchaseDashboard() {
     totalOrders: 0,
     pendingOrders: 0,
     receivedOrders: 0,
+    pendingRequests: 0,
   })
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
 
   useEffect(() => {
     fetchStats()
   }, [])
 
   const fetchStats = async () => {
-    const ordersRes = await purchaseService.getOrders()
-    const orders = ordersRes.data || []
-
-    setStats({
-      totalOrders: orders.length,
-      pendingOrders: orders.filter(o => o.status === 'pending').length,
-      receivedOrders: orders.filter(o => o.status === 'received').length,
-    })
+    // Counted in the database (no row cap)
+    const { data, error } = await purchaseService.getCounts()
+    if (error || !data) {
+      setError(toUserMessage(error))
+    } else {
+      setStats(data)
+    }
     setLoading(false)
   }
 
@@ -50,8 +53,15 @@ export default function PurchaseDashboard() {
         <p className="text-gray-600">لوحة تحكم طلبات وأوامر الشراء</p>
       </div>
 
+      {error && (
+        <div className="p-4 bg-red-50 border border-red-200 rounded-lg flex items-center gap-3">
+          <AlertCircle className="w-5 h-5 text-red-500 shrink-0" />
+          <p className="text-red-700">{error}</p>
+        </div>
+      )}
+
       {/* Stats */}
-      <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+      <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
         <StatCard
           title="أوامر الشراء"
           value={formatNumber(stats.totalOrders)}
@@ -70,30 +80,62 @@ export default function PurchaseDashboard() {
           icon={Package}
           color="green"
         />
+        <StatCard
+          title="طلبات شراء بانتظار الموافقة"
+          value={formatNumber(stats.pendingRequests)}
+          icon={ClipboardList}
+          color="yellow"
+        />
       </div>
 
-      {/* Quick Actions */}
-      <div className="bg-white rounded-lg shadow-sm border border-gray-100 p-6">
-        <div className="flex items-center justify-between mb-4">
-          <h2 className="text-lg font-bold text-gray-900">أوامر الشراء</h2>
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        {/* Purchase orders */}
+        <div className="bg-white rounded-lg shadow-sm border border-gray-100 p-6">
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-lg font-bold text-gray-900">أوامر الشراء</h2>
+            <Link
+              to="/purchase/orders/new"
+              className="flex items-center gap-1 text-sm text-blue-600 hover:text-blue-700"
+            >
+              <Plus className="w-4 h-4" />
+              أمر جديد
+            </Link>
+          </div>
+          <p className="text-gray-600 mb-4">
+            إنشاء ومتابعة واستلام أوامر الشراء من الموردين
+          </p>
           <Link
-            to="/purchase/orders/new"
-            className="flex items-center gap-1 text-sm text-blue-600 hover:text-blue-700"
+            to="/purchase/orders"
+            className="flex items-center gap-2 text-blue-600 hover:text-blue-700 font-medium"
           >
-            <Plus className="w-4 h-4" />
-            أمر جديد
+            عرض جميع الأوامر
+            <ArrowLeft className="w-4 h-4" />
           </Link>
         </div>
-        <p className="text-gray-600 mb-4">
-          إنشاء ومتابعة واستلام أوامر الشراء من الموردين
-        </p>
-        <Link
-          to="/purchase/orders"
-          className="flex items-center gap-2 text-blue-600 hover:text-blue-700 font-medium"
-        >
-          عرض جميع الأوامر
-          <ArrowLeft className="w-4 h-4" />
-        </Link>
+
+        {/* Purchase requests */}
+        <div className="bg-white rounded-lg shadow-sm border border-gray-100 p-6">
+          <div className="flex items-center justify-between mb-4">
+            <h2 className="text-lg font-bold text-gray-900">طلبات الشراء</h2>
+            <Link
+              to="/purchase/requests/new"
+              className="flex items-center gap-1 text-sm text-blue-600 hover:text-blue-700"
+            >
+              <Plus className="w-4 h-4" />
+              طلب جديد
+            </Link>
+          </div>
+          <p className="text-gray-600 mb-4">
+            طلبات الفروع والمخزن، اعتمادها أو رفضها وتحويلها إلى أوامر شراء
+          </p>
+          <Link
+            to="/purchase/requests"
+            className="flex items-center gap-2 text-blue-600 hover:text-blue-700 font-medium"
+          >
+            عرض جميع الطلبات
+            <ArrowLeft className="w-4 h-4" />
+          </Link>
+        </div>
       </div>
     </div>
   )

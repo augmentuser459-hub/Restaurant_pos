@@ -1,17 +1,23 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { supabase } from '../../lib/supabase'
+import { fetchAll } from '../../lib/fetchAll'
+import { localDateRangeISO, todayLocal } from '../../lib/dates'
+import { toUserMessage } from '../../lib/errors'
 import { branchesService } from '../../services/branches.service'
+import { dateRangeError, monthsAgoLocal } from '../../services/reports.service'
 import { Branch } from '../../types/database.types'
-import { formatDate, formatNumber, formatCurrency } from '../../lib/utils'
-import { ArrowRight, AlertTriangle, CheckCircle, XCircle, Clock, DollarSign } from 'lucide-react'
+import { formatDate, formatNumber, formatCurrency, formatQuantity, roundMoney } from '../../lib/utils'
+import { useDebouncedValue } from './useDebouncedValue'
+import { ArrowRight, AlertTriangle, CheckCircle, XCircle, Clock, DollarSign, AlertCircle } from 'lucide-react'
 
 interface DamageReportData {
   totalDamages: number
   pendingCount: number
   approvedCount: number
   rejectedCount: number
-  totalValue: number
+  totalValue: number    // approved records only
+  pendingValue: number
   damages: {
     id: string
     damage_number: string
@@ -26,92 +32,119 @@ interface DamageReportData {
   byReason: { reason: string; count: number; value: number }[]
 }
 
+interface DamageRow {
+  id: string
+  damage_number: string
+  quantity: number
+  total_cost: number | null
+  status: string
+  created_at: string
+  branch: { name_ar: string } | null
+  item: { name_ar: string } | null
+  reason: { name_ar: string } | null
+}
+
 export default function DamagesReport() {
   const [data, setData] = useState<DamageReportData | null>(null)
   const [branches, setBranches] = useState<Branch[]>([])
+  const [branchesError, setBranchesError] = useState('')
   const [loading, setLoading] = useState(true)
+  const [error, setError] = useState('')
   const [selectedBranch, setSelectedBranch] = useState<string>('')
-  const [startDate, setStartDate] = useState(() => {
-    const d = new Date()
-    d.setMonth(d.getMonth() - 1)
-    return d.toISOString().split('T')[0]
-  })
-  const [endDate, setEndDate] = useState(() => new Date().toISOString().split('T')[0])
+  const [startDate, setStartDate] = useState(() => monthsAgoLocal(1))
+  const [endDate, setEndDate] = useState(() => todayLocal())
+  const requestId = useRef(0)
+  const filterKey = useDebouncedValue(`${startDate}|${endDate}|${selectedBranch}`)
 
   useEffect(() => {
     fetchBranches()
   }, [])
 
   useEffect(() => {
-    fetchReport()
-  }, [selectedBranch, startDate, endDate])
+    fetchReport(filterKey)
+  }, [filterKey])
 
   const fetchBranches = async () => {
-    const { data } = await branchesService.getActive()
+    const { data, error } = await branchesService.getActive()
+    if (error) setBranchesError(toUserMessage(error))
     setBranches(data || [])
   }
 
-  const fetchReport = async () => {
-    setLoading(true)
-    
-    let query = supabase
-      .from('damages')
-      .select(`
-        id, damage_number, quantity, total_cost, status, created_at,
-        branch:branches(name_ar),
-        item:items(name_ar),
-        reason:damage_reasons(name_ar)
-      `)
-      .gte('created_at', startDate)
-      .lte('created_at', endDate + 'T23:59:59')
-      .order('created_at', { ascending: false })
-
-    if (selectedBranch) {
-      query = query.eq('branch_id', selectedBranch)
+  const fetchReport = async (key: string) => {
+    const [from, to, branchId] = key.split('|')
+    const id = ++requestId.current
+    const rangeError = dateRangeError(from, to)
+    if (rangeError) {
+      setData(null)
+      setError(rangeError)
+      setLoading(false)
+      return
     }
+    setLoading(true)
+    setError('')
 
-    const { data: damages, error } = await query
-    
-    console.log('Damages report query result:', { damages, error })
+    // Cairo days, end day included
+    const { start, endExclusive } = localDateRangeISO(from, to)
+    try {
+      const rows = await fetchAll((rangeFrom, rangeTo) => {
+        let query = supabase
+          .from('damages')
+          .select(`
+            id, damage_number, quantity, total_cost, status, created_at,
+            branch:branches(name_ar),
+            item:items(name_ar),
+            reason:damage_reasons(name_ar)
+          `)
+          .gte('created_at', start)
+          .lt('created_at', endExclusive)
+          .order('created_at', { ascending: false })
+          .order('id')
+        if (branchId) query = query.eq('branch_id', branchId)
+        return query.range(rangeFrom, rangeTo)
+      })
+      if (id !== requestId.current) return
+      // Embedded many-to-one relations arrive as objects
+      const damages = rows as unknown as DamageRow[]
 
-    if (damages) {
-      // Group by reason
+      // Losses = approved records only (pending ones are shown apart, rejected ones are not losses)
       const reasonStats: Record<string, { count: number; value: number }> = {}
       damages.forEach(d => {
-        const reasonObj = d.reason as unknown as { name_ar: string } | null
-        const reason = reasonObj?.name_ar || 'غير محدد'
+        const reason = d.reason?.name_ar || 'غير محدد'
         if (!reasonStats[reason]) reasonStats[reason] = { count: 0, value: 0 }
         reasonStats[reason].count++
-        reasonStats[reason].value += d.total_cost || 0
+        if (d.status === 'approved') reasonStats[reason].value = roundMoney(reasonStats[reason].value + Number(d.total_cost || 0))
       })
+      const sumCost = (status: string) =>
+        roundMoney(damages.filter(d => d.status === status).reduce((sum, d) => sum + Number(d.total_cost || 0), 0))
 
-      const reportData: DamageReportData = {
+      setData({
         totalDamages: damages.length,
         pendingCount: damages.filter(d => d.status === 'pending').length,
         approvedCount: damages.filter(d => d.status === 'approved').length,
         rejectedCount: damages.filter(d => d.status === 'rejected').length,
-        totalValue: damages.reduce((sum, d) => sum + (d.total_cost || 0), 0),
-        damages: damages.map(d => {
-          const reasonObj = d.reason as unknown as { name_ar: string } | null
-          return {
-            id: d.id,
-            damage_number: d.damage_number,
-            branch: (d.branch as unknown as { name_ar: string })?.name_ar || '-',
-            item: (d.item as unknown as { name_ar: string })?.name_ar || '-',
-            quantity: d.quantity,
-            estimated_value: d.total_cost || 0,
-            reason: reasonObj?.name_ar || '-',
-            status: d.status,
-            created_at: d.created_at,
-          }
-        }),
+        totalValue: sumCost('approved'),
+        pendingValue: sumCost('pending'),
+        damages: damages.map(d => ({
+          id: d.id,
+          damage_number: d.damage_number,
+          branch: d.branch?.name_ar || '-',
+          item: d.item?.name_ar || '-',
+          quantity: Number(d.quantity),
+          estimated_value: Number(d.total_cost || 0),
+          reason: d.reason?.name_ar || '-',
+          status: d.status,
+          created_at: d.created_at,
+        })),
         byReason: Object.entries(reasonStats).map(([reason, stats]) => ({
           reason,
           count: stats.count,
           value: stats.value,
         })),
-      }
-      setData(reportData)
+      })
+    } catch (err) {
+      if (id !== requestId.current) return
+      setData(null)
+      setError(toUserMessage(err))
     }
     setLoading(false)
   }
@@ -128,10 +161,6 @@ export default function DamagesReport() {
       rejected: 'مرفوض',
     }
     return <span className={`px-2 py-1 rounded-full text-xs font-medium ${styles[status] || 'bg-gray-100'}`}>{labels[status] || status}</span>
-  }
-
-  if (loading) {
-    return <div className="flex items-center justify-center h-64"><div className="w-8 h-8 border-4 border-red-600 border-t-transparent rounded-full animate-spin" /></div>
   }
 
   return (
@@ -162,123 +191,138 @@ export default function DamagesReport() {
               <option value="">جميع الفروع</option>
               {branches.map(b => <option key={b.id} value={b.id}>{b.name_ar}</option>)}
             </select>
+            {branchesError && <p className="text-xs text-red-600 mt-1">{branchesError}</p>}
           </div>
         </div>
       </div>
 
-      {/* Stats */}
-      <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
-        <div className="bg-white rounded-lg shadow-sm p-4 border border-gray-100">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 bg-red-100 rounded-lg flex items-center justify-center">
-              <AlertTriangle className="w-5 h-5 text-red-600" />
-            </div>
-            <div>
-              <p className="text-sm text-gray-500">إجمالي التالف</p>
-              <p className="text-xl font-bold">{formatNumber(data?.totalDamages || 0)}</p>
-            </div>
-          </div>
+      {loading ? (
+        <div className="flex items-center justify-center h-64"><div className="w-8 h-8 border-4 border-red-600 border-t-transparent rounded-full animate-spin" /></div>
+      ) : error ? (
+        <div className="p-4 bg-red-50 border border-red-200 rounded-lg flex items-center gap-3">
+          <AlertCircle className="w-5 h-5 text-red-500 shrink-0" />
+          <p className="text-red-700">{error}</p>
         </div>
-        <div className="bg-white rounded-lg shadow-sm p-4 border border-gray-100">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 bg-yellow-100 rounded-lg flex items-center justify-center">
-              <Clock className="w-5 h-5 text-yellow-600" />
-            </div>
-            <div>
-              <p className="text-sm text-gray-500">معلق</p>
-              <p className="text-xl font-bold text-yellow-600">{formatNumber(data?.pendingCount || 0)}</p>
-            </div>
-          </div>
-        </div>
-        <div className="bg-white rounded-lg shadow-sm p-4 border border-gray-100">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 bg-green-100 rounded-lg flex items-center justify-center">
-              <CheckCircle className="w-5 h-5 text-green-600" />
-            </div>
-            <div>
-              <p className="text-sm text-gray-500">موافق عليه</p>
-              <p className="text-xl font-bold text-green-600">{formatNumber(data?.approvedCount || 0)}</p>
-            </div>
-          </div>
-        </div>
-        <div className="bg-white rounded-lg shadow-sm p-4 border border-gray-100">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 bg-red-100 rounded-lg flex items-center justify-center">
-              <XCircle className="w-5 h-5 text-red-600" />
-            </div>
-            <div>
-              <p className="text-sm text-gray-500">مرفوض</p>
-              <p className="text-xl font-bold text-red-600">{formatNumber(data?.rejectedCount || 0)}</p>
-            </div>
-          </div>
-        </div>
-        <div className="bg-white rounded-lg shadow-sm p-4 border border-gray-100">
-          <div className="flex items-center gap-3">
-            <div className="w-10 h-10 bg-orange-100 rounded-lg flex items-center justify-center">
-              <DollarSign className="w-5 h-5 text-orange-600" />
-            </div>
-            <div>
-              <p className="text-sm text-gray-500">إجمالي الخسائر</p>
-              <p className="text-xl font-bold text-orange-600">{formatCurrency(data?.totalValue || 0)}</p>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      {/* By Reason */}
-      {data?.byReason && data.byReason.length > 0 && (
-        <div className="bg-white rounded-lg shadow-sm border border-gray-100 p-6">
-          <h3 className="text-lg font-semibold text-gray-900 mb-4">التالف حسب السبب</h3>
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-            {data.byReason.map(r => (
-              <div key={r.reason} className="bg-gray-50 rounded-lg p-4">
-                <p className="font-medium text-gray-900">{r.reason}</p>
-                <div className="flex justify-between mt-2 text-sm">
-                  <span className="text-gray-500">{r.count} سجل</span>
-                  <span className="text-red-600 font-medium">{formatCurrency(r.value)}</span>
+      ) : (
+        <>
+          {/* Stats */}
+          <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+            <div className="bg-white rounded-lg shadow-sm p-4 border border-gray-100">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 bg-red-100 rounded-lg flex items-center justify-center">
+                  <AlertTriangle className="w-5 h-5 text-red-600" />
+                </div>
+                <div>
+                  <p className="text-sm text-gray-500">إجمالي التالف</p>
+                  <p className="text-xl font-bold">{formatNumber(data?.totalDamages || 0)}</p>
                 </div>
               </div>
-            ))}
+            </div>
+            <div className="bg-white rounded-lg shadow-sm p-4 border border-gray-100">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 bg-yellow-100 rounded-lg flex items-center justify-center">
+                  <Clock className="w-5 h-5 text-yellow-600" />
+                </div>
+                <div>
+                  <p className="text-sm text-gray-500">معلق</p>
+                  <p className="text-xl font-bold text-yellow-600">{formatNumber(data?.pendingCount || 0)}</p>
+                </div>
+              </div>
+            </div>
+            <div className="bg-white rounded-lg shadow-sm p-4 border border-gray-100">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 bg-green-100 rounded-lg flex items-center justify-center">
+                  <CheckCircle className="w-5 h-5 text-green-600" />
+                </div>
+                <div>
+                  <p className="text-sm text-gray-500">موافق عليه</p>
+                  <p className="text-xl font-bold text-green-600">{formatNumber(data?.approvedCount || 0)}</p>
+                </div>
+              </div>
+            </div>
+            <div className="bg-white rounded-lg shadow-sm p-4 border border-gray-100">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 bg-red-100 rounded-lg flex items-center justify-center">
+                  <XCircle className="w-5 h-5 text-red-600" />
+                </div>
+                <div>
+                  <p className="text-sm text-gray-500">مرفوض</p>
+                  <p className="text-xl font-bold text-red-600">{formatNumber(data?.rejectedCount || 0)}</p>
+                </div>
+              </div>
+            </div>
+            <div className="bg-white rounded-lg shadow-sm p-4 border border-gray-100">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 bg-orange-100 rounded-lg flex items-center justify-center">
+                  <DollarSign className="w-5 h-5 text-orange-600" />
+                </div>
+                <div>
+                  <p className="text-sm text-gray-500">إجمالي الخسائر (المعتمد)</p>
+                  <p className="text-xl font-bold text-orange-600">{formatCurrency(data?.totalValue || 0)}</p>
+                  {(data?.pendingValue || 0) > 0 && (
+                    <p className="text-xs text-gray-500 mt-1">قيد المراجعة: {formatCurrency(data!.pendingValue)}</p>
+                  )}
+                </div>
+              </div>
+            </div>
           </div>
-        </div>
-      )}
 
-      {/* Table */}
-      <div className="bg-white rounded-lg shadow-sm border border-gray-100 overflow-hidden">
-        <div className="overflow-x-auto">
-          <table className="w-full">
-            <thead className="bg-red-600 text-white">
-              <tr>
-                <th className="px-4 py-3 text-right text-sm font-medium">رقم السجل</th>
-                <th className="px-4 py-3 text-right text-sm font-medium">الفرع</th>
-                <th className="px-4 py-3 text-right text-sm font-medium">الصنف</th>
-                <th className="px-4 py-3 text-right text-sm font-medium">الكمية</th>
-                <th className="px-4 py-3 text-right text-sm font-medium">القيمة</th>
-                <th className="px-4 py-3 text-right text-sm font-medium">السبب</th>
-                <th className="px-4 py-3 text-right text-sm font-medium">التاريخ</th>
-                <th className="px-4 py-3 text-right text-sm font-medium">الحالة</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-gray-100">
-              {data?.damages.map((d, i) => (
-                <tr key={d.id} className={i % 2 === 0 ? 'bg-white' : 'bg-gray-50'}>
-                  <td className="px-4 py-3 font-medium">{d.damage_number}</td>
-                  <td className="px-4 py-3">{d.branch}</td>
-                  <td className="px-4 py-3">{d.item}</td>
-                  <td className="px-4 py-3">{d.quantity}</td>
-                  <td className="px-4 py-3 text-red-600">{formatCurrency(d.estimated_value)}</td>
-                  <td className="px-4 py-3">{d.reason}</td>
-                  <td className="px-4 py-3">{formatDate(d.created_at)}</td>
-                  <td className="px-4 py-3">{getStatusBadge(d.status)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-        {(!data?.damages || data.damages.length === 0) && (
-          <div className="text-center py-12 text-gray-500">لا توجد سجلات تالف في هذه الفترة</div>
-        )}
-      </div>
+          {/* By Reason */}
+          {data?.byReason && data.byReason.length > 0 && (
+            <div className="bg-white rounded-lg shadow-sm border border-gray-100 p-6">
+              <h3 className="text-lg font-semibold text-gray-900 mb-4">التالف حسب السبب</h3>
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                {data.byReason.map(r => (
+                  <div key={r.reason} className="bg-gray-50 rounded-lg p-4">
+                    <p className="font-medium text-gray-900">{r.reason}</p>
+                    <div className="flex justify-between mt-2 text-sm">
+                      <span className="text-gray-500">{formatNumber(r.count)} سجل</span>
+                      <span className="text-red-600 font-medium">{formatCurrency(r.value)}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Table */}
+          <div className="bg-white rounded-lg shadow-sm border border-gray-100 overflow-hidden">
+            <div className="overflow-x-auto">
+              <table className="w-full">
+                <thead className="bg-red-600 text-white">
+                  <tr>
+                    <th className="px-4 py-3 text-right text-sm font-medium">رقم السجل</th>
+                    <th className="px-4 py-3 text-right text-sm font-medium">الفرع</th>
+                    <th className="px-4 py-3 text-right text-sm font-medium">الصنف</th>
+                    <th className="px-4 py-3 text-right text-sm font-medium">الكمية</th>
+                    <th className="px-4 py-3 text-right text-sm font-medium">القيمة</th>
+                    <th className="px-4 py-3 text-right text-sm font-medium">السبب</th>
+                    <th className="px-4 py-3 text-right text-sm font-medium">التاريخ</th>
+                    <th className="px-4 py-3 text-right text-sm font-medium">الحالة</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-100">
+                  {data?.damages.map((d, i) => (
+                    <tr key={d.id} className={i % 2 === 0 ? 'bg-white' : 'bg-gray-50'}>
+                      <td className="px-4 py-3 font-medium">{d.damage_number}</td>
+                      <td className="px-4 py-3">{d.branch}</td>
+                      <td className="px-4 py-3">{d.item}</td>
+                      <td className="px-4 py-3">{formatQuantity(d.quantity)}</td>
+                      <td className="px-4 py-3 text-red-600">{formatCurrency(d.estimated_value)}</td>
+                      <td className="px-4 py-3">{d.reason}</td>
+                      <td className="px-4 py-3">{formatDate(d.created_at)}</td>
+                      <td className="px-4 py-3">{getStatusBadge(d.status)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            {(!data?.damages || data.damages.length === 0) && (
+              <div className="text-center py-12 text-gray-500">لا توجد سجلات تالف في هذه الفترة</div>
+            )}
+          </div>
+        </>
+      )}
     </div>
   )
 }
