@@ -1,130 +1,57 @@
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useRef, useState } from 'react'
+import type { RealtimePostgresChangesFilter, RealtimePostgresChangesPayload } from '@supabase/supabase-js'
 import { supabase } from '../lib/supabase'
-import { RealtimeChannel } from '@supabase/supabase-js'
 
-type PostgresChangeEvent = 'INSERT' | 'UPDATE' | 'DELETE' | '*'
+type ChangeEvent = 'INSERT' | 'UPDATE' | 'DELETE'
+type Row = Record<string, unknown>
 
 interface UseRealtimeOptions {
   table: string
   schema?: string
-  event?: PostgresChangeEvent
+  events?: ChangeEvent[]
+  // PostgREST-style filter, e.g. `branch_id=eq.<uuid>`. Use it whenever the screen only needs part of the table.
   filter?: string
-  onInsert?: (payload: Record<string, unknown>) => void
-  onUpdate?: (payload: Record<string, unknown>) => void
-  onDelete?: (payload: Record<string, unknown>) => void
+  // false = do not subscribe (e.g. while the branch is not known yet)
+  enabled?: boolean
+  onChange: (payload: RealtimePostgresChangesPayload<Row>) => void
 }
 
-interface RealtimePayload {
-  eventType: 'INSERT' | 'UPDATE' | 'DELETE'
-  new: Record<string, unknown>
-  old: Record<string, unknown>
-}
+let channelSeq = 0
 
 /**
- * Hook for subscribing to Supabase real-time changes
- * @param options - Configuration options for the subscription
- * @returns Object with subscription status and data
+ * Subscribes to Supabase realtime changes of one table while the component is mounted.
+ * The channel name is unique per subscription (two screens never share a channel), the latest
+ * onChange is always called (no stale closures, no resubscribe on every render), and the channel
+ * is removed on unmount or when table/filter/events change.
  */
-export function useRealtime(options: UseRealtimeOptions) {
-  const { table, schema = 'public', event = '*', filter, onInsert, onUpdate, onDelete } = options
+export function useRealtime({ table, schema = 'public', events = ['INSERT', 'UPDATE', 'DELETE'], filter, enabled = true, onChange }: UseRealtimeOptions) {
   const [isConnected, setIsConnected] = useState(false)
-  const [lastEvent, setLastEvent] = useState<RealtimePayload | null>(null)
-
+  const onChangeRef = useRef(onChange)
   useEffect(() => {
-    let channel: RealtimeChannel
-
-    const setupSubscription = () => {
-      channel = supabase.channel(`${table}-changes`)
-
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const channelWithChanges = channel as any
-      channelWithChanges
-        .on(
-          'postgres_changes',
-          {
-            event,
-            schema,
-            table,
-            ...(filter && { filter })
-          },
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          (payload: any) => {
-            const typedPayload = payload as RealtimePayload
-            setLastEvent(typedPayload)
-
-            switch (typedPayload.eventType) {
-              case 'INSERT':
-                onInsert?.(typedPayload.new)
-                break
-              case 'UPDATE':
-                onUpdate?.(typedPayload.new)
-                break
-              case 'DELETE':
-                onDelete?.(typedPayload.old)
-                break
-            }
-          }
-        )
-        .subscribe((status: string) => {
-          setIsConnected(status === 'SUBSCRIBED')
-        })
-    }
-
-    setupSubscription()
-
-    return () => {
-      if (channel) {
-        supabase.removeChannel(channel)
-      }
-    }
-  }, [table, schema, event, filter, onInsert, onUpdate, onDelete])
-
-  return { isConnected, lastEvent }
-}
-
-/**
- * Hook for subscribing to orders in real-time (for kitchen display)
- */
-export function useRealtimeOrders(branchId?: string) {
-  const [orders, setOrders] = useState<Record<string, unknown>[]>([])
-  const [loading, setLoading] = useState(true)
-
-  const fetchOrders = useCallback(async () => {
-    let query = supabase
-      .from('orders')
-      .select('*, items:order_items(*, item:items(name_ar))')
-      .in('status', ['paid', 'in_kitchen', 'preparing'])
-      .order('created_at', { ascending: true })
-
-    if (branchId) {
-      query = query.eq('branch_id', branchId)
-    }
-
-    const { data } = await query
-    setOrders(data || [])
-    setLoading(false)
-  }, [branchId])
-
-  useEffect(() => {
-    fetchOrders()
-  }, [fetchOrders])
-
-  const handleInsert = useCallback(() => {
-    fetchOrders()
-  }, [fetchOrders])
-
-  const handleUpdate = useCallback(() => {
-    fetchOrders()
-  }, [fetchOrders])
-
-  useRealtime({
-    table: 'orders',
-    event: '*',
-    onInsert: handleInsert,
-    onUpdate: handleUpdate,
+    onChangeRef.current = onChange
   })
 
-  return { orders, loading, refetch: fetchOrders }
+  const eventsKey = events.join(',')
+
+  useEffect(() => {
+    if (!enabled) return
+
+    channelSeq += 1
+    const channel = supabase.channel(`rt-${table}-${filter ?? 'all'}-${channelSeq}-${Date.now()}`)
+    for (const event of eventsKey.split(',')) {
+      // One listener per event type: the filter applies to INSERT and UPDATE (DELETE events cannot be filtered).
+      const config = { event, schema, table, ...(filter ? { filter } : {}) } as RealtimePostgresChangesFilter<'*'>
+      channel.on('postgres_changes', config, (payload: RealtimePostgresChangesPayload<Row>) => onChangeRef.current(payload))
+    }
+    channel.subscribe(status => setIsConnected(status === 'SUBSCRIBED'))
+
+    return () => {
+      setIsConnected(false)
+      supabase.removeChannel(channel)
+    }
+  }, [table, schema, eventsKey, filter, enabled])
+
+  return { isConnected }
 }
 
 export default useRealtime

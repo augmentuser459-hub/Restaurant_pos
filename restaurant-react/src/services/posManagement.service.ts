@@ -1,4 +1,11 @@
 import { supabase, fixEncodingInData } from '../lib/supabase'
+import { fetchAll } from '../lib/fetchAll'
+
+// Branch prices live in branch_pos_items.price (one row per branch and item). items.selling_price is only
+// the default price used when an item is added to a branch; nothing here writes it.
+// Every change goes through a posm_* database function (admin only, one transaction each). A row priced 0 is
+// never left available (it would be sold for 0 EGP): such rows stay hidden until they get a price.
+// What the cashier sells is read by the cashier screen from pos_sellable_items (orders.service.ts).
 
 export interface BranchPOSItem {
   id: string
@@ -17,12 +24,13 @@ export interface BranchPOSItem {
     is_recipe: boolean
     image_url?: string
     purchase_price?: number
+    selling_price?: number
     calculated_cost?: number
     unit?: {
       id: string
       code: string
       name_ar: string
-    }
+    } | null
   }
   stock_quantity?: number
   in_stock?: boolean
@@ -41,61 +49,57 @@ export interface AvailableInventoryItem {
   name_ar: string
   is_recipe: boolean
   image_url?: string
+  selling_price?: number | null
+  purchase_price?: number | null
   unit?: {
     name_ar: string
   }
   stock_quantity: number
 }
 
+export interface POSItemChange {
+  id: string
+  price?: number
+  is_available?: boolean
+}
+
+export interface ItemCostChange {
+  item_id: string
+  cost: number
+}
+
+const num = (value: unknown) => Number(value ?? 0) || 0
+
 export const posManagementService = {
-  // Get all branch POS items for a specific branch - paginated to bypass 1000 row Supabase limit
+  // All listed items of a branch (management table), with unit and cost (recipe cost is computed in the view)
   async getBranchPOSItems(branchId: string) {
-    const BATCH_SIZE = 1000
-    let allData: any[] = []
-    let start = 0
-    let hasMore = true
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const rows = await fetchAll<any>((from, to) =>
+        supabase
+          .from('v_branch_pos_items_with_stock')
+          .select('*')
+          .eq('branch_id', branchId)
+          .order('display_order')
+          .order('id')
+          .range(from, to))
 
-    while (hasMore) {
-      const { data, error } = await supabase
-        .from('v_branch_pos_items_with_stock')
-        .select('*')
-        .eq('branch_id', branchId)
-        .order('display_order')
-        .range(start, start + BATCH_SIZE - 1)
-
-      if (error) return { data: null, error }
-
-      if (data && data.length > 0) {
-        allData = [...allData, ...data]
-        start += BATCH_SIZE
-        hasMore = data.length === BATCH_SIZE
-      } else {
-        hasMore = false
-      }
-    }
-
-    // Parse item JSONB and calculate recipe costs
-    const itemsWithCosts = await Promise.all(
-      allData.map(async (row: any) => {
+      const items = rows.map(row => {
         const item = typeof row.item === 'string' ? JSON.parse(row.item) : row.item
-        let calculatedCost = item?.purchase_price || 0
-        if (item?.is_recipe) {
-          const { data: costData } = await supabase.rpc('calculate_recipe_cost', {
-            recipe_item_id: row.item_id
-          })
-          calculatedCost = costData || 0
-        }
         return {
           ...row,
-          item: { ...item, calculated_cost: calculatedCost }
+          price: num(row.price),
+          stock_quantity: num(row.stock_quantity),
+          item: { ...item, calculated_cost: num(row.unit_cost) },
         }
       })
-    )
-
-    return { data: fixEncodingInData(itemsWithCosts) as BranchPOSItem[], error: null }
+      return { data: fixEncodingInData(items) as BranchPOSItem[], error: null }
+    } catch (error) {
+      return { data: null, error }
+    }
   },
 
-  // Get all branches with their POS item counts - count per branch to avoid 1000 row limit
+  // Selling branches with the number of items listed in each
   async getBranchesWithItemCounts() {
     const { data: branches, error: branchError } = await supabase
       .from('branches')
@@ -106,395 +110,131 @@ export const posManagementService = {
 
     if (branchError) return { data: null, error: branchError }
 
-    // Count per branch separately to avoid the 1000-row global limit
-    const branchesWithCounts = await Promise.all(
-      (branches || []).map(async (branch) => {
-        const { count } = await supabase
-          .from('branch_pos_items')
-          .select('*', { count: 'exact', head: true })
-          .eq('branch_id', branch.id)
-
-        return {
-          ...branch,
-          itemCount: count || 0
-        }
-      })
+    // Count per branch (head request) to avoid the 1000-row limit
+    const counts = await Promise.all(
+      (branches || []).map(branch =>
+        supabase
+          .from('v_branch_pos_items_with_stock')
+          .select('id', { count: 'exact', head: true })
+          .eq('branch_id', branch.id))
     )
+    const countError = counts.find(c => c.error)?.error
+    if (countError) return { data: null, error: countError }
 
+    const branchesWithCounts = (branches || []).map((branch, i) => ({
+      ...branch,
+      itemCount: counts[i].count || 0,
+    }))
     return { data: fixEncodingInData(branchesWithCounts), error: null }
   },
 
-  // Get available inventory items for a branch - paginated to bypass 1000 row Supabase limit
+  // Active items of the branch's inventory (candidates for 'إضافة منتج' / 'إضافة الكل')
   async getAvailableInventoryItems(branchId: string) {
-    const BATCH_SIZE = 1000
-    let allRaw: any[] = []
-    let start = 0
-    let hasMore = true
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const rows = await fetchAll<any>((from, to) =>
+        supabase
+          .from('inventory')
+          .select(`
+            item_id,
+            quantity,
+            item:items!inner(
+              id, code, name, name_ar, is_recipe, image_url, selling_price, purchase_price, status,
+              unit:units(name_ar)
+            )
+          `)
+          .eq('branch_id', branchId)
+          .eq('item.status', 'active')
+          .order('item_id')
+          .range(from, to))
 
-    while (hasMore) {
-      const { data, error } = await supabase
-        .from('inventory')
-        .select(`
-          item_id,
-          quantity,
-          item:items(
-            id, code, name, name_ar, is_recipe, image_url, selling_price, purchase_price,
-            unit:units(name_ar)
-          )
-        `)
-        .eq('branch_id', branchId)
-        .order('item_id')
-        .range(start, start + BATCH_SIZE - 1)
-
-      if (error) return { data: null, error }
-
-      if (data && data.length > 0) {
-        allRaw = [...allRaw, ...data]
-        start += BATCH_SIZE
-        hasMore = data.length === BATCH_SIZE
-      } else {
-        hasMore = false
-      }
-    }
-
-    // Filter and transform
-    const items = allRaw
-      .filter(inv => inv.item && !Array.isArray(inv.item))
-      .map(inv => {
-        const item = Array.isArray(inv.item) ? inv.item[0] : inv.item
-        return {
-          id: item.id,
-          code: item.code,
-          name: item.name,
-          name_ar: item.name_ar,
-          is_recipe: item.is_recipe,
-          image_url: item.image_url,
-          selling_price: item.selling_price,
-          purchase_price: item.purchase_price,
-          unit: Array.isArray(item.unit) ? item.unit[0] : item.unit,
-          stock_quantity: inv.quantity
-        }
-      })
-
-    return { data: fixEncodingInData(items) as AvailableInventoryItem[], error: null }
-  },
-
-  // Add item to POS
-  async addItemToPOS(branchId: string, itemId: string, price: number) {
-    // First, update the base item's selling price
-    await supabase
-      .from('items')
-      .update({
-        selling_price: price,
-        updated_at: new Date().toISOString()
-      })
-      .eq('id', itemId)
-
-    // Then add to POS
-    const { data, error } = await supabase
-      .from('branch_pos_items')
-      .insert({
-        branch_id: branchId,
-        item_id: itemId,
-        price: price,
-        is_available: true,
-        display_order: 0
-      })
-      .select()
-      .single()
-
-    return { data, error }
-  },
-
-  // Fix zero prices: update branch_pos_items.price from items.selling_price in batches
-  async fixPricesFromInventory(branchId: string, onProgress?: (done: number, total: number) => void) {
-    // Get all POS items with price = 0 for this branch
-    const { data: zeroPriceItems, error: fetchError } = await supabase
-      .from('branch_pos_items')
-      .select('id, item_id')
-      .eq('branch_id', branchId)
-      .eq('price', 0)
-      .limit(10000)
-
-    if (fetchError || !zeroPriceItems || zeroPriceItems.length === 0) {
-      return { updated: 0, error: fetchError }
-    }
-
-    // Get all item prices in one query
-    const itemIds = zeroPriceItems.map(p => p.item_id)
-    const { data: items, error: itemsError } = await supabase
-      .from('items')
-      .select('id, selling_price, purchase_price')
-      .in('id', itemIds)
-
-    if (itemsError || !items) return { updated: 0, error: itemsError }
-
-    // Build item price map
-    const priceMap = new Map(items.map(i => [i.id, i.selling_price || i.purchase_price || 0]))
-
-    // Filter only items that have a valid price > 0
-    const itemsToFix = zeroPriceItems.filter(p => {
-      const price = priceMap.get(p.item_id) || 0
-      return price > 0
-    })
-
-    if (itemsToFix.length === 0) return { updated: 0, error: null }
-
-    const total = itemsToFix.length
-    let updated = 0
-    const BATCH_SIZE = 50
-
-    for (let i = 0; i < itemsToFix.length; i += BATCH_SIZE) {
-      const batch = itemsToFix.slice(i, i + BATCH_SIZE).map(p => ({
-        id: p.id,
-        price: priceMap.get(p.item_id) || 0,
-        updated_at: new Date().toISOString()
-      }))
-
-      const { error } = await supabase
-        .from('branch_pos_items')
-        .upsert(batch)
-
-      if (!error) updated += batch.length
-      if (onProgress) onProgress(Math.min(i + BATCH_SIZE, total), total)
-    }
-
-    return { updated, error: null }
-  },
-
-  // Remove item from POS
-  async removeItemFromPOS(id: string) {
-    const { error } = await supabase
-      .from('branch_pos_items')
-      .delete()
-      .eq('id', id)
-
-    return { error }
-  },
-
-  // Update POS item price and availability
-  async updatePOSItem(id: string, updates: { price?: number; is_available?: boolean }) {
-    // First, get the item_id from this POS item
-    const { data: posItem, error: fetchError } = await supabase
-      .from('branch_pos_items')
-      .select('item_id')
-      .eq('id', id)
-      .single()
-
-    if (fetchError) return { data: null, error: fetchError }
-
-    // Update the POS item
-    const { data, error } = await supabase
-      .from('branch_pos_items')
-      .update({
-        ...updates,
-        updated_at: new Date().toISOString()
-      })
-      .eq('id', id)
-      .select()
-      .single()
-
-    // If price is being updated, also update the base item's selling_price
-    if (!error && updates.price !== undefined && posItem?.item_id) {
-      await supabase
-        .from('items')
-        .update({
-          selling_price: updates.price,
-          updated_at: new Date().toISOString()
-        })
-        .eq('id', posItem.item_id)
-    }
-
-    return { data, error }
-  },
-
-  // Update item purchase price (cost)
-  async updateItemCost(itemId: string, purchasePrice: number) {
-    const { data, error } = await supabase
-      .from('items')
-      .update({
-        purchase_price: purchasePrice,
-        updated_at: new Date().toISOString()
-      })
-      .eq('id', itemId)
-      .select()
-      .single()
-
-    return { data, error }
-  },
-
-  // Copy prices from one branch to another
-  async copyPricesFromBranch(sourceBranchId: string, targetBranchId: string) {
-    // Get source items
-    const { data: sourceItems, error: fetchError } = await supabase
-      .from('branch_pos_items')
-      .select('item_id, price, is_available')
-      .eq('branch_id', sourceBranchId)
-
-    if (fetchError || !sourceItems) return { success: false, error: fetchError }
-
-    // Update base item prices and upsert to target branch
-    for (const item of sourceItems) {
-      // Update base item selling price
-      await supabase
-        .from('items')
-        .update({ 
-          selling_price: item.price, 
-          updated_at: new Date().toISOString() 
-        })
-        .eq('id', item.item_id)
-    }
-
-    // Upsert to target branch
-    const itemsToInsert = sourceItems.map(item => ({
-      branch_id: targetBranchId,
-      item_id: item.item_id,
-      price: item.price,
-      is_available: item.is_available
-    }))
-
-    const { error: upsertError } = await supabase
-      .from('branch_pos_items')
-      .upsert(itemsToInsert, {
-        onConflict: 'branch_id,item_id'
-      })
-
-    return { success: !upsertError, error: upsertError }
-  },
-
-  // Apply percentage change to all prices in a branch
-  async applyPercentageChange(branchId: string, percentage: number) {
-    const { data: currentItems, error: fetchError } = await supabase
-      .from('branch_pos_items')
-      .select('id, item_id, price')
-      .eq('branch_id', branchId)
-
-    if (fetchError || !currentItems) return { success: false, error: fetchError }
-
-    const multiplier = 1 + (percentage / 100)
-    
-    for (const item of currentItems) {
-      const newPrice = Math.round(item.price * multiplier * 100) / 100
-      
-      // Update POS item price
-      await supabase
-        .from('branch_pos_items')
-        .update({ price: newPrice, updated_at: new Date().toISOString() })
-        .eq('id', item.id)
-      
-      // Update base item selling price
-      await supabase
-        .from('items')
-        .update({ selling_price: newPrice, updated_at: new Date().toISOString() })
-        .eq('id', item.item_id)
-    }
-
-    return { success: true, error: null }
-  },
-
-  // Get POS items for cashier - reads directly from inventory
-  // Any item with stock in the branch automatically appears in POS
-  async getPOSItemsForCashier(branchId: string) {
-    const BATCH_SIZE = 1000
-
-    // First try the managed POS items view - with pagination
-    let posData: any[] = []
-    let posStart = 0
-    let posHasMore = true
-
-    while (posHasMore) {
-      const { data: posBatch } = await supabase
-        .from('v_branch_pos_items_with_stock')
-        .select('*')
-        .eq('branch_id', branchId)
-        .eq('is_available', true)
-        .order('display_order')
-        .range(posStart, posStart + BATCH_SIZE - 1)
-
-      if (!posBatch || posBatch.length === 0) {
-        posHasMore = false
-      } else {
-        posData = [...posData, ...posBatch]
-        posHasMore = posBatch.length === BATCH_SIZE
-        posStart += BATCH_SIZE
-      }
-    }
-
-    // Also get ALL inventory items for this branch (auto-populate) - with pagination
-    let invData: any[] = []
-    let invStart = 0
-    let invHasMore = true
-    let invError = null
-
-    while (invHasMore) {
-      const { data: invBatch, error: batchError } = await supabase
-        .from('inventory')
-        .select(`
-          id,
-          item_id,
-          quantity,
-          branch_id,
-          item:items(
-            id, code, barcode, name, name_ar, is_recipe, image_url,
-            selling_price, purchase_price, category_id,
-            unit:units(name_ar, code)
-          )
-        `)
-        .eq('branch_id', branchId)
-        .gt('quantity', 0)
-        .range(invStart, invStart + BATCH_SIZE - 1)
-
-      if (batchError) {
-        invError = batchError
-        invHasMore = false
-      } else if (!invBatch || invBatch.length === 0) {
-        invHasMore = false
-      } else {
-        invData = [...invData, ...invBatch]
-        invHasMore = invBatch.length === BATCH_SIZE
-        invStart += BATCH_SIZE
-      }
-    }
-
-    if (invError) {
-      // Fallback to managed POS items only
-      return { data: fixEncodingInData(posData), error: null }
-    }
-
-    // Build a set of item_ids already in POS
-    const posItemIds = new Set(posData.map((p: any) => p.item_id))
-
-    // Transform inventory items into POS format (for items NOT already in POS)
-    const autoItems = invData
-      .filter(inv => inv.item && !Array.isArray(inv.item) && !posItemIds.has(inv.item_id))
-      .map(inv => {
-        const item = Array.isArray(inv.item) ? inv.item[0] : inv.item
-        return {
-          id: `auto_${inv.id}`,
-          branch_id: branchId,
-          item_id: inv.item_id,
-          price: item.selling_price || item.purchase_price || 0,
-          is_available: true,
-          display_order: 999,
-          item: {
+      const items = rows
+        .filter(inv => inv.item)
+        .map(inv => {
+          const item = Array.isArray(inv.item) ? inv.item[0] : inv.item
+          return {
             id: item.id,
             code: item.code,
-            barcode: item.barcode,
             name: item.name,
             name_ar: item.name_ar,
             is_recipe: item.is_recipe,
             image_url: item.image_url,
-            category_id: item.category_id,
+            selling_price: item.selling_price,
             purchase_price: item.purchase_price,
-            unit: Array.isArray(item.unit) ? item.unit[0] : item.unit
-          },
-          stock_quantity: inv.quantity,
-          in_stock: inv.quantity > 0
-        }
-      })
+            unit: Array.isArray(item.unit) ? item.unit[0] : item.unit,
+            stock_quantity: num(inv.quantity),
+          }
+        })
+      return { data: fixEncodingInData(items) as AvailableInventoryItem[], error: null }
+    } catch (error) {
+      return { data: null, error }
+    }
+  },
 
-    // Merge: POS managed items first, then auto-populated from inventory
-    const merged = [...posData, ...autoItems]
-    return { data: fixEncodingInData(merged), error: null }
-  }
+  // Add one item to a branch's POS at the given price (re-lists it if it was removed)
+  async addItemToPOS(branchId: string, itemId: string, price: number) {
+    const { data, error } = await supabase.rpc('posm_add_item', {
+      p_branch_id: branchId,
+      p_item_id: itemId,
+      p_price: price,
+    })
+    return { data: data as string | null, error }
+  },
+
+  // 'إضافة الكل': every active inventory item not listed yet (or removed), at its default price.
+  // added = new or listed again; repriced = listed rows that were priced 0; hidden_no_price = added rows
+  // without any default price, which stay hidden until a price is entered.
+  async addAllInventoryItems(branchId: string) {
+    const { data, error } = await supabase.rpc('posm_add_all_items', { p_branch_id: branchId })
+    return { data: data as { added: number; repriced: number; hidden_no_price: number } | null, error }
+  },
+
+  // 'تحديث الأسعار': listed items priced 0 get their default price (selling price, else purchase price).
+  // updatedHidden = of the updated rows, how many are hidden from the cashier; remaining = rows still priced 0
+  // (the item has no price at all), which the database keeps hidden.
+  async fixPricesFromInventory(branchId: string) {
+    const { data, error } = await supabase.rpc('posm_fix_zero_prices', { p_branch_id: branchId })
+    const result = data as { updated: number; updated_hidden: number; remaining: number } | null
+    return {
+      updated: result?.updated ?? 0,
+      updatedHidden: result?.updated_hidden ?? 0,
+      remaining: result?.remaining ?? 0,
+      error,
+    }
+  },
+
+  // Remove item from POS (kept as removed, so the cashier screen does not list it again because of its stock)
+  async removeItemFromPOS(id: string) {
+    const { error } = await supabase.rpc('posm_remove_item', { p_id: id })
+    return { error }
+  },
+
+  // Save the edited prices / availability of this branch and the edited item costs, all or nothing
+  async saveChanges(branchId: string, items: POSItemChange[], costs: ItemCostChange[]) {
+    const { data, error } = await supabase.rpc('posm_save_changes', {
+      p_branch_id: branchId,
+      p_items: items.map(i => ({ id: i.id, price: i.price ?? null, is_available: i.is_available ?? null })),
+      p_costs: costs,
+    })
+    return { data: data as { items: number; costs: number } | null, error }
+  },
+
+  // Copy listed items and prices from one branch to another (only the target branch changes).
+  // Source rows priced 0 are only added where the target lacks them, hidden (hidden_no_price).
+  async copyPricesFromBranch(sourceBranchId: string, targetBranchId: string) {
+    const { data, error } = await supabase.rpc('posm_copy_prices', {
+      p_source_branch_id: sourceBranchId,
+      p_target_branch_id: targetBranchId,
+    })
+    return { data: data as { inserted: number; updated: number; hidden_no_price: number } | null, error }
+  },
+
+  // Apply a percentage change to every listed price of ONE branch
+  async applyPercentageChange(branchId: string, percentage: number) {
+    const { data, error } = await supabase.rpc('posm_apply_percentage', {
+      p_branch_id: branchId,
+      p_percent: percentage,
+    })
+    return { data: data as { updated: number } | null, error }
+  },
 }
